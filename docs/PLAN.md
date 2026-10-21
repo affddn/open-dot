@@ -21,7 +21,7 @@ This project is a fresh, small rebuild of [open-bot](https://github.com/affddn/o
 
 ```
 ~/.opendot/                              OPEN_DOT_HOME
-  open-dot.db                            SQLite (Drizzle): dots, notes, reminders, responsibilities, workers, outbox
+  open-dot.db                            SQLite (Drizzle): dots, notes, reminders, responsibilities, workers, outbox, feed
   api.json                               the daemon's local API address and token, readable only by the owner
   dots/<name>/AGENTS.md                  the dot's personality and purpose (plain OpenCode instructions)
   work/<name>/                           the default directory for a dot's workers
@@ -30,17 +30,19 @@ This project is a fresh, small rebuild of [open-bot](https://github.com/affddn/o
 
 One `plugins` entry in the OpenCode config loads both plugins. The server plugin stays inert outside a dot's directory.
 
-| Part          | Runs in              | Job                                                                                                                                   |
-| ------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| CLI           | `open-dot …`         | Create, list and open dots, and run the daemon.                                                                                       |
-| Server plugin | OpenCode service     | Provides the tools a dot calls, such as `dot_remind`, `dot_track`, `dot_delegate` and `dot_message`. It writes only to open-dot's DB. |
-| Daemon        | `open-dot daemon`    | The single owner of timers and workers. It starts worker sessions, watches them, and sends every message through the outbox.          |
-| TUI plugin    | OpenCode terminal UI | Shows each dot and its recent workers in the sidebar and provides `/dot` and palette commands. It reads the DB read-only.             |
-| Notch app     | `mac/`, a macOS app  | Sits at the notch. Hover to pick a dot, read and type to it, and see its workers. It talks only to the daemon's local API.            |
+| Part          | Runs in              | Job                                                                                                                                    |
+| ------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| CLI           | `open-dot …`         | Create, list and open dots, and run the daemon.                                                                                        |
+| Server plugin | OpenCode service     | Provides the tools a dot calls, such as `dot_remind`, `dot_track`, `dot_delegate` and `dot_message`. It writes only to open-dot's DB.  |
+| Daemon        | `open-dot daemon`    | The single owner of timers, workers and the feed. It starts worker sessions, watches them, and sends every message through the outbox. |
+| TUI plugin    | OpenCode terminal UI | Shows each dot and its recent workers in the sidebar and provides `/dot` and palette commands. It reads the DB read-only.              |
+| Notch app     | `mac/`, a macOS app  | Sits at the notch. Hover to pick a dot, read and type to it, and see its workers. It talks only to the daemon's local API.             |
 
 The daemon, not the plugin, owns timers for two reasons. A plugin runs only while its location is loaded, while the daemon can wake a dot whenever the OpenCode service is up. The daemon is also the host for the notch app and connectors, which is how you'll talk to a dot from anywhere.
 
 The daemon serves a small HTTP API on `127.0.0.1` for the notch app, on a new port each start. It writes the address and a fresh random token to `api.json` with mode 0600, and rejects any request without that token, so other local users and web pages can't call it. `GET /dots` lists the dots, whether each is running a turn, and its unfinished workers. `GET /dots/<name>/messages` returns the last 50 messages of the dot's conversation, each labeled as the owner's, the dot's, another dot's, or a notice such as a reminder or worker report. The label comes from the outbox row with the message's ID. A dot's messages show what it said and the open-dot tools it called, not mechanics such as shell commands, file reads or compaction. `POST /dots/<name>/messages` queues the owner's text in the outbox, marked as the owner's, and returns its ID with 202; the app never retries it on its own. While OpenCode is down, every request gets 503.
+
+The daemon also collects the feed: once a minute it asks GitHub and Linear for the owner's unread review requests, mentions and assignments from the last 24 hours, which costs no model tokens. GitHub uses the token of the `gh` login and Linear a personal API key from the Keychain item `open-dot-linear`; both stay in memory. A notification read at its source leaves the feed at the next pass. `GET /feed` lists the unread items, oldest first. `POST /feed/<id>/dismiss` hides one at once, and the daemon marks it read at its source on its next pass; new activity brings it back, as it does on GitHub. A dot reads the feed with `dot_feed`, framed as data from GitHub and Linear.
 
 Every message the daemon sends goes through the `outbox` table. A producer, such as a due reminder or a finished worker, inserts the message with a fresh `msg_` ID in the same transaction as its own state change. Delivery then checks for that ID before sending, so a lost outcome is confirmed rather than repeated.
 
