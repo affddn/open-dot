@@ -33,9 +33,9 @@ struct RootView: View {
               removal: .opacity.animation(.easeIn(duration: 0.1))))
       } else if store.showsIndicator {
         HStack {
-          if store.dots.contains(where: \.busy) { BusyDot() }
+          if store.dotsBusy { BusyDot() }
           Spacer()
-          if store.feedUnread || store.dots.contains(where: { store.unread($0.name) }) { UnreadDot() }
+          if store.feedUnread || store.dotsUnread { UnreadDot() }
         }
         .padding(.horizontal, 10)
         .frame(height: notch.height)
@@ -70,14 +70,14 @@ struct ExpandedView: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
-      if let status = store.status {
-        centered(status)
-      } else if !store.loaded {
+      if !store.loaded {
         centered("Connecting…")
       } else {
         tabs
         if store.showingFeed {
           FeedList(store: store)
+        } else if let status = store.status {
+          centered(status)
         } else if let name = store.selected, let dot = store.dots.first(where: { $0.name == name }) {
           Conversation(store: store, name: name)
           if !dot.workers.isEmpty { workers(dot.workers) }
@@ -219,7 +219,9 @@ struct FeedList: View {
 
   var body: some View {
     let items = store.feed
-    if items.isEmpty {
+    if let status = store.feedStatus {
+      Text(status).foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+    } else if items.isEmpty {
       Text("Nothing needs you right now.").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
     } else {
       GeometryReader { viewport in

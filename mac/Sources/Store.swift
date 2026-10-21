@@ -20,6 +20,7 @@ struct Pending: Identifiable {
   var expanded = false
   var feed: [FeedItem] = []
   var feedErrors: [Int: String] = [:]
+  var feedStatus: String?
   var showingFeed = false
   private var seen: [String: Double] = [:]
   private var newest: [String: Double] = [:]
@@ -29,7 +30,12 @@ struct Pending: Identifiable {
   @ObservationIgnored private var dismissed: Set<Int> = []
   @ObservationIgnored private let api = API()
 
-  var showsIndicator: Bool { status == nil && (feedUnread || dots.contains { $0.busy || unread($0.name) }) }
+  var showsIndicator: Bool { dotsBusy || dotsUnread || feedUnread }
+
+  // The dot list goes stale while OpenCode is down, so it lights nothing then.
+  var dotsBusy: Bool { status == nil && dots.contains(where: \.busy) }
+
+  var dotsUnread: Bool { status == nil && dots.contains { unread($0.name) } }
 
   var feedUnread: Bool { feedNewest > (feedSeen ?? .infinity) }
 
@@ -142,7 +148,14 @@ struct Pending: Identifiable {
     // A dismissed item stays hidden until a poll that started after its dismiss succeeded,
     // so a poll already in flight can't bring it back.
     let settled = dismissed
-    guard let items = try? await api.feed() else { return }
+    let items: [FeedItem]
+    do {
+      items = try await api.feed()
+    } catch {
+      feedStatus = Self.describe(error)
+      return
+    }
+    feedStatus = nil
     dismissing.subtract(settled)
     dismissed.subtract(settled)
     feed = items.filter { !dismissing.contains($0.id) }
