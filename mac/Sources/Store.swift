@@ -1,4 +1,5 @@
-import Foundation
+import AppKit
+import ImageIO
 import Observation
 
 struct Pending: Identifiable {
@@ -22,12 +23,16 @@ struct Pending: Identifiable {
   var feedErrors: [Int: String] = [:]
   var feedStatus: String?
   var showingFeed = false
+  var thumbnails: [AttachmentKey: NSImage] = [:]
+  var unavailable: Set<AttachmentKey> = []
   private var seen: [String: Double] = [:]
   private var newest: [String: Double] = [:]
   private var feedSeen: Double?
   private var feedNewest: Double = 0
   @ObservationIgnored private var dismissing: Set<Int> = []
   @ObservationIgnored private var dismissed: Set<Int> = []
+  @ObservationIgnored private var loading: Set<AttachmentKey> = []
+  @ObservationIgnored private var opening: Set<AttachmentKey> = []
   @ObservationIgnored private let api = API()
 
   var showsIndicator: Bool { dotsBusy || dotsUnread || feedUnread }
@@ -130,6 +135,59 @@ struct Pending: Identifiable {
     feedErrors[id] = nil
   }
 
+  /// Loads an image attachment's thumbnail once, when its message is shown.
+  func loadThumbnail(_ key: AttachmentKey) {
+    guard thumbnails[key] == nil, !unavailable.contains(key), loading.insert(key).inserted else { return }
+    Task {
+      defer { loading.remove(key) }
+      if let data = try? await api.attachment(key), let image = Self.decode(data, maxPixels: 240) {
+        thumbnails[key] = image
+      } else {
+        unavailable.insert(key)
+      }
+    }
+  }
+
+  /// Clears a failed load, so clicking its chip tries again.
+  func retryThumbnail(_ key: AttachmentKey) {
+    unavailable.remove(key)
+    loadThumbnail(key)
+  }
+
+  /// Reads the image again at full size, so only thumbnails stay in memory. A failure turns the
+  /// thumbnail into a chip that can retry.
+  func openImage(_ key: AttachmentKey, title: String) {
+    guard opening.insert(key).inserted else { return }
+    Task {
+      defer { opening.remove(key) }
+      if let data = try? await api.attachment(key), let image = Self.decode(data, maxPixels: nil) {
+        ImageWindow.show(image, title: title)
+      } else {
+        thumbnails[key] = nil
+        unavailable.insert(key)
+      }
+    }
+  }
+
+  /// Decodes only PNG, JPEG, GIF and WebP, whatever the bytes claim to be, and only up to 40
+  /// million pixels, read from the header first, so a small file can't expand into a huge bitmap.
+  private static func decode(_ data: Data, maxPixels: Int?) -> NSImage? {
+    let allowed: Set<String> = ["public.png", "public.jpeg", "com.compuserve.gif", "org.webmproject.webp"]
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+      let type = CGImageSourceGetType(source) as String?, allowed.contains(type),
+      let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+      let width = properties[kCGImagePropertyPixelWidth] as? Int,
+      let height = properties[kCGImagePropertyPixelHeight] as? Int,
+      width > 0, height > 0, width <= 40_000_000 / height else { return nil }
+    // The thumbnail API at full size too, so both apply the photo's orientation.
+    let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+      kCGImageSourceCreateThumbnailFromImageAlways: true,
+      kCGImageSourceCreateThumbnailWithTransform: true,
+      kCGImageSourceThumbnailMaxPixelSize: maxPixels ?? max(width, height),
+    ] as CFDictionary)
+    return image.map { NSImage(cgImage: $0, size: .zero) }
+  }
+
   private func refreshDots() async {
     do {
       let next = try await api.dots()
@@ -167,6 +225,10 @@ struct Pending: Identifiable {
     guard let list = try? await api.messages(name) else { return }
     messages[name] = list
     let ids = Set(list.map(\.id))
+    // Forget images of messages that have scrolled out, but write only when something goes.
+    let gone = { (key: AttachmentKey) in key.dot == name && !ids.contains(key.message) }
+    if thumbnails.keys.contains(where: gone) { thumbnails = thumbnails.filter { !gone($0.key) } }
+    if unavailable.contains(where: gone) { unavailable = unavailable.filter { !gone($0) } }
     let oldest = list.first?.time ?? 0
     // An accepted message older than everything shown was delivered and has scrolled out.
     pending[name]?.removeAll { item in item.messageID.map { ids.contains($0) || oldest > item.sentAt } ?? false }

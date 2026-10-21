@@ -111,7 +111,7 @@ The notch app is a small native macOS app (macOS 14 or later) that talks to the 
 cd mac && swift build -c release && .build/release/open-dot-notch
 ```
 
-Hover over the notch to open the panel: pick a dot, read its conversation, see its unfinished workers, and type to it. Enter sends. The panel closes shortly after the mouse leaves, and keeps your draft. The Feed tab lists what needs you from GitHub, Linear and Slack, newest at the bottom. Click an item to open it, or × to dismiss it, which also marks a GitHub or Linear item read there. A dot beside the notch shows that a dot is busy or that a dot or the feed has something new. Right-click the open panel to quit.
+Hover over the notch to open the panel: pick a dot, read its conversation, see its unfinished workers, and type to it. Images attached to a message, such as a screenshot pasted into OpenCode, show as thumbnails; click one to open it full size in its own window. Other attachments show their file name. Enter sends. The panel closes shortly after the mouse leaves, and keeps your draft. The Feed tab lists what needs you from GitHub, Linear and Slack, newest at the bottom. Click an item to open it, or × to dismiss it, which also marks a GitHub or Linear item read there. A dot beside the notch shows that a dot is busy or that a dot or the feed has something new. Right-click the open panel to quit.
 
 To start the app at login, save a second launch agent as `~/Library/LaunchAgents/com.opzero1.open-dot.notch.plist`:
 

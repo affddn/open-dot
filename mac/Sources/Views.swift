@@ -279,8 +279,9 @@ struct Conversation: View {
     let pending = store.pending[name] ?? []
     ScrollViewReader { proxy in
       ScrollView {
-        VStack(alignment: .leading, spacing: 8) {
-          ForEach(messages) { MessageRow(message: $0) }
+        // Lazy, so a thumbnail loads only when its message scrolls into view.
+        LazyVStack(alignment: .leading, spacing: 8) {
+          ForEach(messages) { MessageRow(store: store, dot: name, message: $0) }
           ForEach(pending) { item in
             PendingRow(item: item).onTapGesture {
               if item.error != nil { store.dismiss(name, item.id) }
@@ -443,6 +444,8 @@ struct SourceMark: View {
 }
 
 struct MessageRow: View {
+  let store: Store
+  let dot: String
   let message: Message
   @State private var open = false
 
@@ -451,12 +454,16 @@ struct MessageRow: View {
     case "owner":
       HStack {
         Spacer(minLength: 60)
-        Bubble(text: message.text, fill: messageBlue)
+        VStack(alignment: .trailing, spacing: 4) {
+          if !message.text.isEmpty { Bubble(text: message.text, fill: messageBlue) }
+          attachments
+        }
       }
     case "dot":
       HStack {
         VStack(alignment: .leading, spacing: 3) {
           if !message.text.isEmpty { Bubble(text: message.text, fill: messageGray) }
+          attachments
           if let tools = message.tools, !tools.isEmpty {
             Text("used \(tools.joined(separator: ", "))").font(.caption2).foregroundStyle(.tertiary)
           }
@@ -467,7 +474,8 @@ struct MessageRow: View {
       VStack(alignment: .leading, spacing: 2) {
         Text(message.kind == "peer" ? "from \(message.peer ?? "another dot")" : "open-dot")
           .font(.caption2.weight(.semibold))
-        Text(message.text).font(.caption).lineLimit(open ? nil : 4)
+        if !message.text.isEmpty { Text(message.text).font(.caption).lineLimit(open ? nil : 4) }
+        attachments
       }
       .foregroundStyle(.secondary)
       .padding(8)
@@ -475,6 +483,96 @@ struct MessageRow: View {
       .background(RoundedRectangle(cornerRadius: 8).fill(.white.opacity(0.05)))
       .onTapGesture { open.toggle() }
     }
+  }
+}
+
+extension MessageRow {
+  @ViewBuilder fileprivate var attachments: some View {
+    if let items = message.attachments, !items.isEmpty {
+      let row = HStack(spacing: 6) {
+        ForEach(items, id: \.index) { item in
+          AttachmentView(store: store, key: AttachmentKey(dot: dot, message: message.id, index: item.index), item: item)
+        }
+      }
+      // Keeps the row's own alignment when it fits, and scrolls sideways when it doesn't.
+      ViewThatFits(in: .horizontal) {
+        row
+        ScrollView(.horizontal) { row }.scrollIndicators(.never)
+      }
+    }
+  }
+}
+
+/// A thumbnail for an image the daemon serves, or a chip with the file's name for anything else.
+struct AttachmentView: View {
+  let store: Store
+  let key: AttachmentKey
+  let item: Message.Attachment
+
+  var body: some View {
+    let name = item.name.map { ($0 as NSString).lastPathComponent } ?? item.mime
+    if item.isImage, let image = store.thumbnails[key] {
+      Image(nsImage: image)
+        .resizable()
+        .scaledToFill()
+        .frame(width: 96, height: 72)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(Rectangle())
+        .onTapGesture { store.openImage(key, title: name) }
+        .help(name)
+        .accessibilityLabel(name)
+        .accessibilityIdentifier("attachment-\(key.message)-\(key.index)")
+    } else if item.isImage && !store.unavailable.contains(key) {
+      RoundedRectangle(cornerRadius: 8)
+        .fill(.white.opacity(0.08))
+        .frame(width: 96, height: 72)
+        .overlay(ProgressView().controlSize(.small))
+        .onAppear { store.loadThumbnail(key) }
+    } else {
+      // An image that failed to load says so, and a click tries again.
+      HStack(spacing: 4) {
+        Image(systemName: item.isImage ? "arrow.clockwise" : "doc")
+        Text(verbatim: item.isImage ? "\(name) · couldn't load" : name).lineLimit(1)
+      }
+      .font(.caption2)
+      .frame(maxWidth: 200)
+      .padding(.horizontal, 8)
+      .padding(.vertical, 3)
+      .background(Capsule().fill(.white.opacity(0.12)))
+      .contentShape(Capsule())
+      .onTapGesture { if item.isImage { store.retryThumbnail(key) } }
+      .help(item.isImage ? "Click to try again" : name)
+      .accessibilityIdentifier("attachment-\(key.message)-\(key.index)")
+    }
+  }
+}
+
+/// Shows an attachment at full size in its own window, capped to the screen.
+@MainActor enum ImageWindow {
+  /// Drops its image on close, so a large one isn't kept while the window is hidden.
+  private final class Window: NSWindow {
+    override func close() {
+      contentView = nil
+      super.close()
+    }
+  }
+
+  private static var window: NSWindow?
+
+  static func show(_ image: NSImage, title: String) {
+    let screen = NSScreen.main?.visibleFrame.size ?? CGSize(width: 1200, height: 800)
+    let scale = min(1, screen.width * 0.9 / max(image.size.width, 1), screen.height * 0.9 / max(image.size.height, 1))
+    let view = NSImageView(image: image)
+    view.imageScaling = .scaleProportionallyUpOrDown
+    let window = self.window ?? Window(contentRect: .zero, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.title = title
+    window.contentView = view
+    window.setContentSize(CGSize(width: max(image.size.width * scale, 120), height: max(image.size.height * scale, 80)))
+    window.center()
+    self.window = window
+    NSApp.activate()
+    window.makeKeyAndOrderFront(nil)
   }
 }
 

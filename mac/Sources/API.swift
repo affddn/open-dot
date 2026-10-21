@@ -14,12 +14,31 @@ struct Dot: Decodable, Equatable {
 }
 
 struct Message: Decodable, Equatable, Identifiable {
+  struct Attachment: Decodable, Equatable {
+    let index: Int
+    let mime: String
+    let name: String?
+
+    /// The only types the daemon serves, so the only ones decoded.
+    var isImage: Bool {
+      let type = mime.split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+      return ["image/png", "image/jpeg", "image/gif", "image/webp"].contains(type ?? "")
+    }
+  }
+
   let id: String
   let kind: String
   let peer: String?
   let text: String
   let tools: [String]?
+  let attachments: [Attachment]?
   let time: Double
+}
+
+struct AttachmentKey: Hashable {
+  let dot: String
+  let message: String
+  let index: Int
 }
 
 struct FeedItem: Decodable, Equatable, Identifiable {
@@ -77,6 +96,11 @@ enum APIError: Error {
     struct Body: Decodable { let id: String }
     let body = try JSONEncoder().encode(["text": text])
     return try decode(Body.self, await send("POST", "/dots/\(escape(dot))/messages", body: body)).id
+  }
+
+  /// An attachment's bytes, read through the daemon from the dot's own session, never from a URL.
+  func attachment(_ key: AttachmentKey) async throws -> Data {
+    try await send("GET", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/attachments/\(key.index)")
   }
 
   func feed() async throws -> [FeedItem] {

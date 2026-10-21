@@ -116,6 +116,13 @@ export interface Approval {
   readonly resources: readonly string[];
 }
 
+/** A file attached to a user message. OpenCode keeps its bytes inline, as base64. */
+export interface Attachment {
+  readonly mime: string;
+  readonly name: string | undefined;
+  readonly data: string;
+}
+
 /** A user or assistant message in a session's history. */
 export interface Entry {
   readonly id: string;
@@ -123,6 +130,8 @@ export interface Entry {
   readonly text: string;
   /** Names of the tools an assistant message called. */
   readonly tools: readonly string[];
+  /** A user message's attachments, in their original order. */
+  readonly files: readonly Attachment[];
   readonly time: number;
 }
 
@@ -134,6 +143,7 @@ const entry = (item: SessionMessage.Info): Entry[] =>
           role: "user",
           text: item.text,
           tools: [],
+          files: (item.files ?? []).map(({ mime, name, data }) => ({ mime, name, data })),
           time: DateTime.toEpochMillis(item.time.created),
         },
       ]
@@ -147,6 +157,7 @@ const entry = (item: SessionMessage.Info): Entry[] =>
               .join("\n")
               .trim(),
             tools: item.content.flatMap((part) => (part.type === "tool" ? [part.name] : [])),
+            files: [],
             time: DateTime.toEpochMillis(item.time.created),
           },
         ]

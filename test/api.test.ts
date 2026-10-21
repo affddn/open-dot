@@ -1,10 +1,10 @@
-import { beforeEach, expect, test } from "bun:test";
+import { beforeEach, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Effect, Layer } from "effect";
 import { api } from "../src/api";
 import { step } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
-import { OpenCode, OpenCodeError } from "../src/opencode";
+import { type Attachment, OpenCode, OpenCodeError } from "../src/opencode";
 import { dots, feed, outbox, workers } from "../src/schema";
 import { fakeOpenCode } from "./fake-opencode";
 
@@ -56,13 +56,26 @@ const queued = (messageID: string, text: string, from: { fromDot?: string; fromO
     .values({ sessionID: "ses_jojo", messageID, text, state: "sent", createdAt: 0, ...from })
     .run();
 
-const entry = (id: string, role: "user" | "assistant", text: string, tools: string[] = []) => ({
-  id,
-  role,
-  text,
-  tools,
-  time: 0,
+const entry = (
+  id: string,
+  role: "user" | "assistant",
+  text: string,
+  tools: string[] = [],
+  files: Attachment[] = [],
+) => ({ id, role, text, tools, files, time: 0 });
+
+const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 4, 5]);
+const file = (mime: string, data: string | Buffer, name?: string): Attachment => ({
+  mime,
+  name,
+  data: typeof data === "string" ? data : data.toString("base64"),
 });
+const attached = (id: string, files: Attachment[], session = "ses_jojo") =>
+  fake.state.history.set(session, [
+    ...(fake.state.history.get(session) ?? []),
+    entry(id, "user", "", [], files),
+  ]);
 
 test("requests need the token, and only the feed works while OpenCode is down", async () => {
   expect((await call("/dots", { headers: { authorization: "Bearer wrong" } })).status).toBe(401);
@@ -183,4 +196,85 @@ test("posting a message queues it for the daemon to deliver", async () => {
   expect((await post("/dots/dio/messages", JSON.stringify({ text: "Hi" }))).status).toBe(404);
   expect((await post("/dots/%ZZ/messages", JSON.stringify({ text: "Hi" }))).status).toBe(400);
   expect(db.select().from(outbox).all()).toHaveLength(1);
+});
+
+test("messages list attachments as metadata only, and a message with only attachments still shows", async () => {
+  attached("msg_1", [file("image/png", png, "shot.png"), file("application/pdf", "JVBERg==")]);
+  const response = await call("/dots/jojo/messages");
+  const raw = await response.text();
+
+  expect(JSON.parse(raw).messages).toMatchObject([
+    {
+      id: "msg_1",
+      kind: "owner",
+      text: "",
+      attachments: [
+        { index: 0, mime: "image/png", name: "shot.png" },
+        { index: 1, mime: "application/pdf", name: null },
+      ],
+    },
+  ]);
+  expect(raw).not.toContain(png.toString("base64"));
+  expect(raw).not.toContain("JVBERg==");
+});
+
+test("an image's bytes come only from a message in the dot's own session, with the token", async () => {
+  attached("msg_1", [file("image/png", png), file("application/pdf", "JVBERg==")]);
+  attached("msg_9", [file("image/jpeg", jpeg)], "ses_polnareff");
+  const get = (path: string, init: Parameters<typeof call>[1] = {}) =>
+    call(`/dots/jojo/messages/${path}`, init);
+
+  const response = await get("msg_1/attachments/0");
+  expect(response.status).toBe(200);
+  expect(response.headers.get("content-type")).toBe("image/png");
+  expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+  expect(Buffer.from(await response.arrayBuffer())).toEqual(png);
+
+  expect(
+    (await get("msg_1/attachments/0", { headers: { authorization: "Bearer wrong" } })).status,
+  ).toBe(401);
+  // Another dot's message isn't reachable through this dot, even by its exact ID.
+  expect((await get("msg_9/attachments/0")).status).toBe(404);
+  expect((await call("/dots/polnareff/messages/msg_9/attachments/0")).status).toBe(200);
+
+  expect((await get("msg_1/attachments/1")).status).toBe(415);
+  expect((await get("msg_1/attachments/2")).status).toBe(404);
+  expect((await get("msg_2/attachments/0")).status).toBe(404);
+  for (const index of ["01", "-1", "x", "1.0", "99999"])
+    expect((await get(`msg_1/attachments/${index}`)).status).toBe(400);
+  expect((await get("msg_1/attachments/0", { method: "POST" })).status).toBe(404);
+  expect((await get("msg_1/attachments/0/more")).status).toBe(404);
+  expect((await get("msg_1")).status).toBe(404);
+});
+
+test("only an inline image of an allowed type, matching bytes and size is served, and nothing is fetched", async () => {
+  const fetched = spyOn(globalThis, "fetch");
+  try {
+    const big = Buffer.concat([png, Buffer.alloc(10 * 1024 * 1024)]);
+    attached("msg_1", [
+      file("image/png", `data:image/png;base64,${png.toString("base64")}`),
+      file("IMAGE/JPEG; q=1", jpeg),
+      file("image/svg+xml", Buffer.from("<svg/>")),
+      file("image/png", "https://example.test/a.png"),
+      file("image/png", "file:///etc/hosts"),
+      file("image/png", "../../etc/hosts"),
+      file("image/png", jpeg),
+      file("image/png", big),
+      file("image/png", "iVBORw0KGgo"),
+      // Names an object already has must not count as types.
+      file("constructor", png),
+      file("__proto__", png),
+    ]);
+    const status = async (index: number) =>
+      (await call(`/dots/jojo/messages/msg_1/attachments/${index}`)).status;
+
+    const statuses: number[] = [];
+    for (let index = 0; index < 11; index++) statuses.push(await status(index));
+    expect(statuses).toEqual([200, 200, 415, 422, 422, 422, 415, 413, 422, 415, 415]);
+    const jpegResponse = await call("/dots/jojo/messages/msg_1/attachments/1");
+    expect(jpegResponse.headers.get("content-type")).toBe("image/jpeg");
+    expect(fetched).not.toHaveBeenCalled();
+  } finally {
+    fetched.mockRestore();
+  }
 });
