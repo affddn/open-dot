@@ -116,9 +116,11 @@ const feedRoute = (db: Db, request: Request, path: string[]) => {
   return error(404, "Not found");
 };
 
-const route = (db: Db, request: Request): Effect.Effect<Response, OpenCodeError, OpenCode> => {
-  const path = new URL(request.url).pathname.split("/").filter(Boolean);
-  if (path[0] === "feed") return Effect.succeed(feedRoute(db, request, path.slice(1)));
+const route = (
+  db: Db,
+  request: Request,
+  path: string[],
+): Effect.Effect<Response, OpenCodeError, OpenCode> => {
   const [root, name, rest, ...extra] = path;
   if (root !== "dots" || extra.length > 0) return Effect.succeed(error(404, "Not found"));
   if (name === undefined)
@@ -141,14 +143,19 @@ const route = (db: Db, request: Request): Effect.Effect<Response, OpenCodeError,
 /**
  * The daemon's local API for the notch app. Every request needs the token, which only the owner's
  * account can read from api.json, so other local users and web pages can't call it.
+ * The feed doesn't need OpenCode, so it works while OpenCode is down.
  */
 export const api =
-  (db: Db, token: string, layer: Layer.Layer<OpenCode, OpenCodeError>) => (request: Request) =>
-    request.headers.get("authorization") === `Bearer ${token}`
-      ? Effect.runPromise(
-          route(db, request).pipe(
-            Effect.provide(layer),
-            Effect.catch((failure) => Effect.succeed(error(503, failure.message))),
-          ),
-        )
-      : Promise.resolve(error(401, "Unauthorized"));
+  (db: Db, token: string, layer: Layer.Layer<OpenCode, OpenCodeError>) =>
+  (request: Request): Promise<Response> => {
+    if (request.headers.get("authorization") !== `Bearer ${token}`)
+      return Promise.resolve(error(401, "Unauthorized"));
+    const path = new URL(request.url).pathname.split("/").filter(Boolean);
+    if (path[0] === "feed") return Promise.resolve(feedRoute(db, request, path.slice(1)));
+    return Effect.runPromise(
+      route(db, request, path).pipe(
+        Effect.provide(layer),
+        Effect.catch((failure) => Effect.succeed(error(503, failure.message))),
+      ),
+    );
+  };

@@ -64,12 +64,14 @@ const entry = (id: string, role: "user" | "assistant", text: string, tools: stri
   time: 0,
 });
 
-test("requests need the token, and fail with 503 while OpenCode is down", async () => {
+test("requests need the token, and only the feed works while OpenCode is down", async () => {
   expect((await call("/dots", { headers: { authorization: "Bearer wrong" } })).status).toBe(401);
+  expect((await call("/feed", { headers: { authorization: "Bearer wrong" } })).status).toBe(401);
   const down = Layer.effect(OpenCode, Effect.fail(new OpenCodeError({ message: "Not running" })));
   const response = await call("/dots", {}, down);
   expect(response.status).toBe(503);
   expect(await response.json()).toEqual({ error: "Not running" });
+  expect((await call("/feed", {}, down)).status).toBe(200);
 });
 
 test("/dots lists each dot with whether it's busy and its unfinished workers", async () => {
