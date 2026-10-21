@@ -37,8 +37,25 @@ export const outbox = sqliteTable("outbox", {
   fromDot: text("from_dot"),
   // Typed by the owner in the notch app, as opposed to a notice from open-dot.
   fromOwner: integer("from_owner", { mode: "boolean" }).notNull().default(false),
+  // A reply to a feed item: the owner's prompt and the item as the daemon read it from its own DB.
+  // `text` holds both, with the item framed as data.
+  feed: text({ mode: "json" }).$type<FeedSnapshot>(),
   createdAt: integer("created_at").notNull(),
 });
+
+export interface FeedSnapshot {
+  readonly prompt: string;
+  readonly item: {
+    readonly id: number;
+    readonly source: "github" | "linear" | "slack";
+    readonly sourceID: string;
+    readonly reason: string;
+    readonly title: string;
+    readonly context: string;
+    readonly url: string | null;
+    readonly time: number;
+  };
+}
 
 export const notes = sqliteTable("notes", {
   id: integer().primaryKey({ autoIncrement: true }),
@@ -101,8 +118,11 @@ export const feed = sqliteTable(
     url: text(),
     updatedAt: integer("updated_at").notNull(),
     // "dismissed" waits to be marked read at the source, then becomes "cleared".
-    // "read" means the source stopped listing it.
-    state: text({ enum: ["unread", "dismissed", "cleared", "read"] }).notNull(),
+    // "read" means the source stopped listing it. "handed-off" means the owner sent it to dots,
+    // which leaves it unread at its source.
+    state: text({ enum: ["unread", "dismissed", "cleared", "read", "handed-off"] }).notNull(),
+    // Every dot the owner has sent it to, each once. Kept when new activity makes it unread again.
+    handedTo: text("handed_to", { mode: "json" }).$type<string[]>().notNull().default([]),
     createdAt: integer("created_at").notNull(),
   },
   (table) => [unique().on(table.source, table.sourceID)],

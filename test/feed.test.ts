@@ -205,3 +205,25 @@ test("Linear lists unread issue notifications across pages and reports its error
   expect(await failure(source.markRead("n1"))).toContain("Authentication required");
   expect(await linear(fetch, async () => undefined).unread(0)).toBeUndefined();
 });
+
+test("a handed-off item stays handed off until new activity, which brings it back with its dots", async () => {
+  const { source, marked } = fakeSource([item("a", 10)]);
+  await collect(db, source, 100);
+  db.update(feed)
+    .set({ state: "handed-off", handedTo: ["jojo"] })
+    .run();
+
+  // The same activity, or the source no longer listing it, changes nothing.
+  await collect(db, source, 200);
+  expect(state("a")).toBe("handed-off");
+  source.listed = [];
+  await collect(db, source, 300);
+  expect(state("a")).toBe("handed-off");
+
+  source.listed = [item("a", 20)];
+  await collect(db, source, 400);
+  expect(shown()).toEqual(["a"]);
+  expect(unreadFeed(db)[0]?.handedTo).toEqual(["jojo"]);
+  // Handing off never marks an item read at its source.
+  expect(marked).toEqual([]);
+});

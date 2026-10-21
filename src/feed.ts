@@ -1,4 +1,4 @@
-import { and, asc, eq, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, notInArray, sql } from "drizzle-orm";
 import { Schema } from "effect";
 import type { Db } from "./db";
 import { feed, type FeedItem } from "./schema";
@@ -24,7 +24,8 @@ export type Source = {
 /**
  * Saves the source's unread items, and marks what the owner dismissed as read at its source.
  * An item the source no longer lists was read there or is too old, so it leaves the feed until
- * the source lists it again. A dismissed item comes back only with new activity.
+ * the source lists it again. A dismissed or handed-off item comes back only with new activity, and
+ * one handed off keeps the dots it went to.
  */
 export async function collect(db: Db, source: Source, now: number) {
   const items = await source.unread(now - window);
@@ -80,6 +81,17 @@ export async function collect(db: Db, source: Source, now: number) {
 /** Unread items, oldest first, so the newest sit at the bottom like a chat. */
 export const unreadFeed = (db: Db) =>
   db.select().from(feed).where(eq(feed.state, "unread")).orderBy(asc(feed.updatedAt)).all();
+
+/** The 20 items most recently active that the owner handed to dots, oldest first. */
+export const handedOffFeed = (db: Db) =>
+  db
+    .select()
+    .from(feed)
+    .where(eq(feed.state, "handed-off"))
+    .orderBy(desc(feed.updatedAt))
+    .limit(20)
+    .all()
+    .toReversed();
 
 /**
  * Hides an item now, and the daemon marks it read at its source on its next pass.

@@ -170,20 +170,33 @@ struct ExpandedView: View {
 struct Composer: View {
   let placeholder: String
   @Binding var text: String
+  var canSend = true
   let send: () -> Void
   @State private var height: CGFloat = 22
 
   var body: some View {
-    let empty = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let blocked = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !canSend
     HStack(alignment: .bottom) {
       DraftEditor(text: $text, height: $height, placeholder: placeholder, send: send)
         .frame(height: height)
+        .overlay(alignment: .topLeading) {
+          // The editor's own label is for VoiceOver only, so the placeholder is drawn over it.
+          if text.isEmpty {
+            Text(placeholder)
+              .font(.system(size: 13))
+              .foregroundStyle(.tertiary)
+              .padding(.leading, 5)
+              .padding(.top, 3)
+              .allowsHitTesting(false)
+              .accessibilityHidden(true)
+          }
+        }
       Button(action: send) {
         Image(systemName: "arrow.up.circle.fill").font(.title2)
       }
       .buttonStyle(.plain)
-      .disabled(empty)
-      .opacity(empty ? 0.4 : 1)
+      .disabled(blocked)
+      .opacity(blocked ? 0.4 : 1)
       .accessibilityLabel("Send")
       .accessibilityIdentifier("send")
     }
@@ -304,25 +317,23 @@ struct FeedList: View {
   let store: Store
   @State private var atBottom = true
   @State private var unseen = 0
+  @State private var showHanded = false
 
   var body: some View {
     let items = store.feed
-    if let status = store.feedStatus {
+    if let item = store.replying {
+      ReplyBox(store: store, item: item)
+    } else if let status = store.feedStatus {
       Text(status).foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
-    } else if items.isEmpty {
+    } else if items.isEmpty && store.handedOff.isEmpty {
       Text("Nothing needs you right now.").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
     } else {
       GeometryReader { viewport in
         ScrollViewReader { proxy in
           ScrollView {
             VStack(spacing: 6) {
-              ForEach(items) { item in
-                FeedRow(item: item, error: store.feedErrors[item.id]) {
-                  store.dismissFeed(item)
-                } clearError: {
-                  store.clearFeedError(item.id)
-                }
-              }
+              handed
+              ForEach(items) { item in row(item, dismiss: { store.dismissFeed(item) }) }
               Color.clear.frame(height: 1).id("end").background {
                 GeometryReader { end in
                   Color.clear.onChange(of: end.frame(in: .named("feed")).minY <= viewport.size.height + 8, initial: true) {
@@ -363,12 +374,134 @@ struct FeedList: View {
       .accessibilityIdentifier("feed-list")
     }
   }
+
+  private func row(_ item: FeedItem, dismiss: (() -> Void)? = nil) -> some View {
+    FeedRow(item: item, error: store.feedErrors[item.id], dismiss: dismiss, reply: { store.startReply(item) }) {
+      store.clearFeedError(item.id)
+    }
+  }
+
+  /// Items already sent to dots, collapsed. Each can still go to more dots.
+  @ViewBuilder private var handed: some View {
+    let items = store.handedOff
+    if !items.isEmpty {
+      DisclosureGroup(isExpanded: $showHanded) {
+        VStack(spacing: 6) { ForEach(items) { row($0) } }
+      } label: {
+        HStack(spacing: 4) {
+          Text("Handed off (\(items.count))")
+          if items.contains(where: { store.feedErrors[$0.id] != nil }) {
+            Text("· some sends failed").foregroundStyle(.red)
+          }
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(.secondary)
+      }
+      .accessibilityIdentifier("feed-handed-off")
+    }
+  }
+}
+
+/// The feed item being replied to, the dots to send it to, and the prompt.
+struct ReplyBox: View {
+  let store: Store
+  let item: FeedItem
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      HStack {
+        Text("Reply").font(.callout.weight(.semibold))
+        Spacer()
+        Button("Cancel") { store.cancelReply() }
+          .buttonStyle(.plain)
+          .foregroundStyle(.secondary)
+          .accessibilityIdentifier("reply-cancel")
+      }
+      QuoteCard(item: item)
+      ScrollView(.horizontal) {
+        HStack(spacing: 4) {
+          ForEach(store.dots, id: \.name) { dot in
+            let picked = store.replyDots.contains(dot.name)
+            Button { store.toggleReplyDot(dot.name) } label: {
+              HStack(spacing: 3) {
+                if item.handedTo?.contains(dot.name) == true { Image(systemName: "checkmark").font(.caption2) }
+                Text(dot.name).font(.callout.weight(.medium))
+              }
+              .padding(.horizontal, 10)
+              .padding(.vertical, 4)
+              .background(Capsule().fill(.white.opacity(picked ? 0.25 : 0.06)))
+              .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .help(item.handedTo?.contains(dot.name) == true ? "Already has it" : "")
+            .accessibilityAddTraits(picked ? .isSelected : [])
+            .accessibilityIdentifier("reply-dot-\(dot.name)")
+          }
+        }
+      }
+      .scrollIndicators(.hidden)
+      HStack(spacing: 6) {
+        quick("Start on it", Store.startPrompt)
+        quick("Use as context", Store.contextPrompt)
+      }
+      Spacer(minLength: 0)
+      Composer(
+        placeholder: store.replyDots.isEmpty ? "Pick a dot first" : "Prompt for \(store.replyDots.joined(separator: ", "))",
+        text: Binding { store.replyDraft } set: { store.replyDraft = $0 },
+        canSend: !store.replyDots.isEmpty
+      ) {
+        store.sendReply()
+      }
+      .id("reply-\(item.id)")
+    }
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("reply-box")
+  }
+
+  /// Fills the prompt box with text to edit. It sends nothing.
+  private func quick(_ title: String, _ prompt: String) -> some View {
+    Button(title) { store.replyDraft = prompt }
+      .buttonStyle(.plain)
+      .font(.caption.weight(.medium))
+      .padding(.horizontal, 8)
+      .padding(.vertical, 3)
+      .background(Capsule().fill(.white.opacity(0.1)))
+  }
+}
+
+/// A feed item quoted in a reply. Only its web link opens.
+struct QuoteCard: View {
+  let item: FeedItem
+
+  var body: some View {
+    HStack(alignment: .top, spacing: 8) {
+      SourceMark(source: item.source)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(verbatim: "\(item.reason) · \(item.context)").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+        Text(verbatim: item.title).font(.caption).lineLimit(2)
+      }
+    }
+    .padding(8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(RoundedRectangle(cornerRadius: 8).strokeBorder(.white.opacity(0.2)))
+    .contentShape(Rectangle())
+    .onTapGesture { openWebLink(item.url) }
+    .accessibilityElement(children: .combine)
+    .accessibilityIdentifier("quote-\(item.id)")
+  }
+}
+
+/// Feed links come from outside, so only web links open.
+@MainActor func openWebLink(_ link: String?) {
+  guard let link, let url = URL(string: link), ["http", "https"].contains(url.scheme?.lowercased()) else { return }
+  NSWorkspace.shared.open(url)
 }
 
 struct FeedRow: View {
   let item: FeedItem
   let error: String?
-  let dismiss: () -> Void
+  let dismiss: (() -> Void)?
+  let reply: () -> Void
   let clearError: () -> Void
   @State private var hovering = false
 
@@ -384,15 +517,25 @@ struct FeedRow: View {
             Text(verbatim: ago(item.time)).font(.caption2).foregroundStyle(.tertiary)
           }
           Text(verbatim: item.title).font(.callout).lineLimit(2)
+          if let dots = item.handedTo, !dots.isEmpty {
+            Text(verbatim: "with \(dots.joined(separator: ", "))").font(.caption2).foregroundStyle(.tertiary)
+          }
         }
-        Button(action: dismiss) {
-          Image(systemName: "xmark").font(.caption2.weight(.bold)).padding(4).contentShape(Rectangle())
+        Button("Reply", action: reply)
+          .buttonStyle(.plain)
+          .font(.caption.weight(.semibold))
+          .opacity(hovering ? 1 : 0.35)
+          .accessibilityIdentifier("feed-reply-\(item.id)")
+        if let dismiss {
+          Button(action: dismiss) {
+            Image(systemName: "xmark").font(.caption2.weight(.bold)).padding(4).contentShape(Rectangle())
+          }
+          .buttonStyle(.plain)
+          .foregroundStyle(.secondary)
+          .opacity(hovering ? 1 : 0.35)
+          .accessibilityLabel("Dismiss")
+          .accessibilityIdentifier("feed-dismiss-\(item.id)")
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(.secondary)
-        .opacity(hovering ? 1 : 0.35)
-        .accessibilityLabel("Dismiss")
-        .accessibilityIdentifier("feed-dismiss-\(item.id)")
       }
       if let error {
         Text("\(error) · click to clear").font(.caption2).foregroundStyle(.red).onTapGesture(perform: clearError)
@@ -403,15 +546,9 @@ struct FeedRow: View {
     .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(hovering ? 0.1 : 0.05)))
     .contentShape(Rectangle())
     .onHover { hovering = $0 }
-    .onTapGesture { open() }
+    .onTapGesture { openWebLink(item.url) }
     .accessibilityElement(children: .contain)
     .accessibilityIdentifier("feed-item-\(item.id)")
-  }
-
-  /// Feed links come from outside, so only web links open.
-  private func open() {
-    guard let link = item.url, let url = URL(string: link), ["http", "https"].contains(url.scheme?.lowercased()) else { return }
-    NSWorkspace.shared.open(url)
   }
 
   private func ago(_ time: Double) -> String {
@@ -455,6 +592,7 @@ struct MessageRow: View {
       HStack {
         Spacer(minLength: 60)
         VStack(alignment: .trailing, spacing: 4) {
+          if let item = message.feed { QuoteCard(item: item).frame(maxWidth: 300) }
           if !message.text.isEmpty { Bubble(text: message.text, fill: messageBlue) }
           attachments
         }
@@ -583,6 +721,7 @@ struct PendingRow: View {
     HStack {
       Spacer(minLength: 60)
       VStack(alignment: .trailing, spacing: 3) {
+        if let feed = item.feed { QuoteCard(item: feed).frame(maxWidth: 300).opacity(0.6) }
         Bubble(text: item.text, fill: messageBlue).opacity(0.6)
         if let error = item.error {
           Text("\(error) · click to dismiss").font(.caption2).foregroundStyle(.red)

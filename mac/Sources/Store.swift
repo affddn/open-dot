@@ -6,6 +6,8 @@ struct Pending: Identifiable {
   let id = UUID()
   let text: String
   let sentAt = Date().timeIntervalSince1970 * 1000
+  /// The feed item it replies to.
+  var feed: FeedItem?
   var messageID: String?
   var error: String?
 }
@@ -20,6 +22,11 @@ struct Pending: Identifiable {
   var drafts: [String: String] = [:]
   var expanded = false
   var feed: [FeedItem] = []
+  var handedOff: [FeedItem] = []
+  /// The feed item being replied to, the dots it goes to in the order picked, and the prompt.
+  var replying: FeedItem?
+  var replyDots: [String] = []
+  var replyDraft = ""
   var feedErrors: [Int: String] = [:]
   var feedStatus: String?
   var showingFeed = false
@@ -100,6 +107,54 @@ struct Pending: Identifiable {
         update(name, item.id) { $0.error = Self.describe(error) }
       }
     }
+  }
+
+  static let startPrompt = "Take this on. Work out what it needs and get it done, delegating a worker or tracking it as a responsibility if it's more than a quick answer. Tell me what you decide."
+  static let contextPrompt = "Keep this in mind as context. Tell me briefly what it means for what we're working on."
+
+  /// Opens the reply box, with the dot last chatted with picked.
+  func startReply(_ item: FeedItem) {
+    if replying?.id != item.id { replyDraft = "" }
+    replying = item
+    replyDots = (selected ?? dots.first?.name).map { [$0] } ?? []
+  }
+
+  func toggleReplyDot(_ name: String) {
+    if let index = replyDots.firstIndex(of: name) { replyDots.remove(at: index) } else { replyDots.append(name) }
+  }
+
+  func cancelReply() {
+    replying = nil
+  }
+
+  /// Sends the prompt and item to each picked dot once, then opens the first one's chat. Each send
+  /// shows as a pending message in its dot's chat. A failed or unknown one keeps its prompt there
+  /// and is named under the item, and is never sent again on its own.
+  func sendReply() {
+    guard let item = replying else { return }
+    let text = replyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    let targets = replyDots
+    guard !text.isEmpty, let first = targets.first else { return }
+    replying = nil
+    replyDraft = ""
+    feedErrors[item.id] = nil
+    for dot in targets {
+      let pendingItem = Pending(text: text, feed: item)
+      pending[dot, default: []].append(pendingItem)
+      Task {
+        do {
+          let id = try await api.post(dot, text: text, feed: item.id)
+          update(dot, pendingItem.id) { $0.messageID = id }
+        } catch {
+          let message = Self.describe(error)
+          update(dot, pendingItem.id) { $0.error = message }
+          let note = "\(dot): \(message)"
+          feedErrors[item.id] = feedErrors[item.id].map { "\($0) · \(note)" } ?? note
+        }
+        await refreshFeed()
+      }
+    }
+    select(first)
   }
 
   func dismiss(_ name: String, _ id: UUID) {
@@ -208,7 +263,9 @@ struct Pending: Identifiable {
     let settled = dismissed
     let items: [FeedItem]
     do {
-      items = try await api.feed()
+      let result = try await api.feed()
+      items = result.items
+      handedOff = result.handedOff
     } catch {
       feedStatus = Self.describe(error)
       return
