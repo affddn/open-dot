@@ -4,7 +4,7 @@ import { Effect } from "effect";
 import { step } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
 import { outbox, slack, dots } from "../src/schema";
-import { slackChat, slackClient } from "../src/slack";
+import { slackChat, slackClient, slackFeed } from "../src/slack";
 import { fakeOpenCode } from "./fake-opencode";
 
 const owner = "UOWNER";
@@ -222,4 +222,64 @@ test("a reply is saved before it is posted under the dot's name, and a lost post
   await pass();
   expect(row(fourth)?.state).toBe("failed");
   expect(fake.state.posts).toHaveLength(3);
+});
+
+const match = (n: number, user: string, channel: Record<string, unknown>, text = "hey") => ({
+  ts: ts(n),
+  user,
+  text,
+  permalink: `https://slack.test/${n}`,
+  channel,
+});
+
+test("the feed lists mentions and unread DMs from others, not the owner's, the bot's or read ones", async () => {
+  const general = { id: "C1", name: "general" };
+  const friend = { id: "D1", is_im: true };
+  const read = { id: "D2", is_im: true };
+  fake.state.mentions = [
+    match(1, "UOTHER", general, "hey <@UOWNER> &amp; look"),
+    match(2, owner, general),
+    { ...match(3, "UOTHER", general), ts: "999.000000" },
+    match(4, "UFRIEND", friend),
+  ];
+  fake.state.dms = [
+    match(4, "UFRIEND", friend),
+    match(5, "UFRIEND", friend, "lunch?"),
+    match(6, "UREAD", read),
+    match(7, botUser, { id: dm, is_im: true }),
+    match(8, "UOTHER", general),
+  ];
+  fake.state.lastRead.set("D2", ts(6));
+  await fake.client.dm();
+
+  const items = await slackFeed(fake.client).unread(started);
+
+  expect(items).toEqual([
+    {
+      sourceID: `C1/${ts(1)}`,
+      reason: "Mentioned",
+      title: "hey <@UOWNER> & look",
+      context: "#general",
+      url: "https://slack.test/1",
+      updatedAt: started,
+    },
+    {
+      sourceID: `D1/${ts(4)}`,
+      reason: "Mentioned",
+      title: "hey",
+      context: "DM",
+      url: "https://slack.test/4",
+      updatedAt: started,
+    },
+    {
+      sourceID: `D1/${ts(5)}`,
+      reason: "Direct message",
+      title: "lunch?",
+      context: "DM",
+      url: "https://slack.test/5",
+      updatedAt: started,
+    },
+  ]);
+  expect(fake.state.infos).toEqual(["D1", "D2"]);
+  expect(fake.state.queries).toEqual([`<@${owner}> after:1969-12-31`, "is:dm after:1969-12-31"]);
 });

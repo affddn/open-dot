@@ -9,7 +9,7 @@ import { createDot, ensureSession, listDots, pickDot } from "./dots";
 import { collect, github, linear } from "./feed";
 import { apiPath, databasePath } from "./home";
 import { OpenCode } from "./opencode";
-import { slackChat, slackClient } from "./slack";
+import { slackChat, slackClient, slackFeed } from "./slack";
 
 const usage = `Usage:
   open-dot create <name> [purpose]   Create a dot and its OpenCode session
@@ -74,7 +74,7 @@ const serve = Effect.sync(() => {
 });
 
 const slack = slackClient();
-const sources = [github(), linear()];
+const sources = [github(), linear(), slackFeed(slack)];
 
 /** One pass of the owner's chat with the dots in Slack. Problems are logged inside. */
 const converse = slackChat(db, slack, OpenCode.layer);

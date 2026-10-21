@@ -86,12 +86,12 @@ export const workers = sqliteTable("workers", {
 
 export type Worker = typeof workers.$inferSelect;
 
-/** Recent GitHub and Linear notifications that need the owner's attention. */
+/** Recent GitHub, Linear and Slack notifications that need the owner's attention. */
 export const feed = sqliteTable(
   "feed",
   {
     id: integer().primaryKey({ autoIncrement: true }),
-    source: text({ enum: ["github", "linear"] }).notNull(),
+    source: text({ enum: ["github", "linear", "slack"] }).notNull(),
     // The notification's ID at its source, used to mark it read there.
     sourceID: text("source_id").notNull(),
     reason: text().notNull(),

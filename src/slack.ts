@@ -3,7 +3,7 @@ import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { Cause, Effect, type Layer, Schema } from "effect";
 import type { Db } from "./db";
 import { listDots } from "./dots";
-import { type Fetch, output } from "./feed";
+import { type Fetch, output, type Source } from "./feed";
 import { OpenCode, type OpenCodeError } from "./opencode";
 import { dots, outbox, slack } from "./schema";
 
@@ -391,4 +391,109 @@ export function slackChat(
       discard: true,
     },
   );
+}
+
+// Unverified search modifiers until a live test. The local filters in slackFeed keep a wrong one
+// from showing messages that don't need the owner.
+export const mentionQuery = (owner: string, day: string) => `<@${owner}> after:${day}`;
+export const dmQuery = (day: string) => `is:dm after:${day}`;
+
+const Match = Schema.Struct({
+  ts: Schema.String,
+  type: Schema.optionalKey(Schema.String),
+  user: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  text: Schema.optionalKey(Schema.String),
+  permalink: Schema.optionalKey(Schema.String),
+  channel: Schema.Struct({
+    id: Schema.String,
+    name: Schema.optionalKey(Schema.String),
+    is_im: Schema.optionalKey(Schema.Boolean),
+    is_mpim: Schema.optionalKey(Schema.Boolean),
+  }),
+});
+type Match = typeof Match.Type;
+
+const Search = Schema.Struct({ messages: Schema.Struct({ matches: Schema.Array(Match) }) });
+const Info = Schema.Struct({
+  channel: Schema.Struct({ last_read: Schema.optionalKey(Schema.String) }),
+});
+
+const isIM = (match: Match) =>
+  match.channel.is_im === true || match.type === "im" || match.channel.id.startsWith("D");
+const isDirect = (match: Match) => isIM(match) || match.channel.is_mpim === true;
+
+const headline = (text: string) => {
+  const line = unescape(text).replace(/\s+/g, " ").trim();
+  return line.length > 200 ? `${line.slice(0, 199)}…` : line;
+};
+
+/**
+ * Slack mentions of the owner and DMs to them, with the owner's user token. A DM leaves the feed
+ * once the owner reads it in Slack. Slack has no read state for a mention in a channel, so one
+ * stays until dismissed or a day old, and dismissing it changes nothing in Slack.
+ */
+export function slackFeed(client: Slack): Source {
+  return {
+    name: "slack",
+    unread: async (since) => {
+      const owner = await client.owner();
+      if (!owner) return undefined;
+      // Search filters by day, so ask for a day more and filter by time here.
+      const day = new Date(since - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const search = async (query: string) => {
+        const body = await client.read("user", "search.messages", {
+          query,
+          sort: "timestamp",
+          count: "100",
+        });
+        return body && Schema.decodeUnknownSync(Search)(body).messages.matches;
+      };
+      const mentions = await search(mentionQuery(owner, day));
+      const direct = await search(dmQuery(day));
+      if (!mentions || !direct) return undefined;
+      const dm = client.knownDM();
+      const bot = dm ? undefined : await client.bot();
+      const found = new Map<string, { match: Match; reason: string }>();
+      for (const [matches, mention] of [
+        [mentions, true],
+        [direct, false],
+      ] as const) {
+        for (const match of matches) {
+          const id = `${match.channel.id}/${match.ts}`;
+          if (
+            found.has(id) ||
+            Number(match.ts) * 1000 < since ||
+            match.user === owner ||
+            (dm ? match.channel.id === dm : bot !== undefined && match.user === bot) ||
+            (!mention && !isDirect(match))
+          )
+            continue;
+          found.set(id, { match, reason: mention ? "Mentioned" : "Direct message" });
+        }
+      }
+      const lastRead = new Map<string, string | undefined>();
+      for (const { match } of found.values()) {
+        if (!isIM(match) || lastRead.has(match.channel.id)) continue;
+        const body = await client.read("user", "conversations.info", { channel: match.channel.id });
+        if (!body) return undefined;
+        lastRead.set(match.channel.id, Schema.decodeUnknownSync(Info)(body).channel.last_read);
+      }
+      return [...found].flatMap(([sourceID, { match, reason }]) => {
+        const read = lastRead.get(match.channel.id);
+        if (read !== undefined && !after(match.ts, read)) return [];
+        return [
+          {
+            sourceID,
+            reason,
+            title: headline(match.text ?? ""),
+            context: isDirect(match) ? "DM" : `#${match.channel.name ?? match.channel.id}`,
+            url: match.permalink ?? null,
+            updatedAt: Math.round(Number(match.ts) * 1000),
+          },
+        ];
+      });
+    },
+    // Dismissing hides the item in the notch only.
+    markRead: async () => {},
+  };
 }
