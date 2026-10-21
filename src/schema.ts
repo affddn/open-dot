@@ -1,4 +1,4 @@
-import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { integer, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
 
 export const dots = sqliteTable("dots", {
   name: text().primaryKey(),
@@ -85,3 +85,26 @@ export const workers = sqliteTable("workers", {
 });
 
 export type Worker = typeof workers.$inferSelect;
+
+/** Recent GitHub and Linear notifications that need the owner's attention. */
+export const feed = sqliteTable(
+  "feed",
+  {
+    id: integer().primaryKey({ autoIncrement: true }),
+    source: text({ enum: ["github", "linear"] }).notNull(),
+    // The notification's ID at its source, used to mark it read there.
+    sourceID: text("source_id").notNull(),
+    reason: text().notNull(),
+    title: text().notNull(),
+    // Where it happened, such as a repository or a Linear issue's identifier.
+    context: text().notNull(),
+    url: text(),
+    updatedAt: integer("updated_at").notNull(),
+    // "dismissed" means dismissed in the notch but not yet marked read at the source.
+    state: text({ enum: ["unread", "dismissed", "read"] }).notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [unique().on(table.source, table.sourceID)],
+);
+
+export type FeedItem = typeof feed.$inferSelect;

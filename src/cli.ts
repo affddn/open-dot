@@ -6,6 +6,7 @@ import { api } from "./api";
 import { claimDue, hasWork, step } from "./daemon";
 import { openDatabase } from "./db";
 import { createDot, ensureSession, listDots, pickDot } from "./dots";
+import { collect, github, linear } from "./feed";
 import { apiPath, databasePath } from "./home";
 import { OpenCode } from "./opencode";
 
@@ -71,9 +72,33 @@ const serve = Effect.sync(() => {
   console.log(`open-dot API on http://127.0.0.1:${server.port}`);
 });
 
+const sources = [github(), linear()];
+
+/** Collects each source's feed. One failing source doesn't stop the others. */
+const gather = Effect.promise(() =>
+  Promise.all(
+    sources.map((source) =>
+      collect(db, source, Date.now()).catch((error: unknown) =>
+        console.error(
+          `Feed from ${source.name}: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      ),
+    ),
+  ),
+);
+
 const daemon = Effect.sync(() => console.log(`open-dot daemon watching ${databasePath()}`)).pipe(
   Effect.andThen(serve),
-  Effect.andThen(Effect.repeat(tick, Schedule.spaced("1 second"))),
+  Effect.andThen(
+    Effect.all(
+      [
+        Effect.repeat(tick, Schedule.spaced("1 second")),
+        // GitHub asks clients to poll notifications at most once a minute.
+        Effect.repeat(gather, Schedule.spaced("1 minute")),
+      ],
+      { concurrency: "unbounded", discard: true },
+    ),
+  ),
 );
 
 const program =
