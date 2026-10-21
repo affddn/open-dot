@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, lt, notInArray } from "drizzle-orm";
+import { and, asc, eq, notInArray, sql } from "drizzle-orm";
 import { Schema } from "effect";
 import type { Db } from "./db";
 import { feed, type FeedItem } from "./schema";
@@ -22,21 +22,26 @@ export type Source = {
 };
 
 /**
- * Marks what the owner dismissed as read at its source, then saves the source's unread items.
- * An item the source no longer lists was read there or is too old, so it leaves the feed.
- * New activity on a dismissed item brings it back, as it does at the source.
+ * Saves the source's unread items, and marks what the owner dismissed as read at its source.
+ * An item the source no longer lists was read there or is too old, so it leaves the feed until
+ * the source lists it again. A dismissed item comes back only with new activity.
  */
 export async function collect(db: Db, source: Source, now: number) {
+  const items = await source.unread(now - window);
+  if (!items) return;
+  const listed = new Map(items.map((item) => [item.sourceID, item.updatedAt]));
   const dismissed = db
     .select()
     .from(feed)
     .where(and(eq(feed.source, source.name), eq(feed.state, "dismissed")))
     .all();
   for (const row of dismissed) {
+    // Activity after the dismissal brings the item back below instead.
+    if ((listed.get(row.sourceID) ?? 0) > row.updatedAt) continue;
     try {
       await source.markRead(row.sourceID);
       db.update(feed)
-        .set({ state: "read" })
+        .set({ state: "cleared" })
         .where(and(eq(feed.id, row.id), eq(feed.state, "dismissed")))
         .run();
     } catch (error) {
@@ -45,8 +50,6 @@ export async function collect(db: Db, source: Source, now: number) {
       );
     }
   }
-  const items = await source.unread(now - window);
-  if (!items) return;
   db.transaction((tx) => {
     for (const item of items) {
       tx.insert(feed)
@@ -54,7 +57,7 @@ export async function collect(db: Db, source: Source, now: number) {
         .onConflictDoUpdate({
           target: [feed.source, feed.sourceID],
           set: { ...item, state: "unread" },
-          setWhere: lt(feed.updatedAt, item.updatedAt),
+          setWhere: sql`${feed.state} in ('unread', 'read') or ${feed.updatedAt} < ${item.updatedAt}`,
         })
         .run();
     }
@@ -63,7 +66,7 @@ export async function collect(db: Db, source: Source, now: number) {
       .where(
         and(
           eq(feed.source, source.name),
-          inArray(feed.state, ["unread", "dismissed"]),
+          eq(feed.state, "unread"),
           notInArray(
             feed.sourceID,
             items.map((item) => item.sourceID),
@@ -90,11 +93,15 @@ export function dismiss(db: Db, id: number) {
   return db.select({ id: feed.id }).from(feed).where(eq(feed.id, id)).get() !== undefined;
 }
 
-/** A command's trimmed output, or undefined when it fails or isn't installed. */
-function output(command: string[]) {
+/**
+ * A command's trimmed output, or undefined when it fails, isn't installed or takes over 10 seconds,
+ * such as a Keychain prompt nobody answers. It runs without blocking the daemon.
+ */
+async function output(command: string[]) {
   try {
-    const result = Bun.spawnSync(command, { stdout: "pipe", stderr: "ignore" });
-    return (result.success && result.stdout.toString().trim()) || undefined;
+    const child = Bun.spawn(command, { stdout: "pipe", stderr: "ignore", timeout: 10_000 });
+    const [text, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+    return (code === 0 && text.trim()) || undefined;
   } catch {
     return undefined;
   }
@@ -120,7 +127,8 @@ const Threads = Schema.Array(Thread);
 const githubPage = (thread: typeof Thread.Type) =>
   thread.subject.url
     ?.replace("https://api.github.com/repos/", "https://github.com/")
-    .replace(/\/pulls\/(\d+)$/, "/pull/$1") ?? thread.repository.html_url;
+    .replace(/\/pulls\/(\d+)$/, "/pull/$1")
+    .replace(/\/commits\/(\w+)$/, "/commit/$1") ?? thread.repository.html_url;
 
 /** GitHub notifications, with the token of the `gh` login. The token stays in memory. */
 export function github(
@@ -129,7 +137,7 @@ export function github(
 ): Source {
   let saved: string | undefined;
   const call = async (path: string, method = "GET") => {
-    saved ??= token();
+    saved ??= await token();
     if (!saved) return undefined;
     const response = await fetch(`https://api.github.com${path}`, {
       method,
@@ -190,6 +198,10 @@ const FeedReply = Schema.Struct({
   data: Schema.optionalKey(
     Schema.Struct({
       notifications: Schema.Struct({
+        pageInfo: Schema.Struct({
+          hasNextPage: Schema.Boolean,
+          endCursor: Schema.NullOr(Schema.String),
+        }),
         nodes: Schema.Array(
           Schema.Struct({
             id: Schema.String,
@@ -229,8 +241,9 @@ function linearData<D>(
   throw new Error(`Linear answered ${status}: ${messages}`);
 }
 
-const linearQuery = `query Feed($since: DateTimeOrDuration!, $types: [String!]!) {
-  notifications(first: 100, orderBy: updatedAt, filter: { updatedAt: { gt: $since }, type: { in: $types } }) {
+const linearQuery = `query Feed($since: DateTimeOrDuration!, $types: [String!]!, $after: String) {
+  notifications(first: 100, after: $after, orderBy: updatedAt, filter: { updatedAt: { gt: $since }, type: { in: $types } }) {
+    pageInfo { hasNextPage endCursor }
     nodes { id type readAt updatedAt ... on IssueNotification { issue { identifier title url } } }
   }
 }`;
@@ -245,7 +258,7 @@ export function linear(
   key = () => output(["security", "find-generic-password", "-s", "open-dot-linear", "-w"]),
 ): Source {
   const call = async (query: string, variables: Record<string, unknown>) => {
-    const secret = key();
+    const secret = await key();
     if (!secret) return undefined;
     const response = await fetch("https://api.linear.app/graphql", {
       method: "POST",
@@ -258,13 +271,23 @@ export function linear(
   return {
     name: "linear",
     unread: async (since) => {
-      const reply = await call(linearQuery, {
-        since: new Date(since).toISOString(),
-        types: Object.keys(linearReasons),
-      });
-      if (!reply) return undefined;
-      const data = linearData(reply.status, Schema.decodeUnknownSync(FeedReply)(reply.body));
-      return data.notifications.nodes.flatMap((notification) => {
+      const nodes = [];
+      for (let after: string | null = null; ;) {
+        const reply = await call(linearQuery, {
+          since: new Date(since).toISOString(),
+          types: Object.keys(linearReasons),
+          after,
+        });
+        if (!reply) return undefined;
+        const { notifications } = linearData(
+          reply.status,
+          Schema.decodeUnknownSync(FeedReply)(reply.body),
+        );
+        nodes.push(...notifications.nodes);
+        if (!notifications.pageInfo.hasNextPage) break;
+        after = notifications.pageInfo.endCursor;
+      }
+      return nodes.flatMap((notification) => {
         const reason = linearReasons[notification.type];
         if (!reason || notification.readAt || !notification.issue) return [];
         return [
@@ -282,7 +305,8 @@ export function linear(
     markRead: async (id) => {
       const reply = await call(linearRead, { id, readAt: new Date().toISOString() });
       if (!reply) throw new Error("There's no Linear key in the Keychain");
-      linearData(reply.status, Schema.decodeUnknownSync(ReadReply)(reply.body));
+      const data = linearData(reply.status, Schema.decodeUnknownSync(ReadReply)(reply.body));
+      if (!data.notificationUpdate.success) throw new Error(`Linear didn't mark ${id} read`);
     },
   };
 }

@@ -100,8 +100,9 @@ export const feed = sqliteTable(
     context: text().notNull(),
     url: text(),
     updatedAt: integer("updated_at").notNull(),
-    // "dismissed" means dismissed in the notch but not yet marked read at the source.
-    state: text({ enum: ["unread", "dismissed", "read"] }).notNull(),
+    // "dismissed" waits to be marked read at the source, then becomes "cleared".
+    // "read" means the source stopped listing it.
+    state: text({ enum: ["unread", "dismissed", "cleared", "read"] }).notNull(),
     createdAt: integer("created_at").notNull(),
   },
   (table) => [unique().on(table.source, table.sourceID)],

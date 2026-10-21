@@ -56,6 +56,10 @@ test("the feed follows the source: new items appear, read ones leave, oldest fir
   await collect(db, source, 200);
   expect(shown()).toEqual(["b", "c"]);
   expect(state("a")).toBe("read");
+
+  source.listed = [item("a", 10), item("b", 20), item("c", 30)];
+  await collect(db, source, 300);
+  expect(shown()).toEqual(["a", "b", "c"]);
 });
 
 test("dismissing hides an item and marks it read at the source once", async () => {
@@ -80,6 +84,17 @@ test("dismissing hides an item and marks it read at the source once", async () =
 
   source.listed = [item("a", 50)];
   await collect(db, source, 500);
+  expect(shown()).toEqual(["a"]);
+});
+
+test("activity after a dismissal brings the item back instead of marking it read", async () => {
+  const { source, marked } = fakeSource([item("a", 10)]);
+  await collect(db, source, 100);
+  dismiss(db, unreadFeed(db)[0]?.id ?? 0);
+
+  source.listed = [item("a", 20)];
+  await collect(db, source, 200);
+  expect(marked).toEqual([]);
   expect(shown()).toEqual(["a"]);
 });
 
@@ -112,9 +127,10 @@ test("GitHub lists recent review requests, mentions and assignments with web lin
         thread("2", "mention", "https://api.github.com/repos/acme/app/issues/7"),
         thread("3", "comment", "https://api.github.com/repos/acme/app/issues/8"),
         thread("4", "assign", null),
+        thread("5", "mention", "https://api.github.com/repos/acme/app/commits/0a1b2c"),
       ]);
     },
-    () => (tokens++ === 0 ? "expired" : "fresh"),
+    async () => (tokens++ === 0 ? "expired" : "fresh"),
   );
 
   expect(await failure(source.unread(Date.parse("2026-10-20T05:00:00Z")))).toContain("401");
@@ -123,6 +139,7 @@ test("GitHub lists recent review requests, mentions and assignments with web lin
     ["Review requested", "https://github.com/acme/app/pull/12"],
     ["Mentioned", "https://github.com/acme/app/issues/7"],
     ["Assigned", "https://github.com/acme/app"],
+    ["Mentioned", "https://github.com/acme/app/commit/0a1b2c"],
   ]);
   const url = new URL(requests.at(-1)?.url ?? "");
   expect(url.searchParams.get("since")).toBe("2026-10-20T05:00:00.000Z");
@@ -131,51 +148,56 @@ test("GitHub lists recent review requests, mentions and assignments with web lin
   await source.markRead("1");
   expect(requests.at(-1)?.method).toBe("PATCH");
   expect(requests.at(-1)?.url).toBe("https://api.github.com/notifications/threads/1");
-  expect(await github(fetch, () => undefined).unread(0)).toBeUndefined();
+  expect(await github(fetch, async () => undefined).unread(0)).toBeUndefined();
 });
 
-test("Linear lists unread issue notifications and reports its errors", async () => {
+const notification = (id: string, type: string, readAt: string | null, issue?: string) => ({
+  id,
+  type,
+  readAt,
+  updatedAt: "2026-10-21T05:00:00Z",
+  ...(issue && {
+    issue: { identifier: issue, title: "Fix it", url: `https://linear.app/x/${issue}` },
+  }),
+});
+
+const page = (endCursor: string | null, nodes: unknown[]) => ({
+  data: { notifications: { pageInfo: { hasNextPage: endCursor !== null, endCursor }, nodes } },
+});
+
+test("Linear lists unread issue notifications across pages and reports its errors", async () => {
   const bodies: { query: string; variables: Record<string, unknown> }[] = [];
-  let reply: unknown = {
-    data: {
-      notifications: {
-        nodes: [
-          {
-            id: "n1",
-            type: "issueAssignedToYou",
-            readAt: null,
-            updatedAt: "2026-10-21T05:00:00Z",
-            issue: { identifier: "ABC-1", title: "Fix it", url: "https://linear.app/x/ABC-1" },
-          },
-          {
-            id: "n2",
-            type: "issueMention",
-            readAt: "2026-10-21T06:00:00Z",
-            updatedAt: "2026-10-21T05:00:00Z",
-            issue: { identifier: "ABC-2", title: "Read", url: "https://linear.app/x/ABC-2" },
-          },
-          { id: "n3", type: "issueMention", readAt: null, updatedAt: "2026-10-21T05:00:00Z" },
-        ],
-      },
-    },
-  };
+  let replies: unknown[] = [
+    page("c1", [
+      notification("n1", "issueAssignedToYou", null, "ABC-1"),
+      notification("n2", "issueMention", "2026-10-21T06:00:00Z", "ABC-2"),
+    ]),
+    page(null, [
+      notification("n3", "issueMention", null),
+      notification("n4", "issueCommentMention", null, "ABC-4"),
+    ]),
+  ];
   const source = linear(
     async (_input, init) => {
       bodies.push(JSON.parse(typeof init.body === "string" ? init.body : "{}"));
       expect(new Headers(init.headers).get("authorization")).toBe("lin_api_key");
-      return Response.json(reply);
+      return Response.json(replies.shift());
     },
-    () => "lin_api_key",
+    async () => "lin_api_key",
   );
 
   const items = await source.unread(0);
   expect(items).toMatchObject([
     { sourceID: "n1", reason: "Assigned", context: "ABC-1", url: "https://linear.app/x/ABC-1" },
+    { sourceID: "n4", reason: "Mentioned in a comment", context: "ABC-4" },
   ]);
+  expect(bodies.map((body) => body.variables.after)).toEqual([null, "c1"]);
   expect(bodies[0]?.variables.since).toBe("1970-01-01T00:00:00.000Z");
 
-  reply = { errors: [{ message: "Authentication required" }] };
+  replies = [{ data: { notificationUpdate: { success: false } } }];
+  expect(await failure(source.markRead("n1"))).toContain("didn't mark n1 read");
+  replies = [1, 2].map(() => ({ errors: [{ message: "Authentication required" }] }));
   expect(await failure(source.unread(0))).toContain("Authentication required");
   expect(await failure(source.markRead("n1"))).toContain("Authentication required");
-  expect(await linear(fetch, () => undefined).unread(0)).toBeUndefined();
+  expect(await linear(fetch, async () => undefined).unread(0)).toBeUndefined();
 });
