@@ -245,6 +245,30 @@ test("a reply goes to the DM its message came from, even when the tokens change"
   expect(fake.state.posts).toMatchObject([{ channel: dm, markdown_text: "Hi." }]);
 });
 
+test("after a 429, no call reaches Slack until its Retry-After has passed", async () => {
+  let clock = 0;
+  let calls = 0;
+  const client = slackClient(
+    async () => {
+      calls++;
+      return calls === 1
+        ? new Response("", { status: 429, headers: { "retry-after": "5" } })
+        : Response.json({ ok: true, ts: "1.000001" });
+    },
+    { bot: async () => "xoxb", user: async () => "xoxp" },
+    () => clock,
+  );
+  const post = () => client.call("bot", "chat.postMessage", { channel: dm });
+
+  expect(await post()).toEqual({ kind: "refused", error: "ratelimited" });
+  clock = 4_999;
+  expect(await post()).toEqual({ kind: "refused", error: "ratelimited" });
+  expect(calls).toBe(1);
+  clock = 5_000;
+  expect(await post()).toMatchObject({ kind: "ok" });
+  expect(calls).toBe(2);
+});
+
 const match = (n: number, user: string, channel: Record<string, unknown>, text = "hey") => ({
   ts: ts(n),
   user,

@@ -68,6 +68,8 @@ export function slackClient(
   let announced: string | undefined;
   let bot: string | undefined;
   let channel: string | undefined;
+  // Slack's limits are per app and workspace, so one pause after a 429 covers every call.
+  let pausedUntil = 0;
 
   const call = async (
     kind: Kind,
@@ -76,6 +78,7 @@ export function slackClient(
   ): Promise<Answer | undefined> => {
     const token = await saved[kind].get();
     if (!token) return undefined;
+    if (now() < pausedUntil) return { kind: "refused", error: "ratelimited" };
     try {
       const response = await fetch(`${base}/${method}`, {
         method: "POST",
@@ -86,7 +89,11 @@ export function slackClient(
         body: new URLSearchParams(params).toString(),
         signal: AbortSignal.timeout(10_000),
       });
-      if (response.status === 429) return { kind: "refused", error: "ratelimited" };
+      if (response.status === 429) {
+        const seconds = Number(response.headers.get("retry-after"));
+        pausedUntil = now() + (seconds > 0 ? seconds : 30) * 1000;
+        return { kind: "refused", error: "ratelimited" };
+      }
       const body: unknown = await response.json().catch(() => undefined);
       if (response.status < 500 && isRecord(body)) {
         if (body.ok === true) return { kind: "ok", body };
