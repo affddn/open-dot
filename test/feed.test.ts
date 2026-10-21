@@ -113,7 +113,7 @@ const thread = (id: string, reason: string, url: string | null) => ({
   repository: { full_name: "acme/app", html_url: "https://github.com/acme/app" },
 });
 
-test("GitHub lists recent review requests, mentions and assignments with web links", async () => {
+test("GitHub lists the notifications that need the owner, with web links", async () => {
   const requests: Request[] = [];
   let tokens = 0;
   const source = github(
@@ -128,6 +128,8 @@ test("GitHub lists recent review requests, mentions and assignments with web lin
         thread("3", "comment", "https://api.github.com/repos/acme/app/issues/8"),
         thread("4", "assign", null),
         thread("5", "mention", "https://api.github.com/repos/acme/app/commits/0a1b2c"),
+        thread("6", "author", "https://api.github.com/repos/acme/app/pulls/13"),
+        thread("7", "ci_activity", null),
       ]);
     },
     async () => (tokens++ === 0 ? "expired" : "fresh"),
@@ -138,8 +140,10 @@ test("GitHub lists recent review requests, mentions and assignments with web lin
   expect(items?.map((listed) => [listed.reason, listed.url])).toEqual([
     ["Review requested", "https://github.com/acme/app/pull/12"],
     ["Mentioned", "https://github.com/acme/app/issues/7"],
+    ["Comment", "https://github.com/acme/app/issues/8"],
     ["Assigned", "https://github.com/acme/app"],
     ["Mentioned", "https://github.com/acme/app/commit/0a1b2c"],
+    ["Author", "https://github.com/acme/app/pull/13"],
   ]);
   const url = new URL(requests.at(-1)?.url ?? "");
   expect(url.searchParams.get("since")).toBe("2026-10-20T05:00:00.000Z");

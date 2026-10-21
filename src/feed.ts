@@ -112,6 +112,8 @@ const githubReasons: Record<string, string> = {
   mention: "Mentioned",
   team_mention: "Team mentioned",
   assign: "Assigned",
+  comment: "Comment",
+  author: "Author",
 };
 
 const Thread = Schema.Struct({
