@@ -32,6 +32,10 @@ struct Pending: Identifiable {
   var showingFeed = false
   var thumbnails: [AttachmentKey: NSImage] = [:]
   var unavailable: Set<AttachmentKey> = []
+  var reacting: Set<ReactionKey> = []
+  var reactionErrors: [ReactionKey: String] = [:]
+  @ObservationIgnored private var reactionEpoch: [String: Int] = [:]
+  @ObservationIgnored private var messageReads: [String: Int] = [:]
   private var seen: [String: Double] = [:]
   private var newest: [String: Double] = [:]
   private var feedSeen: Double?
@@ -161,6 +165,41 @@ struct Pending: Identifiable {
     pending[name]?.removeAll { $0.id == id }
   }
 
+  func react(_ key: ReactionKey, emoji: String) {
+    guard let message = messages[key.dot]?.first(where: { $0.id == key.message }),
+      message.kind == "dot", reacting.insert(key).inserted else { return }
+    let selected = message.reactions?.first(where: { $0.actor == "owner" })?.emoji
+    let next = selected == emoji ? nil : emoji
+    reactionEpoch[key.dot, default: 0] += 1
+    reactionErrors[key] = nil
+    Task {
+      defer {
+        reacting.remove(key)
+        reactionEpoch[key.dot, default: 0] += 1
+      }
+      do {
+        let confirmed = try await api.react(key, emoji: next)
+        guard confirmed.dot == key.dot, confirmed.messageID == key.message,
+          confirmed.actor == "owner", confirmed.emoji == next else {
+          reactionErrors[key] = "Reaction outcome unknown: unexpected response. Refreshing saved state."
+          return
+        }
+        if let index = messages[key.dot]?.firstIndex(where: { $0.id == key.message }) {
+          var saved = messages[key.dot]![index].reactions ?? []
+          saved.removeAll { $0.actor == "owner" }
+          saved.append(confirmed)
+          messages[key.dot]![index].reactions = saved
+        }
+      } catch {
+        if let failure = error as? APIError, case .lost = failure {
+          reactionErrors[key] = "Reaction outcome unknown: no response. It may have been saved. No automatic retry."
+        } else {
+          reactionErrors[key] = "Reaction not confirmed. \(Self.describe(error)) Showing the last saved state; no automatic retry."
+        }
+      }
+    }
+  }
+
   func openFeed() {
     showingFeed = true
     feedSeen = feedNewest
@@ -279,7 +318,13 @@ struct Pending: Identifiable {
   }
 
   private func refreshMessages(_ name: String) async {
+    let epoch = reactionEpoch[name, default: 0]
+    messageReads[name, default: 0] += 1
+    let read = messageReads[name]
     guard let list = try? await api.messages(name) else { return }
+    // Discard polls begun before/during a write, and older overlapping reads.
+    guard epoch == reactionEpoch[name, default: 0], read == messageReads[name],
+      !reacting.contains(where: { $0.dot == name }) else { return }
     messages[name] = list
     let ids = Set(list.map(\.id))
     // Forget images of messages that have scrolled out, but write only when something goes.

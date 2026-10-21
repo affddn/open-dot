@@ -5,7 +5,7 @@ import { api } from "../src/api";
 import { step } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
 import { type Attachment, OpenCode, OpenCodeError } from "../src/opencode";
-import { dots, feed, outbox, workers } from "../src/schema";
+import { dots, feed, outbox, reactions, workers } from "../src/schema";
 import { fakeOpenCode } from "./fake-opencode";
 
 let db: Db;
@@ -65,6 +65,107 @@ const entry = (
 ) => ({ id, role, text, tools, files, time: 0 });
 
 const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+
+const putReaction = (emoji: unknown) =>
+  call("/dots/jojo/messages/msg_answer/reaction", {
+    method: "PUT",
+    body: JSON.stringify({ emoji }),
+  });
+
+test("owner reactions add, replace and remove idempotently without queuing a turn", async () => {
+  fake.state.history.set("ses_jojo", [entry("msg_answer", "assistant", "A".repeat(400))]);
+  const first = await putReaction("👍");
+  expect(first.status).toBe(200);
+  const saved = await first.json();
+  expect(await (await putReaction("👍")).json()).toEqual(saved);
+  expect(db.select().from(reactions).all()).toHaveLength(1);
+  expect(db.select().from(reactions).get()?.excerpt).toHaveLength(240);
+  for (const emoji of ["❤️", "👎", "😂", "‼️", "❓", null]) {
+    expect((await putReaction(emoji)).status).toBe(200);
+    expect((await conversation())[0]).toMatchObject({
+      reactions: [{ actor: "owner", emoji, messageID: "msg_answer", sessionID: "ses_jojo" }],
+    });
+  }
+  const removed = db.select().from(reactions).get();
+  await putReaction(null);
+  expect(db.select().from(reactions).get()).toEqual(removed);
+  expect(db.select().from(outbox).all()).toEqual([]);
+  expect(fake.state.prompted).toEqual([]);
+});
+
+test("reaction API rejects auth, body, target, binding and service failures without saving", async () => {
+  queued("msg_notice", "notice", {});
+  queued("msg_peer", "peer", { fromDot: "polnareff" });
+  fake.state.history.set("ses_jojo", [
+    entry("msg_owner", "user", "owner"),
+    entry("msg_notice", "user", "notice"),
+    entry("msg_peer", "user", "peer"),
+    entry("msg_hidden", "assistant", "", ["read"]),
+    entry("msg_answer", "assistant", "answer"),
+  ]);
+  fake.state.history.set("ses_polnareff", [entry("msg_foreign", "assistant", "foreign")]);
+  const path = "/dots/jojo/messages/msg_answer/reaction";
+  expect(
+    (await call(path, { method: "PUT", body: '{"emoji":"👍"}', headers: { authorization: "bad" } }))
+      .status,
+  ).toBe(401);
+  for (const body of [
+    "{",
+    "null",
+    "[]",
+    "{}",
+    '{"emoji":"🔥"}',
+    '{"emoji":1}',
+    '{"emoji":"👍","text":"fake"}',
+  ])
+    expect((await call(path, { method: "PUT", body })).status).toBe(400);
+  for (const id of ["owner", "notice", "peer", "hidden", "missing", "foreign"])
+    expect(
+      (
+        await call(`/dots/jojo/messages/msg_${id}/reaction`, {
+          method: "PUT",
+          body: '{"emoji":"👍"}',
+        })
+      ).status,
+    ).toBe(404);
+  const down = Layer.effect(OpenCode, Effect.fail(new OpenCodeError({ message: "Not running" })));
+  expect((await call(path, { method: "PUT", body: '{"emoji":null}' }, down)).status).toBe(503);
+  db.update(dots).set({ sessionState: "creating" }).where(eq(dots.name, "jojo")).run();
+  expect((await call(path, { method: "PUT", body: '{"emoji":null}' })).status).toBe(404);
+  expect(db.select().from(reactions).all()).toEqual([]);
+  expect(fake.state.prompted).toEqual([]);
+});
+
+test("message reactions are actor-labelled and isolated by dot and bound session", async () => {
+  fake.state.history.set("ses_jojo", [entry("msg_owner", "user", "owner")]);
+  fake.state.history.set("ses_polnareff", [entry("msg_owner", "user", "other")]);
+  db.insert(reactions)
+    .values([
+      {
+        dot: "jojo",
+        sessionID: "ses_jojo",
+        messageID: "msg_owner",
+        actor: "dot",
+        emoji: "❤️",
+        excerpt: "owner",
+        updatedAt: 1,
+      },
+      {
+        dot: "jojo",
+        sessionID: "ses_old",
+        messageID: "msg_owner",
+        actor: "dot",
+        emoji: "👎",
+        excerpt: "old",
+        updatedAt: 2,
+      },
+    ])
+    .run();
+  expect((await conversation())[0]).toMatchObject({ reactions: [{ actor: "dot", emoji: "❤️" }] });
+  expect(await (await call("/dots/polnareff/messages")).json()).toMatchObject({
+    messages: [{ reactions: [] }],
+  });
+});
 const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 4, 5]);
 const file = (mime: string, data: string | Buffer, name?: string): Attachment => ({
   mime,

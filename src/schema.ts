@@ -1,4 +1,4 @@
-import { integer, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
+import { integer, primaryKey, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
 
 export const dots = sqliteTable("dots", {
   name: text().primaryKey(),
@@ -56,6 +56,33 @@ export interface FeedSnapshot {
     readonly time: number;
   };
 }
+
+/** The reactions a message in the notch chat can get, in the order the picker shows them. */
+export const reactionEmojis = ["❤️", "👍", "👎", "😂", "‼️", "❓"] as const;
+
+/**
+ * Each actor's current reaction to a message in a dot's conversation: the owner's to the dot's
+ * messages, and the dot's to the owner's. A removal keeps its row with no emoji, so the dot's
+ * memory can say it's gone. Nothing here is ever sent to a session.
+ */
+export const reactions = sqliteTable(
+  "reactions",
+  {
+    dot: text()
+      .notNull()
+      .references(() => dots.name),
+    sessionID: text("session_id").notNull(),
+    messageID: text("message_id").notNull(),
+    actor: text({ enum: ["owner", "dot"] }).notNull(),
+    emoji: text({ enum: reactionEmojis }),
+    // A short excerpt of the message, read from the session's history when the reaction was set.
+    excerpt: text().notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.dot, table.sessionID, table.messageID, table.actor] })],
+);
+
+export type Reaction = typeof reactions.$inferSelect;
 
 export const notes = sqliteTable("notes", {
   id: integer().primaryKey({ autoIncrement: true }),

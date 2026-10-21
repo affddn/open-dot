@@ -35,6 +35,21 @@ struct Message: Decodable, Equatable, Identifiable {
   /// The feed item the owner replied to, as the daemon read it when the message was sent.
   let feed: FeedItem?
   let time: Double
+  var reactions: [Reaction]?
+}
+
+struct Reaction: Decodable, Equatable {
+  let dot: String
+  let sessionID: String
+  let messageID: String
+  let actor: String
+  let emoji: String?
+  let updatedAt: Double
+}
+
+struct ReactionKey: Hashable {
+  let dot: String
+  let message: String
 }
 
 struct AttachmentKey: Hashable {
@@ -94,6 +109,13 @@ enum APIError: Error {
   func messages(_ dot: String) async throws -> [Message] {
     struct Body: Decodable { let messages: [Message] }
     return try decode(Body.self, await send("GET", "/dots/\(escape(dot))/messages")).messages
+  }
+
+  func react(_ key: ReactionKey, emoji: String?) async throws -> Reaction {
+    struct Body: Decodable { let reaction: Reaction }
+    // JSONEncoder omits nil optional fields; removal needs an explicit JSON null.
+    let body = try JSONSerialization.data(withJSONObject: ["emoji": emoji as Any? ?? NSNull()])
+    return try decode(Body.self, await send("PUT", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/reaction", body: body)).reaction
   }
 
   /// Queues the text, as a reply to a feed item when `feed` is its ID. Never retried on its own.

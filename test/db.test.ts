@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { openDatabase } from "../src/db";
-import { feed, outbox, slack, slackApps, slackEvents } from "../src/schema";
+import { feed, outbox, reactions, slack, slackApps, slackEvents } from "../src/schema";
 
 test("a database from before feed replies keeps its rows, and replies survive a restart", () => {
   // Build the database as the release before feed replies left it: every migration before 0012.
@@ -112,5 +112,68 @@ test("a database from before per-dot Slack apps keeps its Slack rows, and an app
   ]);
   expect(reopened.select().from(slackEvents).all()).toMatchObject([{ eventID: "Ev1" }]);
   expect(reopened.select().from(slack).all()).toHaveLength(1);
+  reopened.$client.close();
+});
+
+test("reactions migrate additively and both actors and removal tombstones survive reopening", () => {
+  const dir = mkdtempSync(join(tmpdir(), "open-dot-reactions-"));
+  const migrations = join(dir, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0014");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(dir, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name, directory, session_id, session_state, created_at) values ('jojo', '/dots/jojo', 'ses_jojo', 'ready', 0)",
+  );
+  old.run("insert into notes (dot, text, created_at) values ('jojo', 'Keep this note', 1)");
+  old.run(
+    "insert into outbox (session_id, message_id, text, state, from_owner, created_at) values ('ses_jojo', 'msg_owner', 'Keep this prompt', 'sent', 1, 1)",
+  );
+  old.run(
+    "insert into slack_apps (dot, state, attempt_id, created_at, updated_at) values ('jojo', 'unknown', 'keep-attempt', 1, 1)",
+  );
+  const tables = old
+    .query<{ name: string }, []>(
+      "select name from sqlite_master where type = 'table' and name not like 'sqlite_%' and name != '__drizzle_migrations'",
+    )
+    .all();
+  const rows = (sqlite: Database) =>
+    tables.map(({ name }) => [name, sqlite.query(`select * from "${name}"`).all()]);
+  const before = rows(old);
+  old.close();
+
+  const db = openDatabase(path);
+  expect(rows(db.$client)).toEqual(before);
+  db.insert(reactions)
+    .values([
+      {
+        dot: "jojo",
+        sessionID: "ses_jojo",
+        messageID: "msg_answer",
+        actor: "owner",
+        emoji: null,
+        excerpt: "Answer",
+        updatedAt: 2,
+      },
+      {
+        dot: "jojo",
+        sessionID: "ses_jojo",
+        messageID: "msg_owner",
+        actor: "dot",
+        emoji: "❤️",
+        excerpt: "Keep this prompt",
+        updatedAt: 3,
+      },
+    ])
+    .run();
+  const saved = db.select().from(reactions).all();
+  db.$client.close();
+  const reopened = openDatabase(path);
+  expect(reopened.select().from(reactions).all()).toEqual(saved);
+  expect(rows(reopened.$client)).toEqual(before);
   reopened.$client.close();
 });

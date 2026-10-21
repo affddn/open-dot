@@ -80,6 +80,7 @@ struct ExpandedView: View {
           centered(status)
         } else if let name = store.selected, let dot = store.dots.first(where: { $0.name == name }) {
           Conversation(store: store, name: name)
+            .id(name)
           if !dot.workers.isEmpty { workers(dot.workers) }
           composer(name)
         } else {
@@ -585,6 +586,8 @@ struct MessageRow: View {
   let dot: String
   let message: Message
   @State private var open = false
+  @State private var hovering = false
+  @State private var pickerOpen = false
 
   var body: some View {
     switch message.kind {
@@ -596,16 +599,37 @@ struct MessageRow: View {
           if !message.text.isEmpty { Bubble(text: message.text, fill: messageBlue) }
           attachments
         }
+        .padding(.bottom, badge == nil ? 0 : 22)
+        .overlay(alignment: .bottomTrailing) { reactionBadge }
       }
     case "dot":
       HStack {
-        VStack(alignment: .leading, spacing: 3) {
-          if !message.text.isEmpty { Bubble(text: message.text, fill: messageGray) }
-          attachments
-          if let tools = message.tools, !tools.isEmpty {
-            Text("used \(tools.joined(separator: ", "))").font(.caption2).foregroundStyle(.tertiary)
+        VStack(alignment: .leading, spacing: 0) {
+          picker
+            .frame(height: 32)
+            .opacity(hovering || pickerOpen ? 1 : 0)
+            .allowsHitTesting(hovering || pickerOpen)
+            .accessibilityHidden(!(hovering || pickerOpen))
+          VStack(alignment: .leading, spacing: 3) {
+            if !message.text.isEmpty { Bubble(text: message.text, fill: messageGray) }
+            attachments
+            if let tools = message.tools, !tools.isEmpty {
+              Text("used \(tools.joined(separator: ", "))").font(.caption2).foregroundStyle(.tertiary)
+            }
+          }
+          .padding(.bottom, badge == nil ? 0 : 22)
+          .overlay(alignment: .bottomTrailing) { reactionBadge }
+          if store.reacting.contains(key) {
+            Text("Saving reaction…").font(.caption2).foregroundStyle(.secondary)
+          }
+          if let error = store.reactionErrors[key] {
+            Text(error).font(.caption2).foregroundStyle(.red)
+              .accessibilityIdentifier("reaction-error-\(dot)-\(message.id)")
           }
         }
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .accessibilityAction(named: "React") { pickerOpen.toggle() }
         Spacer(minLength: 60)
       }
     default:
@@ -625,6 +649,45 @@ struct MessageRow: View {
 }
 
 extension MessageRow {
+  private var key: ReactionKey { ReactionKey(dot: dot, message: message.id) }
+
+  private var badge: Reaction? {
+    message.reactions?.first { $0.actor == (message.kind == "dot" ? "owner" : "dot") && $0.emoji != nil }
+  }
+
+  @ViewBuilder private var reactionBadge: some View {
+    if let reaction = badge, let emoji = reaction.emoji {
+      Text(emoji)
+        .font(.system(size: 13))
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Capsule().fill(messageGray).overlay(Capsule().strokeBorder(.white.opacity(0.3))))
+        .accessibilityLabel("\(reaction.actor == "owner" ? "You" : dot) reacted \(emoji)")
+        .accessibilityIdentifier("reaction-badge-\(dot)-\(message.id)")
+    }
+  }
+
+  private var picker: some View {
+    let selected = message.reactions?.first(where: { $0.actor == "owner" })?.emoji
+    return HStack(spacing: 2) {
+      ForEach(["❤️", "👍", "👎", "😂", "‼️", "❓"], id: \.self) { emoji in
+        Button { store.react(key, emoji: emoji) } label: {
+          Text(emoji).font(.system(size: 16))
+            .frame(width: 28, height: 26)
+            .background(RoundedRectangle(cornerRadius: 6).fill(selected == emoji ? messageBlue : .clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(store.reacting.contains(key))
+        .accessibilityLabel(selected == emoji ? "Remove your \(emoji) reaction" : "React \(emoji)")
+        .accessibilityAddTraits(selected == emoji ? .isSelected : [])
+        .accessibilityIdentifier("react-\(dot)-\(message.id)-\(emoji)")
+      }
+    }
+    .padding(.horizontal, 3)
+    .background(Capsule().fill(messageGray))
+  }
+
   @ViewBuilder fileprivate var attachments: some View {
     if let items = message.attachments, !items.isEmpty {
       let row = HStack(spacing: 6) {

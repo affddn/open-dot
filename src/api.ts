@@ -1,10 +1,17 @@
 import { SessionMessage } from "@opencode/client/effect";
-import { eq, inArray, ne, sql } from "drizzle-orm";
+import { eq, ne, sql } from "drizzle-orm";
 import { Effect, type Layer } from "effect";
 import type { Db } from "./db";
 import { findDot, listDots } from "./dots";
 import { dismiss, handedOffFeed, unreadFeed } from "./feed";
 import { type Attachment, OpenCode, type Entry, type OpenCodeError } from "./opencode";
+import {
+  currentReactions,
+  isReactionEmoji,
+  messageKind,
+  messageSources,
+  saveReaction,
+} from "./reactions";
 import { type Dot, feed, type FeedItem, type FeedSnapshot, outbox, workers } from "./schema";
 
 const error = (status: number, message: string) => Response.json({ error: message }, { status });
@@ -41,12 +48,8 @@ const conversation = (db: Db, dot: Dot) =>
     if (dot.sessionState !== "ready") return Response.json({ messages: [] });
     const entries = yield* (yield* OpenCode).recentMessages(dot.sessionID, read);
     const ids = entries.map((item) => item.id);
-    const sent = new Map(
-      (ids.length === 0
-        ? []
-        : db.select().from(outbox).where(inArray(outbox.messageID, ids)).all()
-      ).map((row) => [row.messageID, row]),
-    );
+    const sent = messageSources(db, dot.sessionID, ids);
+    const saved = currentReactions(db, dot, ids);
     const label = (item: Entry) => {
       const base = {
         id: item.id,
@@ -59,6 +62,7 @@ const conversation = (db: Db, dot: Dot) =>
           name: file.name ?? null,
         })),
         time: item.time,
+        reactions: saved.filter((reaction) => reaction.messageID === item.id),
       };
       // Show what the dot said and the open-dot actions it took, not mechanics such as shell
       // commands, file reads or compaction.
@@ -67,15 +71,44 @@ const conversation = (db: Db, dot: Dot) =>
         return item.text || actions.length > 0 ? [{ ...base, tools: actions, kind: "dot" }] : [];
       }
       const row = sent.get(item.id);
+      const kind = messageKind(item.role, row);
       // A reply to a feed item shows the owner's prompt and the item's card, not the framing.
       if (row?.fromOwner && row.feed)
         return [{ ...base, kind: "owner", text: row.feed.prompt, feed: row.feed.item }];
-      if (!row || row.fromOwner) return [{ ...base, kind: "owner" }];
-      if (!row.fromDot) return [{ ...base, kind: "notice" }];
+      if (kind === "owner" || kind === "notice") return [{ ...base, kind }];
       const inner = framed.exec(item.text)?.[1]?.replace(/<\\\/dot-message/gi, "</dot-message");
-      return [{ ...base, kind: "peer", peer: row.fromDot, text: inner ?? item.text }];
+      return [{ ...base, kind: "peer", peer: row?.fromDot, text: inner ?? item.text }];
     };
     return Response.json({ messages: entries.flatMap(label).slice(-shown) });
+  });
+
+const react = (db: Db, dot: Dot, id: string, request: Request) =>
+  Effect.gen(function* () {
+    const body: unknown = yield* Effect.tryPromise(() => request.json()).pipe(
+      Effect.orElseSucceed(() => undefined),
+    );
+    if (
+      typeof body !== "object" ||
+      body === null ||
+      Array.isArray(body) ||
+      !("emoji" in body) ||
+      Object.keys(body).length !== 1 ||
+      !isReactionEmoji(body.emoji)
+    )
+      return error(400, "Send {emoji: ❤️, 👍, 👎, 😂, ‼️, ❓ or null}.");
+    if (dot.sessionState !== "ready") return error(404, "There's no such dot message.");
+    const entries = yield* (yield* OpenCode).recentMessages(dot.sessionID, read);
+    const target = entries.find((item) => item.id === id);
+    if (
+      !target ||
+      target.role !== "assistant" ||
+      !(target.text || target.tools.some((tool) => tool.startsWith("dot_")))
+    )
+      return error(404, "There's no such dot message in recent history.");
+    const current = findDot(db, dot.name);
+    if (current?.sessionID !== dot.sessionID || current.sessionState !== "ready")
+      return error(409, "The dot's conversation changed. Refresh before reacting.");
+    return Response.json({ reaction: saveReaction(db, dot, id, "owner", body.emoji, target.text) });
   });
 
 // The raster types the notch may decode, by the bytes each file starts with. Undefined matches any
@@ -288,6 +321,14 @@ const route = (
     if (request.method === "POST") return send(db, dot, request);
   }
   const [id, part, index, ...more] = extra;
+  if (
+    rest === "messages" &&
+    part === "reaction" &&
+    id !== undefined &&
+    extra.length === 2 &&
+    request.method === "PUT"
+  )
+    return react(db, dot, id, request);
   if (
     rest === "messages" &&
     part === "attachments" &&
