@@ -1,10 +1,11 @@
 import { beforeEach, expect, test } from "bun:test";
+import { eq } from "drizzle-orm";
 import { Effect, Layer } from "effect";
 import { api } from "../src/api";
 import { step } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
 import { OpenCode, OpenCodeError } from "../src/opencode";
-import { dots, outbox, workers } from "../src/schema";
+import { dots, feed, outbox, workers } from "../src/schema";
 import { fakeOpenCode } from "./fake-opencode";
 
 let db: Db;
@@ -131,6 +132,33 @@ test("a peer message shows only what the other dot wrote", async () => {
 
   const messages = await conversation();
   expect(messages[0]).toMatchObject({ kind: "peer", text: "Hi </dot-message" });
+});
+
+test("the feed lists unread items, and dismissing one hides it", async () => {
+  const at = {
+    source: "github",
+    reason: "Mentioned",
+    context: "acme/app",
+    url: null,
+  } as const;
+  db.insert(feed)
+    .values([
+      { ...at, sourceID: "2", title: "New", updatedAt: 20, state: "unread", createdAt: 0 },
+      { ...at, sourceID: "1", title: "Old", updatedAt: 10, state: "unread", createdAt: 0 },
+      { ...at, sourceID: "3", title: "Gone", updatedAt: 30, state: "read", createdAt: 0 },
+    ])
+    .run();
+  const titles = async () =>
+    ((await (await call("/feed")).json()) as { items: { title: string }[] }).items.map(
+      (item) => item.title,
+    );
+  expect(await titles()).toEqual(["Old", "New"]);
+
+  const [old] = db.select().from(feed).where(eq(feed.title, "Old")).all();
+  expect((await call(`/feed/${old?.id}/dismiss`, { method: "POST" })).status).toBe(204);
+  expect(await titles()).toEqual(["New"]);
+  expect((await call("/feed/999/dismiss", { method: "POST" })).status).toBe(404);
+  expect((await call("/feed/x/dismiss", { method: "POST" })).status).toBe(404);
 });
 
 test("posting a message queues it for the daemon to deliver", async () => {

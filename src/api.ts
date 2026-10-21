@@ -3,6 +3,7 @@ import { inArray, ne } from "drizzle-orm";
 import { Effect, type Layer } from "effect";
 import type { Db } from "./db";
 import { findDot, listDots } from "./dots";
+import { dismiss, unreadFeed } from "./feed";
 import { OpenCode, type Entry, type OpenCodeError } from "./opencode";
 import { type Dot, outbox, workers } from "./schema";
 
@@ -89,8 +90,36 @@ const send = (db: Db, dot: Dot, request: Request) =>
     return Response.json({ id: row.messageID }, { status: 202 });
   });
 
+const feedRoute = (db: Db, request: Request, path: string[]) => {
+  if (path.length === 0 && request.method === "GET") {
+    const items = unreadFeed(db).map(({ id, source, reason, title, context, url, updatedAt }) => ({
+      id,
+      source,
+      reason,
+      title,
+      context,
+      url,
+      time: updatedAt,
+    }));
+    return Response.json({ items });
+  }
+  const [id, action] = path;
+  if (
+    path.length === 2 &&
+    action === "dismiss" &&
+    request.method === "POST" &&
+    /^\d+$/.test(id ?? "")
+  )
+    return dismiss(db, Number(id))
+      ? new Response(null, { status: 204 })
+      : error(404, "There's no such feed item.");
+  return error(404, "Not found");
+};
+
 const route = (db: Db, request: Request): Effect.Effect<Response, OpenCodeError, OpenCode> => {
-  const [root, name, rest, ...extra] = new URL(request.url).pathname.split("/").filter(Boolean);
+  const path = new URL(request.url).pathname.split("/").filter(Boolean);
+  if (path[0] === "feed") return Effect.succeed(feedRoute(db, request, path.slice(1)));
+  const [root, name, rest, ...extra] = path;
   if (root !== "dots" || extra.length > 0) return Effect.succeed(error(404, "Not found"));
   if (name === undefined)
     return request.method === "GET" ? listAll(db) : Effect.succeed(error(404, "Not found"));
