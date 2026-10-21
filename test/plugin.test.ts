@@ -182,6 +182,7 @@ test("the feed reaches a dot as framed data", async () => {
     })
     .run();
   const content = String((await loaded.call("dot_feed", {})).content);
+  expect(content).toContain("oldest first: 1 in all (1 Review requested).");
   expect(content).toContain("Review requested · acme/app: Fix login");
   expect(content).toContain("(https://github.com/acme/app/pull/12)");
   expect(content.match(/<\/feed>/g)).toHaveLength(1);
