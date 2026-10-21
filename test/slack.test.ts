@@ -1,4 +1,4 @@
-import { beforeEach, expect, test } from "bun:test";
+import { beforeEach, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Effect } from "effect";
 import { step } from "../src/daemon";
@@ -29,23 +29,49 @@ function fakeSlack() {
     lastRead: new Map<string, string>(),
     infos: [] as string[],
     queries: [] as string[],
+    // What the Keychain holds, how often it was read, and the client's clock in ms.
+    tokens: { bot: "xoxb", user: "xoxp" },
+    reads: { bot: 0, user: 0 },
+    time: 0,
+    // Each call as "<token> <method>", and the methods that answer missing_scope.
+    calls: [] as string[],
+    missing: new Set<string>(),
+    // The user token's x-oauth-scopes header, or undefined to send none.
+    scopes: undefined as string | undefined,
+    names: new Map([
+      [owner, "Afif"],
+      ["UFRIEND", "Friend"],
+    ]),
   };
   // One clock for everyone's messages, as Slack's ts only grows.
   let clock = 1;
   const now = () => ts(clock++);
-  const fetch = async (url: string, init: RequestInit) => {
-    const method = url.split("/").at(-1);
+  const route = async (url: string, init: RequestInit) => {
+    const method = url.split("/").at(-1) ?? "";
     const params = Object.fromEntries(
       new URLSearchParams(typeof init.body === "string" ? init.body : ""),
     );
-    const user = new Headers(init.headers).get("authorization") === "Bearer xoxp";
+    const token = new Headers(init.headers).get("authorization")?.replace("Bearer ", "") ?? "";
+    state.calls.push(`${token} ${method}`);
+    if (state.missing.has(method)) return Response.json({ ok: false, error: "missing_scope" });
+    const user = token.startsWith("xoxp");
     switch (method) {
       case "auth.test":
         return Response.json({
           ok: true,
           user: user ? "owner" : "open-dot",
           user_id: user ? owner : botUser,
+          ...(!user && { bot_id: "B1" }),
         });
+      case "users.info": {
+        const name = state.names.get(params.user ?? "");
+        return name
+          ? Response.json({
+              ok: true,
+              user: { id: params.user, name: "handle", profile: { display_name: name } },
+            })
+          : Response.json({ ok: false, error: "user_not_found" });
+      }
       case "conversations.open":
         return Response.json({ ok: true, channel: { id: state.dm } });
       case "conversations.history": {
@@ -90,7 +116,27 @@ function fakeSlack() {
         return Response.json({ ok: false, error: "unknown_method" });
     }
   };
-  const connect = () => slackClient(fetch, { bot: async () => "xoxb", user: async () => "xoxp" });
+  const fetch = async (url: string, init: RequestInit) => {
+    const response = await route(url, init);
+    const user = new Headers(init.headers).get("authorization")?.startsWith("Bearer xoxp");
+    if (user && state.scopes !== undefined) response.headers.set("x-oauth-scopes", state.scopes);
+    return response;
+  };
+  const connect = () =>
+    slackClient(
+      fetch,
+      {
+        bot: async () => {
+          state.reads.bot++;
+          return state.tokens.bot;
+        },
+        user: async () => {
+          state.reads.user++;
+          return state.tokens.user;
+        },
+      },
+      () => state.time,
+    );
   return { state, client: connect(), connect, now };
 }
 
@@ -249,10 +295,11 @@ test("after a 429, no call reaches Slack until its Retry-After has passed", asyn
   let clock = 0;
   let calls = 0;
   const client = slackClient(
-    async () => {
+    async (url) => {
       calls++;
-      return calls === 1
-        ? new Response("", { status: 429, headers: { "retry-after": "5" } })
+      if (calls === 1) return new Response("", { status: 429, headers: { "retry-after": "5" } });
+      return url.endsWith("/auth.test")
+        ? Response.json({ ok: true, user_id: botUser, bot_id: "B1" })
         : Response.json({ ok: true, ts: "1.000001" });
     },
     { bot: async () => "xoxb", user: async () => "xoxp" },
@@ -266,7 +313,8 @@ test("after a 429, no call reaches Slack until its Retry-After has passed", asyn
   expect(calls).toBe(1);
   clock = 5_000;
   expect(await post()).toMatchObject({ kind: "ok" });
-  expect(calls).toBe(2);
+  // The bot token's auth.test, then the post.
+  expect(calls).toBe(3);
 });
 
 test("a finished reply posts while the dot is busy with something else", async () => {
@@ -316,7 +364,12 @@ test("the feed lists mentions and unread DMs from others, not the owner's, the b
   const friend = { id: "D1", is_im: true };
   const read = { id: "D2", is_im: true };
   fake.state.mentions = [
-    match(1, "UOTHER", general, "hey <@UOWNER> &amp; look"),
+    match(
+      1,
+      "UOTHER",
+      general,
+      "<!here> hey <@UOWNER> &amp; <@UGONE>, see <https://x.test/a?b=1&amp;c=2|the doc> in <#C9|random> or <https://x.test>",
+    ),
     match(2, owner, general, "<@UOWNER> note to self"),
     { ...match(3, "UOTHER", general, "<@UOWNER>"), ts: "999.000000" },
     match(4, "UFRIEND", friend, "<@UOWNER|owner> ping"),
@@ -338,7 +391,7 @@ test("the feed lists mentions and unread DMs from others, not the owner's, the b
     {
       sourceID: `C1/${ts(1)}`,
       reason: "Mentioned",
-      title: "hey <@UOWNER> & look",
+      title: "@here hey @owner & @UGONE, see the doc in #random or https://x.test",
       context: "#general",
       url: "https://slack.test/1",
       updatedAt: started,
@@ -346,7 +399,7 @@ test("the feed lists mentions and unread DMs from others, not the owner's, the b
     {
       sourceID: `D1/${ts(4)}`,
       reason: "Mentioned",
-      title: "<@UOWNER|owner> ping",
+      title: "@owner ping",
       context: "DM",
       url: "https://slack.test/4",
       updatedAt: started,
@@ -361,6 +414,10 @@ test("the feed lists mentions and unread DMs from others, not the owner's, the b
     },
   ]);
   expect(fake.state.infos).toEqual(["D1", "D2"]);
+  // The owner's name comes from auth.test, so only UGONE is looked up.
+  expect(fake.state.calls.filter((call) => call.endsWith("users.info"))).toEqual([
+    "xoxp users.info",
+  ]);
   expect(fake.state.queries).toEqual([`<@${owner}> after:1969-12-31`, "is:dm after:1969-12-31"]);
 });
 
@@ -373,7 +430,11 @@ test("search reads pages until they pass the window, and gives up on a flood", a
       const params = Object.fromEntries(
         new URLSearchParams(typeof init.body === "string" ? init.body : ""),
       );
-      if (url.endsWith("/auth.test")) return Response.json({ ok: true, user_id: owner });
+      if (url.endsWith("/auth.test"))
+        return new Headers(init.headers).get("authorization") === "Bearer xoxb"
+          ? Response.json({ ok: true, user_id: botUser, bot_id: "B1" })
+          : Response.json({ ok: true, user_id: owner });
+      if (url.endsWith("/users.info")) return Response.json({ ok: true, user: { name: "afif" } });
       const page = Number(params.page);
       asked.push(
         `${params.query?.startsWith("is:dm") ? "dm" : "mention"} ${page} ${params.sort_dir}`,
@@ -392,19 +453,143 @@ test("search reads pages until they pass the window, and gives up on a flood", a
   );
   const feed = slackFeed(client);
 
-  expect((await feed.unread(started))?.map((item) => item.title)).toEqual([`<@${owner}> 1`]);
+  expect((await feed.unread(started))?.map((item) => item.title)).toEqual(["@afif 1"]);
   expect(asked).toEqual(["mention 1 desc", "mention 2 desc", "dm 1 desc", "dm 2 desc"]);
 
   pages = 2;
   asked.length = 0;
-  expect((await feed.unread(started))?.map((item) => item.title)).toEqual([
-    `<@${owner}> 1`,
-    `<@${owner}> 2`,
-  ]);
+  expect((await feed.unread(started))?.map((item) => item.title)).toEqual(["@afif 1", "@afif 2"]);
   expect(asked).toHaveLength(4);
 
   pages = 11;
   asked.length = 0;
   expect(await feed.unread(started)).toBeUndefined();
   expect(asked).toHaveLength(10);
+});
+
+test("a user token saved as the bot's is dropped before any bot call, and a bot token saved later is used", async () => {
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    fake.state.tokens.bot = "xoxp-wrong";
+    say("jotaro: hi");
+    await pass();
+    await pass();
+
+    expect(fake.state.calls.filter((call) => call.startsWith("xoxp-wrong"))).toEqual([
+      "xoxp-wrong auth.test",
+    ]);
+    expect(rows()).toEqual([]);
+    expect(errors.mock.calls.filter(([line]) => String(line).includes("xoxb-"))).toHaveLength(1);
+
+    // The Keychain is read again only after a minute.
+    fake.state.tokens.bot = "xoxb";
+    await pass();
+    expect(fake.state.reads.bot).toBe(1);
+    fake.state.time += 60_000;
+    await pass();
+
+    expect(fake.state.reads.bot).toBe(2);
+    expect(rows()).toMatchObject([{ dot: "jotaro", state: "waiting" }]);
+  } finally {
+    errors.mockRestore();
+  }
+});
+
+test("a token Slack says lacks a scope is dropped with what came from it, and read again a minute later", async () => {
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    fake.state.missing.add("conversations.open");
+    say("jotaro: hi");
+    await pass();
+    await pass();
+    expect(fake.state.calls.filter((call) => call.endsWith("conversations.open"))).toHaveLength(1);
+    fake.state.missing.clear();
+    fake.state.time += 60_000;
+    await pass();
+    expect(fake.state.reads.bot).toBe(2);
+    // The bot's identity went with its token, so the new one is checked too.
+    expect(fake.state.calls.filter((call) => call === "xoxb auth.test")).toHaveLength(2);
+    expect(rows()).toMatchObject([{ dot: "jotaro", state: "waiting" }]);
+
+    const general = { id: "C1", name: "general" };
+    fake.state.mentions = [match(1, "UOTHER", general, "<@UOWNER> hi")];
+    fake.state.missing.add("search.messages");
+    const feed = slackFeed(fake.client);
+    expect(await feed.unread(started).catch((error: Error) => error.message)).toContain(
+      "missing_scope",
+    );
+    expect(await feed.unread(started)).toBeUndefined();
+    fake.state.missing.clear();
+    fake.state.time += 60_000;
+    expect((await feed.unread(started))?.map((item) => item.title)).toEqual(["@owner hi"]);
+    expect(fake.state.reads.user).toBe(2);
+  } finally {
+    errors.mockRestore();
+  }
+});
+
+test("with no scopes header, a missing_scope lookup drops the token once with a log, and a reinstalled one names others", async () => {
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const general = { id: "C1", name: "general" };
+    fake.state.mentions = [match(1, "UOTHER", general, "<@UOWNER> meet <@UFRIEND>")];
+    fake.state.missing.add("users.info");
+    const feed = slackFeed(fake.client);
+    const titles = async () => (await feed.unread(started))?.map((item) => item.title);
+    const lookups = (token = "xoxp") =>
+      fake.state.calls.filter((call) => call === `${token} users.info`).length;
+
+    // The items already found still show, and lookups stop at the first refusal.
+    expect(await titles()).toEqual(["@owner meet @UFRIEND"]);
+    expect(lookups()).toBe(1);
+    expect(await titles()).toBeUndefined();
+    fake.state.time += 60_000;
+    expect(await titles()).toEqual(["@owner meet @UFRIEND"]);
+    expect(lookups()).toBe(2);
+    expect(fake.state.reads.user).toBe(2);
+    expect(errors.mock.calls.filter(([line]) => String(line).includes("users:read"))).toHaveLength(
+      1,
+    );
+
+    // The app is reinstalled with users:read, and its new token saved.
+    fake.state.tokens.user = "xoxp-scoped";
+    fake.state.missing.clear();
+    expect(await titles()).toBeUndefined();
+    fake.state.time += 60_000;
+    expect(await titles()).toEqual(["@owner meet @Friend"]);
+    expect(await titles()).toEqual(["@owner meet @Friend"]);
+    expect(fake.state.reads.user).toBe(3);
+    expect(lookups("xoxp-scoped")).toBe(1);
+  } finally {
+    errors.mockRestore();
+  }
+});
+
+test("a user token whose scopes lack users:read is never asked for names, and chat and the feed go on", async () => {
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    fake.state.scopes = "search:read, im:read, mpim:read, channels:read, groups:read";
+    // Asking would drop the token, as in the test above.
+    fake.state.missing.add("users.info");
+    const general = { id: "C1", name: "general" };
+    fake.state.mentions = [match(1, "UOTHER", general, "<@UOWNER> meet <@UFRIEND>")];
+    const feed = slackFeed(fake.client);
+    const titles = async () => (await feed.unread(started))?.map((item) => item.title);
+
+    say("jotaro: hi");
+    await pass();
+    expect(await titles()).toEqual(["@owner meet @UFRIEND"]);
+    say("and you?");
+    await pass();
+    expect(await titles()).toEqual(["@owner meet @UFRIEND"]);
+
+    expect(fake.state.calls.filter((call) => call.endsWith("users.info"))).toEqual([]);
+    expect(rows().map((saved) => saved.state)).toEqual(["waiting", "waiting"]);
+    expect(fake.state.reads.user).toBe(1);
+    expect(
+      errors.mock.calls.filter(([line]) => String(line).includes("lacks users:read")),
+    ).toHaveLength(1);
+  } finally {
+    errors.mockRestore();
+  }
 });

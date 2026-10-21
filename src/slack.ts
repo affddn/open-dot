@@ -23,8 +23,14 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const failure = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
-// Errors that mean the token itself is bad, so the Keychain is read again.
-const revoked = new Set(["invalid_auth", "not_authed", "token_revoked", "account_inactive"]);
+// Errors that mean the token itself is bad or the wrong one, so the Keychain is read again.
+const revoked = new Set([
+  "invalid_auth",
+  "not_authed",
+  "token_revoked",
+  "account_inactive",
+  "missing_scope",
+]);
 
 const keychain = (service: string) => () =>
   output(["security", "find-generic-password", "-s", service, "-w"]);
@@ -65,11 +71,32 @@ export function slackClient(
   const base = process.env.OPEN_DOT_SLACK_URL ?? "https://slack.com/api";
   const saved = { bot: remembered(tokens.bot, now), user: remembered(tokens.user, now) };
   let owner: string | undefined;
+  let ownerName: string | undefined;
+  // The user token's scopes, from Slack's x-oauth-scopes header once a call has shown them.
+  let userScopes: Set<string> | undefined;
   let announced: string | undefined;
   let bot: string | undefined;
   let channel: string | undefined;
+  let wrongBot = false;
   // Slack's limits are per app and workspace, so one pause after a 429 covers every call.
   let pausedUntil = 0;
+
+  /** Keeps the bot's user ID from its auth.test. A token without a bot_id isn't a bot's. */
+  const verify = (body: Record<string, unknown>) => {
+    if (typeof body.bot_id === "string" && typeof body.user_id === "string") {
+      bot = body.user_id;
+      wrongBot = false;
+      return true;
+    }
+    saved.bot.forget();
+    bot = channel = undefined;
+    if (!wrongBot)
+      console.error(
+        "Slack: the Keychain item open-dot-slack-bot holds a token that isn't a bot's. Save the app's Bot User OAuth Token (xoxb-…) there instead; the daemon reads it again within a minute.",
+      );
+    wrongBot = true;
+    return false;
+  };
 
   const call = async (
     kind: Kind,
@@ -78,6 +105,13 @@ export function slackClient(
   ): Promise<Answer | undefined> => {
     const token = await saved[kind].get();
     if (!token) return undefined;
+    // A user token saved as the bot's would act as the owner, so it's checked before any bot call.
+    if (kind === "bot" && method !== "auth.test" && !bot) {
+      const checked = await call("bot", "auth.test");
+      // The call itself never left, so a lost check means only "not now".
+      if (checked?.kind === "refused") return checked;
+      if (checked?.kind !== "ok" || !verify(checked.body)) return undefined;
+    }
     if (now() < pausedUntil) return { kind: "refused", error: "ratelimited" };
     try {
       const response = await fetch(`${base}/${method}`, {
@@ -89,6 +123,9 @@ export function slackClient(
         body: new URLSearchParams(params).toString(),
         signal: AbortSignal.timeout(10_000),
       });
+      const scopes = response.headers.get("x-oauth-scopes");
+      if (kind === "user" && scopes !== null)
+        userScopes = new Set(scopes.split(",").map((scope) => scope.trim()));
       if (response.status === 429) {
         const seconds = Number(response.headers.get("retry-after"));
         pausedUntil = now() + (seconds > 0 ? seconds : 30) * 1000;
@@ -100,7 +137,7 @@ export function slackClient(
         if (body.ok === false && typeof body.error === "string") {
           if (revoked.has(body.error)) {
             saved[kind].forget();
-            if (kind === "user") owner = channel = undefined;
+            if (kind === "user") owner = ownerName = userScopes = channel = undefined;
             else bot = channel = undefined;
           }
           return { kind: "refused", error: body.error };
@@ -126,6 +163,7 @@ export function slackClient(
     if (!body) return undefined;
     const identity = Schema.decodeUnknownSync(Auth)(body);
     owner = identity.user_id;
+    ownerName = identity.user;
     // Whoever owns the user token can instruct the dots, so say who that is.
     if (owner !== announced) console.log(`Slack: acting for ${identity.user ?? "?"} (${owner})`);
     announced = owner;
@@ -136,11 +174,15 @@ export function slackClient(
     call,
     read,
     owner: ownerID,
-    /** The bot's own user ID, from the bot token. */
+    /** The owner's Slack handle from the user token's auth.test, once it has run. */
+    ownerName: () => ownerName,
+    /** Whether the user token has `scope`, or undefined while Slack hasn't said. */
+    userScope: (scope: string) => userScopes?.has(scope),
+    /** The bot's own user ID, from the bot token. Undefined when the token isn't a bot's. */
     bot: async () => {
       if (bot) return bot;
       const body = await read("bot", "auth.test");
-      if (body) bot = Schema.decodeUnknownSync(Auth)(body).user_id;
+      if (body) verify(body);
       return bot;
     },
     /** The owner's DM with the bot. Opening it again returns the same conversation. */
@@ -456,8 +498,27 @@ const isIM = (match: Match) =>
   match.channel.is_im === true || match.type === "im" || match.channel.id.startsWith("D");
 const isDirect = (match: Match) => isIM(match) || match.channel.is_mpim === true;
 
-const headline = (text: string) => {
-  const line = unescape(text).replace(/\s+/g, " ").trim();
+// A mention without a label, so its name has to be found elsewhere.
+const bareMention = /<@(\w+)>/g;
+
+/** The name Slack shows for a user in users.info's answer. */
+const nameIn = (body: Record<string, unknown>) => {
+  const user = isRecord(body.user) ? body.user : {};
+  const profile = isRecord(user.profile) ? user.profile : {};
+  return [profile.display_name, user.real_name, user.name].find(
+    (name): name is string => typeof name === "string" && name !== "",
+  );
+};
+
+/** One line of plain text: a link shows its label, a mention the name or else the ID. */
+const headline = (text: string, names: ReadonlyMap<string, string | null>) => {
+  const plain = text.replace(/<([^<>|]*)(?:\|([^<>]*))?>/g, (_, ref: string, label?: string) => {
+    if (ref.startsWith("@")) return `@${label || names.get(ref.slice(1)) || ref.slice(1)}`;
+    if (ref.startsWith("#")) return `#${label || ref.slice(1)}`;
+    if (ref.startsWith("!")) return label || `@${ref.slice(1).split("^")[0]}`;
+    return label || ref;
+  });
+  const line = unescape(plain).replace(/\s+/g, " ").trim();
   return line.length > 200 ? `${line.slice(0, 199)}…` : line;
 };
 
@@ -467,6 +528,40 @@ const headline = (text: string) => {
  * stays until dismissed or a day old, and dismissing it changes nothing in Slack.
  */
 export function slackFeed(client: Slack): Source {
+  // Null when Slack has no name for the ID.
+  const names = new Map<string, string | null>();
+  let warned = false;
+  const warn = (problem: string) => {
+    if (!warned)
+      console.error(
+        `Slack: ${problem}. Feed mentions of others show user IDs until you add users:read to the app's user scopes, reinstall the app, and save its new User OAuth Token (xoxp-…) under open-dot-slack-user.`,
+      );
+    warned = true;
+  };
+  /** Names the users mentioned in `texts`, until Slack can't say for now. */
+  const learn = async (owner: string, texts: string[]) => {
+    const handle = client.ownerName();
+    if (handle) names.set(owner, handle);
+    const ids = texts.flatMap((text) => [...text.matchAll(bareMention)].map((m) => m[1] ?? ""));
+    for (const id of new Set(ids)) {
+      if (names.has(id)) continue;
+      // Asking without the scope would drop the token and pause Slack for a minute.
+      if (client.userScope("users:read") === false) return warn("the user token lacks users:read");
+      const answer = await client.call("user", "users.info", { user: id });
+      if (answer?.kind === "ok") {
+        names.set(id, nameIn(answer.body) ?? null);
+        warned = false;
+        continue;
+      }
+      // The client has dropped the token, so a reinstalled one is read within a minute.
+      if (answer?.kind === "refused" && answer.error === "missing_scope")
+        warn("users.info answered missing_scope, so the user token is read again in a minute");
+      // Until Slack can answer, IDs stand in for names this pass.
+      if (answer?.kind !== "refused" || ["missing_scope", "ratelimited"].includes(answer.error))
+        return;
+      names.set(id, null);
+    }
+  };
   return {
     name: "slack",
     unread: async (since) => {
@@ -531,20 +626,22 @@ export function slackFeed(client: Slack): Source {
         if (!body) return undefined;
         lastRead.set(match.channel.id, Schema.decodeUnknownSync(Info)(body).channel.last_read);
       }
-      return [...found].flatMap(([sourceID, { match, reason }]) => {
+      const unread = [...found].filter(([, { match }]) => {
         const read = lastRead.get(match.channel.id);
-        if (read !== undefined && !after(match.ts, read)) return [];
-        return [
-          {
-            sourceID,
-            reason,
-            title: headline(match.text ?? ""),
-            context: isDirect(match) ? "DM" : `#${match.channel.name ?? match.channel.id}`,
-            url: match.permalink ?? null,
-            updatedAt: Math.round(Number(match.ts) * 1000),
-          },
-        ];
+        return read === undefined || after(match.ts, read);
       });
+      await learn(
+        owner,
+        unread.map(([, { match }]) => match.text ?? ""),
+      );
+      return unread.map(([sourceID, { match, reason }]) => ({
+        sourceID,
+        reason,
+        title: headline(match.text ?? "", names),
+        context: isDirect(match) ? "DM" : `#${match.channel.name ?? match.channel.id}`,
+        url: match.permalink ?? null,
+        updatedAt: Math.round(Number(match.ts) * 1000),
+      }));
     },
     // Dismissing hides the item in the notch only.
     markRead: async () => {},

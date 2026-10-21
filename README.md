@@ -87,21 +87,21 @@ features:
 oauth_config:
   scopes:
     bot: [chat:write, chat:write.customize, im:history, im:read, im:write, metadata.message:read]
-    user: [search:read, im:read, mpim:read, channels:read, groups:read]
+    user: [search:read, im:read, mpim:read, channels:read, groups:read, users:read]
 settings:
   org_deploy_enabled: false
   socket_mode_enabled: false
   token_rotation_enabled: false
 ```
 
-If your workspace requires approval, ask an admin to approve this internal app with these scopes. The bot scopes let it read and write only its own DMs with you, post replies under a dot's name, and tag replies so a lost post can be found. The user scopes let it search messages you can see and read DM read state on your behalf; it never posts or marks anything as you. Once an admin approves it, install it yourself: the user token belongs to whoever installs the app, and whoever that is can instruct your dots. The daemon logs `Slack: acting for <name> (<user ID>)` so you can check. Then copy the **Bot User OAuth Token** (`xoxb-…`) and the **User OAuth Token** (`xoxp-…`) from **OAuth & Permissions** into the Keychain:
+If your workspace requires approval, ask an admin to approve this internal app with these scopes. The bot scopes let it read and write only its own DMs with you, post replies under a dot's name, and tag replies so a lost post can be found. The user scopes let it search messages you can see, read DM read state and look up the names of people a message mentions, on your behalf; it never posts or marks anything as you. Once an admin approves it, install it yourself: the user token belongs to whoever installs the app, and whoever that is can instruct your dots. The daemon logs `Slack: acting for <name> (<user ID>)` so you can check. Then copy the **Bot User OAuth Token** (`xoxb-…`) and the **User OAuth Token** (`xoxp-…`) from **OAuth & Permissions** into the Keychain:
 
 ```sh
 security add-generic-password -a "$USER" -s open-dot-slack-bot -w
 security add-generic-password -a "$USER" -s open-dot-slack-user -w
 ```
 
-The daemon picks them up within a minute, without a restart. Until the tokens it needs are saved, it skips that part and checks the Keychain again once a minute: chat needs both tokens, the feed only the user token.
+The daemon picks them up within a minute, without a restart. Until the tokens it needs are saved, it skips that part and checks the Keychain again once a minute: chat needs both tokens, the feed only the user token. If Slack rejects a token or says it lacks a scope, or `open-dot-slack-bot` holds a token that isn't a bot's, the daemon logs it, drops the token and reads the Keychain again a minute later. Feed titles show mentions of you by your Slack handle, and mentions of others by name, which needs `users:read`. An app installed before that scope was added still works: the daemon sees from Slack's `x-oauth-scopes` header that the scope is missing, never asks for names, shows others by user ID and logs once what to do. Add `users:read`, reinstall the app, and save its new User OAuth Token under `open-dot-slack-user`. If the previous token remains valid, restart the open-dot daemon to load its replacement; valid tokens stay cached. If Slack sends no scopes header, the daemon tries a lookup, and its `missing_scope` drops the token and pauses Slack until the Keychain is read again a minute later.
 
 ## Talk from the notch
 
