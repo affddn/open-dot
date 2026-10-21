@@ -427,7 +427,15 @@ const Match = Schema.Struct({
 });
 type Match = typeof Match.Type;
 
-const Search = Schema.Struct({ messages: Schema.Struct({ matches: Schema.Array(Match) }) });
+const Search = Schema.Struct({
+  messages: Schema.Struct({
+    matches: Schema.Array(Match),
+    paging: Schema.optionalKey(Schema.Struct({ page: Schema.Number, pages: Schema.Number })),
+  }),
+});
+
+// More pages than this in a day is a flood; the feed keeps what it had rather than miss some.
+const searchPages = 10;
 const Info = Schema.Struct({
   channel: Schema.Struct({ last_read: Schema.optionalKey(Schema.String) }),
 });
@@ -454,17 +462,36 @@ export function slackFeed(client: Slack): Source {
       if (!owner) return undefined;
       // Search filters by day, so ask for a day more and filter by time here.
       const day = new Date(since - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      /** Every match since `since`, newest first, or undefined when they can't all be read. */
       const search = async (query: string) => {
-        const body = await client.read("user", "search.messages", {
-          query,
-          sort: "timestamp",
-          count: "100",
-        });
-        return body && Schema.decodeUnknownSync(Search)(body).messages.matches;
+        const matches: Match[] = [];
+        for (let page = 1; page <= searchPages; page++) {
+          const body = await client.read("user", "search.messages", {
+            query,
+            sort: "timestamp",
+            sort_dir: "desc",
+            count: "100",
+            page: String(page),
+          });
+          if (!body) return undefined;
+          const { messages } = Schema.decodeUnknownSync(Search)(body);
+          matches.push(...messages.matches);
+          const oldest = messages.matches.at(-1);
+          if (
+            !oldest ||
+            Number(oldest.ts) * 1000 < since ||
+            !messages.paging ||
+            messages.paging.page >= messages.paging.pages
+          )
+            return matches;
+        }
+        return undefined;
       };
       const mentions = await search(mentionQuery(owner, day));
+      if (!mentions) return undefined;
       const direct = await search(dmQuery(day));
-      if (!mentions || !direct) return undefined;
+      if (!direct) return undefined;
+      const mentioned = (text = "") => text.includes(`<@${owner}>`) || text.includes(`<@${owner}|`);
       const dm = client.knownDM();
       const bot = dm ? undefined : await client.bot();
       const found = new Map<string, { match: Match; reason: string }>();
@@ -479,7 +506,7 @@ export function slackFeed(client: Slack): Source {
             Number(match.ts) * 1000 < since ||
             match.user === owner ||
             (dm ? match.channel.id === dm : bot !== undefined && match.user === bot) ||
-            (!mention && !isDirect(match))
+            (mention ? !mentioned(match.text) : !isDirect(match))
           )
             continue;
           found.set(id, { match, reason: mention ? "Mentioned" : "Direct message" });

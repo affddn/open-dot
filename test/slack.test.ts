@@ -277,18 +277,19 @@ const match = (n: number, user: string, channel: Record<string, unknown>, text =
   channel,
 });
 
-test("the feed lists mentions and unread DMs from others, not the owner's, the bot's or read ones", async () => {
+test("the feed lists mentions and unread DMs from others, not the owner's, the bot's, read ones or false mentions", async () => {
   const general = { id: "C1", name: "general" };
   const friend = { id: "D1", is_im: true };
   const read = { id: "D2", is_im: true };
   fake.state.mentions = [
     match(1, "UOTHER", general, "hey <@UOWNER> &amp; look"),
-    match(2, owner, general),
-    { ...match(3, "UOTHER", general), ts: "999.000000" },
-    match(4, "UFRIEND", friend),
+    match(2, owner, general, "<@UOWNER> note to self"),
+    { ...match(3, "UOTHER", general, "<@UOWNER>"), ts: "999.000000" },
+    match(4, "UFRIEND", friend, "<@UOWNER|owner> ping"),
+    match(9, "UOTHER", general, "about UOWNER, not to them"),
   ];
   fake.state.dms = [
-    match(4, "UFRIEND", friend),
+    match(4, "UFRIEND", friend, "<@UOWNER|owner> ping"),
     match(5, "UFRIEND", friend, "lunch?"),
     match(6, "UREAD", read),
     match(7, botUser, { id: dm, is_im: true }),
@@ -311,7 +312,7 @@ test("the feed lists mentions and unread DMs from others, not the owner's, the b
     {
       sourceID: `D1/${ts(4)}`,
       reason: "Mentioned",
-      title: "hey",
+      title: "<@UOWNER|owner> ping",
       context: "DM",
       url: "https://slack.test/4",
       updatedAt: started,
@@ -327,4 +328,49 @@ test("the feed lists mentions and unread DMs from others, not the owner's, the b
   ]);
   expect(fake.state.infos).toEqual(["D1", "D2"]);
   expect(fake.state.queries).toEqual([`<@${owner}> after:1969-12-31`, "is:dm after:1969-12-31"]);
+});
+
+test("search reads pages until they pass the window, and gives up on a flood", async () => {
+  const general = { id: "C1", name: "general" };
+  let pages = 5;
+  const asked: string[] = [];
+  const client = slackClient(
+    async (url, init) => {
+      const params = Object.fromEntries(
+        new URLSearchParams(typeof init.body === "string" ? init.body : ""),
+      );
+      if (url.endsWith("/auth.test")) return Response.json({ ok: true, user_id: owner });
+      const page = Number(params.page);
+      asked.push(
+        `${params.query?.startsWith("is:dm") ? "dm" : "mention"} ${page} ${params.sort_dir}`,
+      );
+      // Newest first: page 2 already reaches before the window when there are 5 pages.
+      const at = pages === 5 && page === 2 ? "999.000000" : ts(100 - page);
+      return Response.json({
+        ok: true,
+        messages: {
+          matches: [{ ...match(page, "UOTHER", general, `<@${owner}> ${page}`), ts: at }],
+          paging: { page, pages },
+        },
+      });
+    },
+    { bot: async () => "xoxb", user: async () => "xoxp" },
+  );
+  const feed = slackFeed(client);
+
+  expect((await feed.unread(started))?.map((item) => item.title)).toEqual([`<@${owner}> 1`]);
+  expect(asked).toEqual(["mention 1 desc", "mention 2 desc", "dm 1 desc", "dm 2 desc"]);
+
+  pages = 2;
+  asked.length = 0;
+  expect((await feed.unread(started))?.map((item) => item.title)).toEqual([
+    `<@${owner}> 1`,
+    `<@${owner}> 2`,
+  ]);
+  expect(asked).toHaveLength(4);
+
+  pages = 11;
+  asked.length = 0;
+  expect(await feed.unread(started)).toBeUndefined();
+  expect(asked).toHaveLength(10);
 });
