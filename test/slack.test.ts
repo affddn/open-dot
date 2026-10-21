@@ -269,6 +269,19 @@ test("after a 429, no call reaches Slack until its Retry-After has passed", asyn
   expect(calls).toBe(2);
 });
 
+test("a finished reply posts while the dot is busy with something else", async () => {
+  opencode.state.turns.set("ses_jotaro", { outcome: "succeeded", text: "Done." });
+  const first = say("jotaro: hi");
+  await pass();
+  await deliver();
+  opencode.state.active.add("ses_jotaro");
+
+  await pass();
+
+  expect(row(first)?.state).toBe("posted");
+  expect(fake.state.posts).toMatchObject([{ markdown_text: "Done." }]);
+});
+
 const match = (n: number, user: string, channel: Record<string, unknown>, text = "hey") => ({
   ts: ts(n),
   user,

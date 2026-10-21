@@ -313,9 +313,8 @@ export function slackChat(
     if (waiting.length === 0) return;
     yield* Effect.gen(function* () {
       const opencode = yield* OpenCode;
-      const active = yield* opencode.activeSessions;
       for (const row of waiting) {
-        if (active.has(row.sessionID)) continue;
+        // The session may already be busy with a later message, so only this turn's end counts.
         const turn = yield* opencode.turnAfter(row);
         if (!turn) continue;
         db.update(slack)
