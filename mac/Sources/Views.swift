@@ -222,6 +222,7 @@ struct DraftEditor: NSViewRepresentable {
     scroll.hasVerticalScroller = true
     let editor = DraftTextView()
     editor.isRichText = false
+    editor.allowsUndo = true
     editor.drawsBackground = false
     editor.textColor = .white
     editor.font = .systemFont(ofSize: 13)
@@ -240,7 +241,12 @@ struct DraftEditor: NSViewRepresentable {
     guard let editor = scroll.documentView as? DraftTextView else { return }
     editor.send = send
     editor.setAccessibilityLabel(placeholder)
-    if editor.string != text { editor.string = text }
+    if editor.string != text {
+      // The text changed outside the editor, as after a send or a quick prompt, so earlier undo
+      // steps no longer fit it.
+      editor.history.removeAllActions()
+      editor.string = text
+    }
     DispatchQueue.main.async {
       let size = measuredSize(scroll, width: max(scroll.contentSize.width, 1))
       if height != size.height { height = size.height }
@@ -270,6 +276,22 @@ struct DraftEditor: NSViewRepresentable {
 
 class DraftTextView: NSTextView {
   var send: () -> Void = {}
+  /// Each editor keeps its own undo history, which ends with it. The panel's shared one would let
+  /// Command-Z in one dot's draft undo typing in another's.
+  let history = UndoManager()
+
+  override var undoManager: UndoManager? { history }
+
+  @objc func undo(_ sender: Any?) { history.undo() }
+  @objc func redo(_ sender: Any?) { history.redo() }
+
+  override func validateMenuItem(_ item: NSMenuItem) -> Bool {
+    switch item.action {
+    case #selector(undo(_:)): history.canUndo
+    case #selector(redo(_:)): history.canRedo
+    default: super.validateMenuItem(item)
+    }
+  }
 
   override func keyDown(with event: NSEvent) {
     if (event.keyCode == 36 || event.keyCode == 76) && !hasMarkedText() {

@@ -60,6 +60,25 @@ struct Notch {
   }
 }
 
+/// An accessory app shows no menu bar, but AppKit still finds Command shortcuts in its main menu.
+/// Without one, Command-A, C, X, V and Z do nothing in the composer. Each item has no target, so it
+/// goes to whatever has keyboard focus, such as the composer or selected chat text.
+@MainActor func editMenu() -> NSMenu {
+  let edit = NSMenu(title: "Edit")
+  edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+  edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z").keyEquivalentModifierMask = [.command, .shift]
+  edit.addItem(.separator())
+  edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+  edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+  edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+  edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+  let menu = NSMenu()
+  // AppKit treats the first item as the application menu, so Edit comes second.
+  menu.addItem(NSMenuItem())
+  menu.addItem(withTitle: "Edit", action: nil, keyEquivalent: "").submenu = edit
+  return menu
+}
+
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
   private let store = Store()
   private let pinned = ProcessInfo.processInfo.environment["OPEN_DOT_NOTCH_PINNED"] == "1"
@@ -71,6 +90,7 @@ struct Notch {
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
+    NSApp.mainMenu = editMenu()
     panel.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3)
     panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
     panel.isOpaque = false
