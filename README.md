@@ -103,6 +103,46 @@ security add-generic-password -a "$USER" -s open-dot-slack-user -w
 
 The daemon picks them up within a minute, without a restart. Until the tokens it needs are saved, it skips that part and checks the Keychain again once a minute: chat needs both tokens, the feed only the user token. If Slack rejects a token or says it lacks a scope, or `open-dot-slack-bot` holds a token that isn't a bot's, the daemon logs it, drops the token and reads the Keychain again a minute later. Feed titles show mentions of you by your Slack handle, and mentions of others by name, which needs `users:read`. An app installed before that scope was added still works: the daemon sees from Slack's `x-oauth-scopes` header that the scope is missing, never asks for names, shows others by user ID and logs once what to do. Add `users:read`, reinstall the app, and save its new User OAuth Token under `open-dot-slack-user`. If the previous token remains valid, restart the open-dot daemon to load its replacement; valid tokens stay cached. If Slack sends no scopes header, the daemon tries a lookup, and its `missing_scope` drops the token and pauses Slack until the Keychain is read again a minute later.
 
+### Give a dot its own Slack app
+
+A dot can have its own Slack app, with its own name, profile and agent view, and an @handle that works in any channel you invite it to. The shared open-dot app stays: the feed and its DM work as before.
+
+1. Generate an app configuration token pair at [api.slack.com/apps](https://api.slack.com/apps), under **Your App Configuration Tokens → Generate Token**, for your workspace. Save it with `bun src/cli.ts slack config`, which asks for the access token (`xoxe.xoxp-…`) and the refresh token (`xoxe-…`) without echoing them and keeps both in the one Keychain item `open-dot-slack-config`. A configuration token lasts 12 hours, so the daemon rotates the pair with `tooling.tokens.rotate` before each use and saves the new pair in the same item. Slack's answer to the rotation must name you and your workspace, as `open-dot-slack-user` does, or no app is created.
+2. Run `bun src/cli.ts slack connect jotaro`, or answer yes when `open-dot create` asks in a terminal. This only records the request. The daemon creates the app named after the dot with `apps.manifest.create` within about 10 seconds. It keeps only the app's ID, never its client or signing secrets.
+3. Run `bun src/cli.ts slack status jotaro` and follow its steps. Slack only sends an install's OAuth code to an HTTPS address, which the daemon doesn't have, so you install the app and copy its tokens yourself:
+   - Open the app's **Install App** page and click **Install**, then **Allow**. If your workspace needs an admin to approve apps, ask for that first.
+   - Optionally set its icon under **Display Information**. Slack's manifest has no field for it.
+   - Under **App-Level Tokens** on the **Basic Information** page, generate a token with the `connections:write` scope.
+   - Save the **Bot User OAuth Token** (`xoxb-…`) and the app-level token (`xapp-…`). Each command asks for the token without echoing it:
+
+     ```sh
+     security add-generic-password -U -a "$USER" -s open-dot-slack-jotaro-bot -w
+     security add-generic-password -U -a "$USER" -s open-dot-slack-jotaro-app -w
+     ```
+
+4. Within a minute the daemon checks the tokens and connects over Socket Mode. `slack status` then says `active`. Invite the dot to a channel with `/invite @jotaro`.
+
+What it does:
+
+- When you mention the dot in a channel, it replies once in that message's thread when its turn ends. Each mention gets its own reply, even if the dot answered several in one turn. The dot is given every message in the thread it hasn't seen yet, all of it the first time, as data framed in a `<slack-thread>` block; only your mention instructs it. If the thread can't be read in full, the mention waits and is tried again.
+- A DM to the dot's app, including its agent view threads, goes to that dot, with no name needed. The reply goes back to the same DM or thread.
+- A worker's report goes to your DM with the dot's app, as well as the notch, never to a channel thread. Mention the dot again to have it post a result there. Only reports from after the app connected are sent.
+- When someone else mentions or DMs a dot, nothing reaches the dot. They get one note only they can see, such as "jotaro only answers @Afif.", once per conversation.
+- The shared open-dot app can do the same for anyone who DMs it, but only once you turn it on with `bun src/cli.ts slack notices enable`. Until then it doesn't read its DMs for this or send any note. Once on, it checks once a minute and answers DMs sent from the moment you turned it on, including ones sent while the daemon was stopped, never older ones. Running `enable` again keeps that moment. `bun src/cli.ts slack notices disable` turns it off, and `bun src/cli.ts slack status` says which it is.
+
+How it stays safe:
+
+- An app is created only after you ask. The attempt is saved before the call. If Slack's answer is lost, the dot's app turns `unknown` and is never created again on its own: look for it at api.slack.com/apps and run `bun src/cli.ts slack attach jotaro <app ID>`, which has the daemon check that the app's bot is named after the dot and uses Socket Mode, or, if there's none, run `bun src/cli.ts slack connect jotaro --retry`. A late answer about an app you named earlier never changes one you've named since.
+- A rotation is saved as started before the call. If its answer is lost or its new pair can't be saved, every later rotation stops, because Slack may already have used up the old refresh token. Generate a new pair and save it with `slack config`.
+- A bot token is used only once `auth.test` shows a bot in your workspace and `bots.info` shows it belongs to the dot's app, and, once connected, the same bot and bot user as before, even for a token read again without a restart. A connection's `hello` never replaces the bot an app saved. Slack's `hello` must name the dot's app, and each event must name that app and workspace. A token saved in the wrong item is dropped and the Keychain read again a minute later.
+- Each event is saved before Slack gets its acknowledgement, with only the fields open-dot needs and never the envelope's verification token. Slack sending it again, under the same or a new event ID, adds nothing. Only your own messages are kept with their words.
+- A reply's ID is saved before it's posted, and the reply turns _unknown_ just before the post. An unknown reply is only looked up by that ID among the dot's own posts in that conversation, once a minute for an hour, and never posted again; if it's never found it stays unknown. Slack refusing a post marks it failed.
+- A token check that fails, such as Slack answering `internal_error` to the bot token's `auth.test`, means the call it guarded was never sent, so a reply waiting on it is posted later rather than marked unknown or failed.
+- If `slack config` can't turn off the terminal's echo, and show that it's off, it stops before asking for a token, and puts the terminal's settings back.
+- A note to someone else is saved before it's sent and never sent twice, even if its answer was lost, so a note can go missing but never repeat.
+
+The app's manifest asks for these bot scopes: `app_mentions:read`, `assistant:write`, `channels:history`, `chat:write`, `groups:history`, `im:history`, `im:read`, `im:write`, `metadata.message:read` and `users:read`, which `bots.info` needs. It subscribes to `app_mention` and `message.im` over Socket Mode. Not yet checked live: whether Slack shows the AGENT badge, and whether your workspace lets you install your own apps.
+
 ## Talk from the notch
 
 The notch app is a small native macOS app (macOS 14 or later) that talks to the running daemon. Build and start it:

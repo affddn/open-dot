@@ -7,6 +7,7 @@ import type { Db } from "./db";
 import { worktreeDirectory } from "./home";
 import { OpenCode, type Turn } from "./opencode";
 import { dots, outbox, reminders, type Worker, workers } from "./schema";
+import { queueReport } from "./slack-agents";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Message = typeof outbox.$inferSelect;
@@ -187,13 +188,13 @@ const start = (db: Db, worker: Worker, dotSessionID: string) =>
           .where(and(eq(workers.id, worker.id), eq(workers.state, "creating")))
           .returning({ id: workers.id })
           .get();
-        if (failed) {
-          enqueue(
-            tx,
-            dotSessionID,
-            `Worker #${worker.id} could not start, because git could not create its worktree: ${error}\nTask: ${headline(worker.task)}`,
-          );
-        }
+        if (!failed) return;
+        const report = enqueue(
+          tx,
+          dotSessionID,
+          `Worker #${worker.id} could not start, because git could not create its worktree: ${error}\nTask: ${headline(worker.task)}`,
+        );
+        queueReport(tx, worker.dot, report.text, report.messageID);
       });
       return;
     }
@@ -259,7 +260,10 @@ const check = (db: Db, worker: Worker, dotSessionID: string, active: ReadonlySet
         .where(and(eq(workers.id, worker.id), eq(workers.state, "running")))
         .returning({ id: workers.id })
         .get();
-      if (finished) enqueue(tx, dotSessionID, reportText(worker, turn));
+      if (!finished) return;
+      // The owner also gets the report in the dot's own Slack DM, if it has one.
+      const report = enqueue(tx, dotSessionID, reportText(worker, turn));
+      queueReport(tx, worker.dot, report.text, report.messageID);
     });
   });
 

@@ -38,6 +38,8 @@ function fakeSlack() {
     missing: new Set<string>(),
     // The user token's x-oauth-scopes header, or undefined to send none.
     scopes: undefined as string | undefined,
+    // An error Slack gives the bot token's auth.test, as during an outage.
+    botCheck: undefined as string | undefined,
     names: new Map([
       [owner, "Afif"],
       ["UFRIEND", "Friend"],
@@ -57,6 +59,7 @@ function fakeSlack() {
     const user = token.startsWith("xoxp");
     switch (method) {
       case "auth.test":
+        if (!user && state.botCheck) return Response.json({ ok: false, error: state.botCheck });
         return Response.json({
           ok: true,
           user: user ? "owner" : "open-dot",
@@ -291,6 +294,30 @@ test("a reply goes to the DM its message came from, even when the tokens change"
   expect(fake.state.posts).toMatchObject([{ channel: dm, markdown_text: "Hi." }]);
 });
 
+test("a bot token check that fails leaves a reply unsent and posts it later, never failed or unknown", async () => {
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    opencode.state.turns.set("ses_jotaro", { outcome: "succeeded", text: "Hi." });
+    const first = say("jotaro: hi");
+    await pass();
+    await deliver();
+
+    // The daemon restarts while Slack fails the bot token's check.
+    fake.state.botCheck = "internal_error";
+    const chat = slackChat(db, fake.connect(), opencode.layer, started);
+    await Effect.runPromise(chat);
+    expect(row(first)?.state).toBe("posting");
+    expect(fake.state.calls.filter((call) => call.endsWith("chat.postMessage"))).toEqual([]);
+
+    fake.state.botCheck = undefined;
+    await Effect.runPromise(chat);
+    expect(row(first)?.state).toBe("posted");
+    expect(fake.state.posts).toMatchObject([{ channel: dm, markdown_text: "Hi." }]);
+  } finally {
+    errors.mockRestore();
+  }
+});
+
 test("after a 429, no call reaches Slack until its Retry-After has passed", async () => {
   let clock = 0;
   let calls = 0;
@@ -307,9 +334,10 @@ test("after a 429, no call reaches Slack until its Retry-After has passed", asyn
   );
   const post = () => client.call("bot", "chat.postMessage", { channel: dm });
 
-  expect(await post()).toEqual({ kind: "refused", error: "ratelimited" });
+  // The 429 answered the bot token's check, so the post itself was never sent.
+  expect(await post()).toBeUndefined();
   clock = 4_999;
-  expect(await post()).toEqual({ kind: "refused", error: "ratelimited" });
+  expect(await post()).toBeUndefined();
   expect(calls).toBe(1);
   clock = 5_000;
   expect(await post()).toMatchObject({ kind: "ok" });

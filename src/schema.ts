@@ -153,3 +153,116 @@ export const slack = sqliteTable("slack", {
   }).notNull(),
   createdAt: integer("created_at").notNull(),
 });
+
+/**
+ * A dot's own Slack app, created from a manifest with the owner's configuration token, and the
+ * identity its tokens must show before the daemon uses them. No secret is kept here.
+ */
+export const slackApps = sqliteTable("slack_apps", {
+  dot: text()
+    .primaryKey()
+    .references(() => dots.name),
+  // "requested": the owner asked for an app. "creating": an attempt is saved just before the
+  // create call. "unknown": that call's outcome was lost, so nothing is created again until the
+  // owner attaches the app or says there is none. "attaching": the owner named an app to check.
+  // "failed": Slack refused. "created": waiting for the owner to install it and save its tokens.
+  // "active": its tokens showed this app, workspace and bot.
+  state: text({
+    enum: ["requested", "creating", "unknown", "attaching", "failed", "created", "active"],
+  }).notNull(),
+  // The create or attach in progress, so a late answer about an earlier one changes nothing.
+  attemptID: text("attempt_id"),
+  appID: text("app_id"),
+  teamID: text("team_id"),
+  // The only Slack user who can instruct the dot through this app.
+  ownerID: text("owner_id"),
+  botID: text("bot_id"),
+  botUser: text("bot_user"),
+  // What the owner should know or do, as the daemon last saw it.
+  problem: text(),
+  createdAt: integer("created_at").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+export type SlackApp = typeof slackApps.$inferSelect;
+
+/**
+ * Slack settings in one row: the configuration token's rotation, so a lost outcome is never
+ * retried, and whether the shared app sends notes to others.
+ */
+export const slackConfig = sqliteTable("slack_config", {
+  id: integer().primaryKey(),
+  // "rotating": a rotation may be in flight. "blocked": its outcome or its save was lost, and the
+  // owner saves a new token pair with `open-dot slack config`.
+  state: text({ enum: ["idle", "rotating", "blocked"] }).notNull(),
+  // When the saved pair was issued, so a recovered rotation can tell whether its pair was saved.
+  fromIat: integer("from_iat"),
+  problem: text(),
+  // When the owner turned on notes to others who DM the shared app, which then reads DMs from
+  // this time on, across restarts. Null means off: the shared app's DMs aren't read for notes.
+  noticesSince: integer("notices_since"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+/**
+ * What a dot's own app received, and each reply on its way back. An event is saved before Slack
+ * gets its acknowledgement, with only the fields open-dot needs. A worker's report to the owner's
+ * DM is a row too, with no event.
+ */
+export const slackEvents = sqliteTable(
+  "slack_events",
+  {
+    id: integer().primaryKey({ autoIncrement: true }),
+    app: text().notNull(),
+    dot: text()
+      .notNull()
+      .references(() => dots.name),
+    // "mention": the owner mentioned the dot in a channel. "dm": the owner wrote in its DM.
+    // "outsider": someone else did either. "report": a worker's report for the owner's DM.
+    kind: text({ enum: ["mention", "dm", "outsider", "report"] }).notNull(),
+    eventID: text("event_id"),
+    channel: text(),
+    ts: text(),
+    // The thread a reply goes in: a mention's thread, or a DM thread. Null for a top-level DM.
+    thread: text(),
+    user: text(),
+    // The owner's words. Never saved for someone else's message.
+    text: text(),
+    // The newest thread message the dot was given, so the next mention starts after it.
+    contextTS: text("context_ts"),
+    messageID: text("message_id"),
+    replyID: text("reply_id"),
+    replyText: text("reply_text"),
+    replyTS: text("reply_ts"),
+    // "new" waits to be queued to the dot. "waiting" waits for its turn to end. "posting" means
+    // the reply is surely not posted yet, and "unknown" that a post may have happened, so it's only
+    // looked up. "answered" shares a later DM's reply. "done" is an outsider's handled message.
+    state: text({
+      enum: ["new", "waiting", "posting", "unknown", "posted", "failed", "answered", "done"],
+    }).notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [
+    unique().on(table.app, table.eventID),
+    // Slack can deliver a message again under a new event ID.
+    unique().on(table.app, table.channel, table.ts),
+  ],
+);
+
+export type SlackEvent = typeof slackEvents.$inferSelect;
+
+/** The one note telling someone in a conversation that a bot only answers its owner. */
+export const slackNotices = sqliteTable(
+  "slack_notices",
+  {
+    id: integer().primaryKey({ autoIncrement: true }),
+    // The bot user that sent it, so each app tells each person once per conversation.
+    bot: text().notNull(),
+    channel: text().notNull(),
+    user: text().notNull(),
+    // Saved as "sending" before the call. Any other outcome is final: it's never sent again.
+    state: text({ enum: ["sending", "sent", "refused", "unknown"] }).notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [unique().on(table.bot, table.channel, table.user)],
+);

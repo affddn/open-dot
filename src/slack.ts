@@ -5,9 +5,9 @@ import type { Db } from "./db";
 import { listDots } from "./dots";
 import { type Fetch, output, type Source } from "./feed";
 import { OpenCode, type OpenCodeError, type Turn } from "./opencode";
-import { dots, outbox, slack } from "./schema";
+import { dots, outbox, slack, slackConfig, slackNotices } from "./schema";
 
-type Kind = "bot" | "user";
+type Kind = "bot" | "user" | "app";
 
 /**
  * What Slack did with a call. "refused" means Slack answered that it did nothing, while "lost"
@@ -18,7 +18,7 @@ export type Answer =
   | { readonly kind: "refused"; readonly error: string }
   | { readonly kind: "lost"; readonly reason: string };
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
+export const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
 
 const failure = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -32,8 +32,10 @@ const revoked = new Set([
   "missing_scope",
 ]);
 
-const keychain = (service: string) => () =>
+export const keychain = (service: string) => () =>
   output(["security", "find-generic-password", "-s", service, "-w"]);
+
+const none = async () => undefined;
 
 /** A token kept in memory. While it's missing, the Keychain is read at most once a minute. */
 function remembered(read: () => Promise<string | undefined>, now: () => number) {
@@ -56,62 +58,80 @@ function remembered(read: () => Promise<string | undefined>, now: () => number) 
   };
 }
 
-const Auth = Schema.Struct({ user_id: Schema.String, user: Schema.optionalKey(Schema.String) });
+const Auth = Schema.Struct({
+  user_id: Schema.String,
+  user: Schema.optionalKey(Schema.String),
+  team_id: Schema.optionalKey(Schema.String),
+});
 const Opened = Schema.Struct({ channel: Schema.Struct({ id: Schema.String }) });
+
+/** The app, workspace and bot a dot's own bot token must belong to. */
+export interface Expected {
+  readonly app: string;
+  readonly team: string;
+  /** The bot's user and bot IDs once a check has saved them. */
+  readonly botUser?: string | null;
+  readonly botID?: string | null;
+}
+
+interface Tokens {
+  readonly bot: () => Promise<string | undefined>;
+  readonly user: () => Promise<string | undefined>;
+  readonly app?: () => Promise<string | undefined>;
+}
 
 /**
  * Slack's Web API with the bot token from the Keychain item `open-dot-slack-bot` and the owner's
  * user token from `open-dot-slack-user`. Calls with a token that isn't saved give undefined.
+ * A dot's own app passes its Keychain item and `expected`, so its bot token is used only once
+ * Slack shows it belongs to that app, workspace and bot. `expected` can be a function, read at
+ * every check, so a bot identity saved later binds every token read after it. While it gives
+ * nothing, no bot token is used.
  */
 export function slackClient(
   fetch: Fetch = globalThis.fetch,
-  tokens = { bot: keychain("open-dot-slack-bot"), user: keychain("open-dot-slack-user") },
+  tokens: Tokens = { bot: keychain("open-dot-slack-bot"), user: keychain("open-dot-slack-user") },
   now = Date.now,
+  options: {
+    readonly item?: string;
+    readonly expected?: Expected | (() => Expected | undefined);
+  } = {},
 ) {
   const base = process.env.OPEN_DOT_SLACK_URL ?? "https://slack.com/api";
-  const saved = { bot: remembered(tokens.bot, now), user: remembered(tokens.user, now) };
+  const item = options.item ?? "open-dot-slack-bot";
+  const saved = {
+    bot: remembered(tokens.bot, now),
+    user: remembered(tokens.user, now),
+    app: remembered(tokens.app ?? none, now),
+  };
   let owner: string | undefined;
   let ownerName: string | undefined;
+  let team: string | undefined;
   // The user token's scopes, from Slack's x-oauth-scopes header once a call has shown them.
   let userScopes: Set<string> | undefined;
   let announced: string | undefined;
   let bot: string | undefined;
+  let botID: string | undefined;
   let channel: string | undefined;
   let wrongBot = false;
+  // The last refusal of a bot token check, so it's logged once.
+  let unchecked: string | undefined;
   // Slack's limits are per app and workspace, so one pause after a 429 covers every call.
   let pausedUntil = 0;
 
-  /** Keeps the bot's user ID from its auth.test. A token without a bot_id isn't a bot's. */
-  const verify = (body: Record<string, unknown>) => {
-    if (typeof body.bot_id === "string" && typeof body.user_id === "string") {
-      bot = body.user_id;
-      wrongBot = false;
-      return true;
-    }
-    saved.bot.forget();
-    bot = channel = undefined;
-    if (!wrongBot)
-      console.error(
-        "Slack: the Keychain item open-dot-slack-bot holds a token that isn't a bot's. Save the app's Bot User OAuth Token (xoxb-…) there instead; the daemon reads it again within a minute.",
-      );
-    wrongBot = true;
-    return false;
+  const forget = (kind: Kind) => {
+    saved[kind].forget();
+    if (kind === "user") owner = ownerName = team = userScopes = channel = undefined;
+    if (kind === "bot") bot = botID = channel = undefined;
   };
 
-  const call = async (
+  /** One call with the given token, without any identity check. */
+  const send = async (
     kind: Kind,
+    token: string,
     method: string,
-    params: Record<string, string> = {},
-  ): Promise<Answer | undefined> => {
-    const token = await saved[kind].get();
-    if (!token) return undefined;
-    // A user token saved as the bot's would act as the owner, so it's checked before any bot call.
-    if (kind === "bot" && method !== "auth.test" && !bot) {
-      const checked = await call("bot", "auth.test");
-      // The call itself never left, so a lost check means only "not now".
-      if (checked?.kind === "refused") return checked;
-      if (checked?.kind !== "ok" || !verify(checked.body)) return undefined;
-    }
+    params: Record<string, string>,
+  ): Promise<Answer> => {
     if (now() < pausedUntil) return { kind: "refused", error: "ratelimited" };
     try {
       const response = await fetch(`${base}/${method}`, {
@@ -135,11 +155,7 @@ export function slackClient(
       if (response.status < 500 && isRecord(body)) {
         if (body.ok === true) return { kind: "ok", body };
         if (body.ok === false && typeof body.error === "string") {
-          if (revoked.has(body.error)) {
-            saved[kind].forget();
-            if (kind === "user") owner = ownerName = userScopes = channel = undefined;
-            else bot = channel = undefined;
-          }
+          if (revoked.has(body.error)) forget(kind);
           return { kind: "refused", error: body.error };
         }
       }
@@ -147,6 +163,87 @@ export function slackClient(
     } catch (error) {
       return { kind: "lost", reason: `${method}: ${failure(error)}` };
     }
+  };
+
+  /** What the bot token must show now. */
+  const current = () =>
+    typeof options.expected === "function" ? options.expected() : options.expected;
+
+  const wrong = (problem: string) => {
+    forget("bot");
+    if (!wrongBot)
+      console.error(
+        `Slack: the Keychain item ${item} ${problem}. Save the right Bot User OAuth Token (xoxb-…) there instead; the daemon reads it again within a minute.`,
+      );
+    wrongBot = true;
+    return false;
+  };
+
+  /**
+   * Checks the bot token with auth.test, and for a dot's own app with bots.info, before it's used.
+   * A token without a bot_id isn't a bot's, so a user token saved as the bot's never acts as the
+   * owner. Gives a refusal to pass on, true when the token is fit to use, or false.
+   */
+  const identify = async (token: string): Promise<Answer | boolean> => {
+    const checked = await send("bot", token, "auth.test", {});
+    // The call itself never left, so a lost check means only "not now".
+    if (checked.kind === "refused") return checked;
+    if (checked.kind !== "ok") return false;
+    const body = checked.body;
+    if (typeof body.bot_id !== "string" || typeof body.user_id !== "string")
+      return wrong("holds a token that isn't a bot's");
+    if (options.expected) {
+      const expected = current();
+      if (!expected) return false;
+      if (body.team_id !== expected.team) return wrong("holds a bot token from another workspace");
+      const pinned = (want: Expected) =>
+        (!want.botUser || body.user_id === want.botUser) &&
+        (!want.botID || body.bot_id === want.botID);
+      if (!pinned(expected)) return wrong("holds a token for another bot");
+      const info = await send("bot", token, "bots.info", { bot: body.bot_id });
+      if (info.kind === "refused") return info;
+      if (info.kind !== "ok") return false;
+      const found = isRecord(info.body.bot) ? info.body.bot : {};
+      if (found.app_id !== expected.app || found.user_id !== body.user_id)
+        return wrong(`holds the bot token of another app than ${expected.app}`);
+      // The bot's identity may have been saved while bots.info was asked.
+      const after = current();
+      if (!after || after.app !== expected.app || after.team !== expected.team) return false;
+      if (!pinned(after)) return wrong("holds a token for another bot");
+    }
+    bot = body.user_id;
+    botID = body.bot_id;
+    wrongBot = false;
+    return true;
+  };
+
+  /**
+   * Calls `method`. Undefined means it was never sent: there's no usable token, or the bot token's
+   * check didn't pass. A check's own refusal, such as internal_error, is never passed on as the
+   * method's answer, so a write that never left can't look like one that may have happened.
+   */
+  const call = async (
+    kind: Kind,
+    method: string,
+    params: Record<string, string> = {},
+  ): Promise<Answer | undefined> => {
+    const token = await saved[kind].get();
+    if (!token) return undefined;
+    if (kind === "bot" && !bot) {
+      const fit = await identify(token);
+      if (fit !== true) {
+        const problem = typeof fit === "object" && fit.kind === "refused" ? fit.error : undefined;
+        if (problem && problem !== "ratelimited" && problem !== unchecked)
+          console.error(
+            `Slack: couldn't check the token in ${item} (${problem}), so nothing was sent.`,
+          );
+        unchecked = problem;
+        return undefined;
+      }
+      unchecked = undefined;
+      if (method === "auth.test") return { kind: "ok", body: { user_id: bot, bot_id: botID } };
+    }
+    return send(kind, token, method, params);
   };
 
   /** A read's body. Any answer but ok is an error, since a read can simply run again. */
@@ -164,6 +261,7 @@ export function slackClient(
     const identity = Schema.decodeUnknownSync(Auth)(body);
     owner = identity.user_id;
     ownerName = identity.user;
+    team = identity.team_id;
     // Whoever owns the user token can instruct the dots, so say who that is.
     if (owner !== announced) console.log(`Slack: acting for ${identity.user ?? "?"} (${owner})`);
     announced = owner;
@@ -176,15 +274,23 @@ export function slackClient(
     owner: ownerID,
     /** The owner's Slack handle from the user token's auth.test, once it has run. */
     ownerName: () => ownerName,
+    /** The owner's workspace from the user token's auth.test, once it has run. */
+    team: () => team,
     /** Whether the user token has `scope`, or undefined while Slack hasn't said. */
     userScope: (scope: string) => userScopes?.has(scope),
-    /** The bot's own user ID, from the bot token. Undefined when the token isn't a bot's. */
+    /** The bot's own user ID, from the bot token. Undefined when the token isn't fit to use. */
     bot: async () => {
       if (bot) return bot;
-      const body = await read("bot", "auth.test");
-      if (body) verify(body);
+      const token = await saved.bot.get();
+      const fit = token && (await identify(token));
+      if (typeof fit === "object" && fit.kind === "refused")
+        throw new Error(`Slack refused to check the bot token: ${fit.error}`);
       return bot;
     },
+    /** The bot's bot ID, once its token has been checked. */
+    botID: () => botID,
+    /** Drops a token, so the Keychain is read again a minute later. */
+    forget,
     /** The owner's DM with the bot. Opening it again returns the same conversation. */
     dm: async () => {
       if (channel) return channel;
@@ -202,23 +308,24 @@ export function slackClient(
 export type Slack = ReturnType<typeof slackClient>;
 
 /** Slack escapes only these three in message text. */
-const unescape = (text: string) =>
+export const unescape = (text: string) =>
   text.replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&");
 
 // A ts is seconds and six decimals, so padding makes text order time order.
 const order = (ts: string) => ts.padStart(24, "0");
-const after = (ts: string, than: string) => order(ts) > order(than);
+export const after = (ts: string, than: string) => order(ts) > order(than);
 
-const HistoryMessage = Schema.Struct({
+export const HistoryMessage = Schema.Struct({
   ts: Schema.String,
   user: Schema.optionalKey(Schema.String),
+  bot_id: Schema.optionalKey(Schema.NullOr(Schema.String)),
   subtype: Schema.optionalKey(Schema.String),
   thread_ts: Schema.optionalKey(Schema.String),
   text: Schema.optionalKey(Schema.String),
   metadata: Schema.optionalKey(Schema.Unknown),
 });
 
-const History = Schema.Struct({
+export const History = Schema.Struct({
   messages: Schema.Array(HistoryMessage),
   response_metadata: Schema.optionalKey(
     Schema.Struct({ next_cursor: Schema.optionalKey(Schema.String) }),
@@ -226,7 +333,7 @@ const History = Schema.Struct({
 });
 
 /** Every message in the conversation after `oldest`, across pages. */
-async function history(client: Slack, channel: string, params: Record<string, string>) {
+export async function history(client: Slack, channel: string, params: Record<string, string>) {
   const messages: (typeof HistoryMessage.Type)[] = [];
   for (let cursor = ""; ;) {
     const body = await client.read("bot", "conversations.history", {
@@ -243,9 +350,9 @@ async function history(client: Slack, channel: string, params: Record<string, st
   }
 }
 
-const replyEvent = "open_dot_reply";
+export const replyEvent = "open_dot_reply";
 
-const replyID = (message: typeof HistoryMessage.Type) => {
+export const replyID = (message: typeof HistoryMessage.Type) => {
   const { metadata } = message;
   if (!isRecord(metadata) || metadata.event_type !== replyEvent) return undefined;
   return isRecord(metadata.event_payload) ? metadata.event_payload.reply_id : undefined;
@@ -460,6 +567,134 @@ export function slackChat(
     },
   );
 }
+
+/**
+ * Tells `user` once per conversation that `who` only answers the owner, in a note only they see.
+ * The note is saved before the call, and any outcome is final: nobody is told twice, even if a
+ * lost note never arrived. False while the bot token isn't usable, so it's tried again later.
+ */
+export async function notice(
+  db: Db,
+  client: Slack,
+  place: { readonly channel: string; readonly user: string; readonly thread?: string | null },
+  text: string,
+) {
+  const bot = await client.bot();
+  if (!bot) return false;
+  const saved = db
+    .insert(slackNotices)
+    .values({
+      bot,
+      channel: place.channel,
+      user: place.user,
+      state: "sending",
+      createdAt: Date.now(),
+    })
+    .onConflictDoNothing()
+    .returning({ id: slackNotices.id })
+    .get();
+  if (!saved) return true;
+  const answer = await client.call("bot", "chat.postEphemeral", {
+    channel: place.channel,
+    user: place.user,
+    text,
+    ...(place.thread && { thread_ts: place.thread }),
+  });
+  db.update(slackNotices)
+    .set({
+      state: answer?.kind === "ok" ? "sent" : answer?.kind === "lost" ? "unknown" : "refused",
+    })
+    .where(eq(slackNotices.id, saved.id))
+    .run();
+  if (answer?.kind !== "ok")
+    console.error(
+      `Slack note to ${place.user} in ${place.channel} was not confirmed, and won't be sent again: ${answer?.kind === "refused" ? answer.error : (answer?.reason ?? "no bot token")}`,
+    );
+  return true;
+}
+
+const Ims = Schema.Struct({
+  channels: Schema.Array(
+    Schema.Struct({ id: Schema.String, user: Schema.optionalKey(Schema.String) }),
+  ),
+  response_metadata: Schema.optionalKey(
+    Schema.Struct({ next_cursor: Schema.optionalKey(Schema.String) }),
+  ),
+});
+
+/**
+ * Finds people other than the owner who DM the shared app, and tells each once that it only
+ * answers the owner. Nothing happens, not even a Slack call, until the owner turns it on with
+ * `open-dot slack notices enable`. It lists every DM the bot has, page by page, and reads each one
+ * whose sender it hasn't told from the time it was turned on, so DMs sent while the daemon was
+ * stopped count, and older ones don't. Its failures never stop the chat or the feed.
+ */
+export function sharedNotices(db: Db, client: Slack) {
+  const cursors = new Map<string, string>();
+  let baseline: number | undefined;
+  return async () => {
+    const since = db
+      .select({ since: slackConfig.noticesSince })
+      .from(slackConfig)
+      .where(eq(slackConfig.id, 1))
+      .get()?.since;
+    if (since === null || since === undefined) return;
+    // Turned off and on again: read from the new time.
+    if (since !== baseline) cursors.clear();
+    baseline = since;
+    const owner = await client.owner();
+    const bot = owner && (await client.bot());
+    if (!owner || !bot) return;
+    const ims: (typeof Ims.Type)["channels"][number][] = [];
+    for (let cursor = ""; ;) {
+      const body = await client.read("bot", "conversations.list", {
+        types: "im",
+        limit: "200",
+        ...(cursor && { cursor }),
+      });
+      if (!body) return;
+      const page = Schema.decodeUnknownSync(Ims)(body);
+      ims.push(...page.channels);
+      cursor = page.response_metadata?.next_cursor ?? "";
+      if (!cursor) break;
+    }
+    for (const im of ims) {
+      const user = im.user;
+      if (!user || user === owner || user === bot || user === "USLACKBOT") continue;
+      const told = db
+        .select({ id: slackNotices.id })
+        .from(slackNotices)
+        .where(
+          and(
+            eq(slackNotices.bot, bot),
+            eq(slackNotices.channel, im.id),
+            eq(slackNotices.user, user),
+          ),
+        )
+        .get();
+      if (told) continue;
+      const oldest = cursors.get(im.id) ?? (since / 1000).toFixed(6);
+      const messages = await history(client, im.id, { oldest });
+      if (!messages) return;
+      const asked = messages.find(
+        (message) => message.user === user && !message.subtype && !message.bot_id,
+      );
+      if (
+        asked &&
+        !(await notice(db, client, { channel: im.id, user }, onlyOwner("open-dot", owner)))
+      )
+        return;
+      const newest = messages.reduce(
+        (latest, message) => (after(message.ts, latest) ? message.ts : latest),
+        oldest,
+      );
+      cursors.set(im.id, newest);
+    }
+  };
+}
+
+/** What someone other than the owner is told, once per conversation. */
+export const onlyOwner = (who: string, owner: string) => `${who} only answers <@${owner}>.`;
 
 // Unverified search modifiers until a live test. The local filters in slackFeed keep a wrong one
 // from showing messages that don't need the owner.

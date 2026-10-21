@@ -145,7 +145,7 @@ const attachment = (dot: Dot, id: string, index: string) =>
 const sourceNames = { github: "GitHub", linear: "Linear", slack: "Slack" } as const;
 
 // JSON keeps each field on one line, and escaping <, > and & keeps a title from closing the block.
-const quoted = (value: unknown) =>
+export const quoted = (value: unknown) =>
   JSON.stringify(value).replace(
     /[<>&]/g,
     (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
