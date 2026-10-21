@@ -123,7 +123,8 @@ export const slack = sqliteTable("slack", {
   replyID: text("reply_id"),
   replyText: text("reply_text"),
   replyTS: text("reply_ts"),
-  // "unknown" means the post's outcome was lost; it's looked up by reply ID before any new post.
+  // "posting" means the reply is surely not posted yet. A row turns "unknown" just before the post,
+  // and stays so if its outcome is lost; it's looked up by reply ID before any new post.
   state: text({ enum: ["waiting", "posting", "unknown", "posted", "failed"] }).notNull(),
   createdAt: integer("created_at").notNull(),
 });

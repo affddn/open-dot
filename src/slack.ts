@@ -316,6 +316,7 @@ export function slackChat(
     }).pipe(Effect.provide(layer));
   });
 
+  /** Moves the row on from the state it was read in. False when another pass already did. */
   const settle = (
     ts: string,
     from: "posting" | "unknown",
@@ -325,7 +326,8 @@ export function slackChat(
       .update(slack)
       .set(set)
       .where(and(eq(slack.ts, ts), eq(slack.state, from)))
-      .run();
+      .returning({ ts: slack.ts })
+      .get() !== undefined;
 
   const post = async () => {
     const rows = db
@@ -353,6 +355,8 @@ export function slackChat(
         );
         continue;
       }
+      // From here a crash leaves the row "unknown", so it's looked up rather than posted again.
+      if (!settle(row.ts, "posting", { state: "unknown" })) continue;
       const answer = await client.call("bot", "chat.postMessage", {
         channel,
         username: row.dot,
@@ -362,18 +366,17 @@ export function slackChat(
           event_payload: { reply_id: row.replyID },
         }),
       });
-      if (!answer) return;
-      if (answer.kind === "ok") {
+      if (answer?.kind === "ok") {
         const ts = typeof answer.body.ts === "string" ? answer.body.ts : null;
-        settle(row.ts, "posting", { state: "posted", replyTS: ts });
-      } else if (answer.kind === "lost") {
-        settle(row.ts, "posting", { state: "unknown" });
+        settle(row.ts, "unknown", { state: "posted", replyTS: ts });
+      } else if (answer?.kind === "lost") {
         console.error(`Slack reply to ${row.ts} is unknown, looking it up: ${answer.reason}`);
-      } else if (answer.error === "ratelimited") {
-        // Stays "posting" and is posted on a later pass.
+      } else if (!answer || answer.error === "ratelimited") {
+        // Nothing was sent, so it's posted on a later pass.
+        settle(row.ts, "unknown", { state: "posting" });
         return;
       } else {
-        settle(row.ts, "posting", { state: "failed" });
+        settle(row.ts, "unknown", { state: "failed" });
         console.error(`Slack reply to ${row.ts} failed: ${answer.error}`);
       }
     }

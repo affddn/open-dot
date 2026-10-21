@@ -165,7 +165,8 @@ test("the owner's top-level DMs reach the named or last dot once, and nothing el
 test("a reply is saved before it is posted under the dot's name, and a lost post is looked up first", async () => {
   const seen: string[] = [];
   fake.state.onPost = (params) => {
-    const saved = rows().find((candidate) => candidate.state === "posting");
+    // Already "unknown", so a crash right after this post can't lead to a second one.
+    const saved = rows().find((candidate) => candidate.state === "unknown");
     seen.push(`${saved?.replyID === JSON.parse(params.metadata ?? "{}").event_payload?.reply_id}`);
   };
   opencode.state.turns.set("ses_jotaro", { outcome: "succeeded", text: "**Hello**" });
@@ -222,6 +223,7 @@ test("a reply is saved before it is posted under the dot's name, and a lost post
   await pass();
   expect(row(fourth)?.state).toBe("failed");
   expect(fake.state.posts).toHaveLength(3);
+  expect(seen).toEqual(["true", "true", "true", "true", "true"]);
 });
 
 const match = (n: number, user: string, channel: Record<string, unknown>, text = "hey") => ({
