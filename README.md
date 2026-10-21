@@ -101,7 +101,7 @@ security add-generic-password -a "$USER" -s open-dot-slack-bot -w
 security add-generic-password -a "$USER" -s open-dot-slack-user -w
 ```
 
-Restart the daemon. Until the tokens it needs are saved, it skips that part and checks the Keychain again once a minute: chat needs both tokens, the feed only the user token.
+The daemon picks them up within a minute, without a restart. Until the tokens it needs are saved, it skips that part and checks the Keychain again once a minute: chat needs both tokens, the feed only the user token.
 
 ## Talk from the notch
 
