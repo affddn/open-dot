@@ -160,14 +160,25 @@ struct ExpandedView: View {
   }
 
   private func composer(_ name: String) -> some View {
-    let empty = (store.drafts[name] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    return HStack {
-      TextField("Message \(name)", text: Binding { store.drafts[name] ?? "" } set: { store.drafts[name] = $0 })
-        .textFieldStyle(.plain)
-        .onSubmit { store.send() }
-        .accessibilityIdentifier("composer")
-        .id(name)
-      Button { store.send() } label: {
+    Composer(placeholder: "Message \(name)", text: Binding { store.drafts[name] ?? "" } set: { store.drafts[name] = $0 }) {
+      store.send()
+    }
+    .id(name)
+  }
+}
+
+struct Composer: View {
+  let placeholder: String
+  @Binding var text: String
+  let send: () -> Void
+  @State private var height: CGFloat = 22
+
+  var body: some View {
+    let empty = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    HStack(alignment: .bottom) {
+      DraftEditor(text: $text, height: $height, placeholder: placeholder, send: send)
+        .frame(height: height)
+      Button(action: send) {
         Image(systemName: "arrow.up.circle.fill").font(.title2)
       }
       .buttonStyle(.plain)
@@ -180,6 +191,82 @@ struct ExpandedView: View {
     .padding(.trailing, 6)
     .padding(.vertical, 6)
     .background(RoundedRectangle(cornerRadius: 14).fill(.white.opacity(0.08)))
+  }
+}
+
+struct DraftEditor: NSViewRepresentable {
+  @Binding var text: String
+  @Binding var height: CGFloat
+  let placeholder: String
+  let send: () -> Void
+
+  func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+  func makeNSView(context: Context) -> NSScrollView {
+    let scroll = NSScrollView()
+    scroll.drawsBackground = false
+    scroll.hasVerticalScroller = true
+    let editor = DraftTextView()
+    editor.isRichText = false
+    editor.drawsBackground = false
+    editor.textColor = .white
+    editor.font = .systemFont(ofSize: 13)
+    editor.textContainerInset = NSSize(width: 0, height: 3)
+    editor.isVerticallyResizable = true
+    editor.autoresizingMask = [.width]
+    editor.textContainer?.widthTracksTextView = true
+    editor.delegate = context.coordinator
+    editor.setAccessibilityIdentifier("composer")
+    scroll.documentView = editor
+    return scroll
+  }
+
+  func updateNSView(_ scroll: NSScrollView, context: Context) {
+    context.coordinator.parent = self
+    guard let editor = scroll.documentView as? DraftTextView else { return }
+    editor.send = send
+    editor.setAccessibilityLabel(placeholder)
+    if editor.string != text { editor.string = text }
+    DispatchQueue.main.async {
+      let size = measuredSize(scroll, width: max(scroll.contentSize.width, 1))
+      if height != size.height { height = size.height }
+    }
+  }
+
+  private func measuredSize(_ scroll: NSScrollView, width: CGFloat) -> CGSize {
+    guard let editor = scroll.documentView as? NSTextView,
+      let container = editor.textContainer, let layout = editor.layoutManager else { return CGSize(width: width, height: 22) }
+    container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
+    layout.ensureLayout(for: container)
+    let line = layout.defaultLineHeight(for: editor.font ?? .systemFont(ofSize: 13))
+    let height = max(line, layout.usedRect(for: container).height + (editor.string.hasSuffix("\n") ? line : 0)) + 6
+    editor.setFrameSize(NSSize(width: width, height: height))
+    return CGSize(width: width, height: min(height, line * 6 + 6))
+  }
+
+  class Coordinator: NSObject, NSTextViewDelegate {
+    var parent: DraftEditor
+    init(_ parent: DraftEditor) { self.parent = parent }
+    func textDidChange(_ notification: Notification) {
+      guard let editor = notification.object as? NSTextView else { return }
+      parent.text = editor.string
+    }
+  }
+}
+
+class DraftTextView: NSTextView {
+  var send: () -> Void = {}
+
+  override func keyDown(with event: NSEvent) {
+    if (event.keyCode == 36 || event.keyCode == 76) && !hasMarkedText() {
+      if !event.modifierFlags.intersection([.shift, .option]).isEmpty {
+        insertNewline(nil)
+      } else if !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        send()
+      }
+      return
+    }
+    super.keyDown(with: event)
   }
 }
 
