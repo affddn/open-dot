@@ -117,6 +117,8 @@ export const slack = sqliteTable("slack", {
   dot: text()
     .notNull()
     .references(() => dots.name),
+  // The DM it was read from, where the reply goes even if the tokens change.
+  channel: text().notNull(),
   // The outbox message that carried it to the dot.
   messageID: text("message_id").notNull(),
   // Saved before the reply is posted, and tagged on the post so a lost outcome can be found.

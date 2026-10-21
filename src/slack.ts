@@ -50,7 +50,7 @@ function remembered(read: () => Promise<string | undefined>, now: () => number) 
   };
 }
 
-const Auth = Schema.Struct({ user_id: Schema.String });
+const Auth = Schema.Struct({ user_id: Schema.String, user: Schema.optionalKey(Schema.String) });
 const Opened = Schema.Struct({ channel: Schema.Struct({ id: Schema.String }) });
 
 /**
@@ -65,6 +65,7 @@ export function slackClient(
   const base = process.env.OPEN_DOT_SLACK_URL ?? "https://slack.com/api";
   const saved = { bot: remembered(tokens.bot, now), user: remembered(tokens.user, now) };
   let owner: string | undefined;
+  let announced: string | undefined;
   let bot: string | undefined;
   let channel: string | undefined;
 
@@ -115,7 +116,12 @@ export function slackClient(
   const ownerID = async () => {
     if (owner) return owner;
     const body = await read("user", "auth.test");
-    if (body) owner = Schema.decodeUnknownSync(Auth)(body).user_id;
+    if (!body) return undefined;
+    const identity = Schema.decodeUnknownSync(Auth)(body);
+    owner = identity.user_id;
+    // Whoever owns the user token can instruct the dots, so say who that is.
+    if (owner !== announced) console.log(`Slack: acting for ${identity.user ?? "?"} (${owner})`);
+    announced = owner;
     return owner;
   };
 
@@ -200,10 +206,11 @@ const replyID = (message: typeof HistoryMessage.Type) => {
 const addressed = /^(?:@([a-z][a-z0-9-]*)[\s:,]|([a-z][a-z0-9-]*)[:,])\s*/i;
 
 /**
- * Saves the owner's Slack message and queues it to a dot in one transaction. The dot is the one
- * the message names, or the one last messaged from Slack, or the first. False when there's no dot.
+ * Saves the owner's Slack message from the DM `channel` and queues it to a dot in one transaction.
+ * The dot is the one the message names, or the one last messaged from Slack, or the first.
+ * False when there's no dot.
  */
-export function receive(db: Db, ts: string, text: string) {
+export function receive(db: Db, channel: string, ts: string, text: string) {
   const ready = listDots(db).filter((dot) => dot.sessionState === "ready");
   const match = addressed.exec(text);
   const name = (match?.[1] ?? match?.[2])?.toLowerCase();
@@ -217,7 +224,7 @@ export function receive(db: Db, ts: string, text: string) {
     const messageID = SessionMessage.ID.create();
     const saved = tx
       .insert(slack)
-      .values({ ts, dot: dot.name, messageID, state: "waiting", createdAt: Date.now() })
+      .values({ ts, dot: dot.name, channel, messageID, state: "waiting", createdAt: Date.now() })
       .onConflictDoNothing()
       .returning({ ts: slack.ts })
       .get();
@@ -281,7 +288,7 @@ export function slackChat(
         message.user === owner &&
         !message.subtype &&
         (!message.thread_ts || message.thread_ts === message.ts);
-      if (own && !receive(db, message.ts, unescape(message.text ?? "")))
+      if (own && !receive(db, channel, message.ts, unescape(message.text ?? "")))
         console.error(`Slack message ${message.ts} ignored: there are no dots.`);
       if (after(message.ts, cursor)) cursor = message.ts;
     }
@@ -336,13 +343,10 @@ export function slackChat(
       .where(inArray(slack.state, ["posting", "unknown"]))
       .orderBy(asc(slack.ts))
       .all();
-    if (rows.length === 0) return;
-    const channel = await client.dm();
-    if (!channel) return;
     for (const row of rows) {
       if (!row.replyID || row.replyText === null) continue;
       if (row.state === "unknown") {
-        const messages = await history(client, channel, {
+        const messages = await history(client, row.channel, {
           oldest: row.ts,
           include_all_metadata: "true",
         });
@@ -358,7 +362,7 @@ export function slackChat(
       // From here a crash leaves the row "unknown", so it's looked up rather than posted again.
       if (!settle(row.ts, "posting", { state: "unknown" })) continue;
       const answer = await client.call("bot", "chat.postMessage", {
-        channel,
+        channel: row.channel,
         username: row.dot,
         markdown_text: clip(row.replyText),
         metadata: JSON.stringify({

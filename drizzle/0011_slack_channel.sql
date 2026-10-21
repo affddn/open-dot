@@ -1,0 +1,1 @@
+ALTER TABLE `slack` ADD `channel` text NOT NULL;

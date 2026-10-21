@@ -19,6 +19,7 @@ type Message = Record<string, unknown> & { ts: string };
 /** An in-memory Slack Web API. "lost" posts but drops the response; "dropped" fails before posting. */
 function fakeSlack() {
   const state = {
+    dm,
     history: [] as Message[],
     posts: [] as Record<string, string>[],
     post: "ok" as "ok" | "lost" | "dropped" | "refused",
@@ -40,9 +41,13 @@ function fakeSlack() {
     const user = new Headers(init.headers).get("authorization") === "Bearer xoxp";
     switch (method) {
       case "auth.test":
-        return Response.json({ ok: true, user_id: user ? owner : botUser });
+        return Response.json({
+          ok: true,
+          user: user ? "owner" : "open-dot",
+          user_id: user ? owner : botUser,
+        });
       case "conversations.open":
-        return Response.json({ ok: true, channel: { id: dm } });
+        return Response.json({ ok: true, channel: { id: state.dm } });
       case "conversations.history": {
         const newer = state.history
           .filter((message) => Number(message.ts) > Number(params.oldest ?? 0))
@@ -85,8 +90,8 @@ function fakeSlack() {
         return Response.json({ ok: false, error: "unknown_method" });
     }
   };
-  const client = slackClient(fetch, { bot: async () => "xoxb", user: async () => "xoxp" });
-  return { state, client, now };
+  const connect = () => slackClient(fetch, { bot: async () => "xoxb", user: async () => "xoxp" });
+  return { state, client: connect(), connect, now };
 }
 
 let db: Db;
@@ -224,6 +229,20 @@ test("a reply is saved before it is posted under the dot's name, and a lost post
   expect(row(fourth)?.state).toBe("failed");
   expect(fake.state.posts).toHaveLength(3);
   expect(seen).toEqual(["true", "true", "true", "true", "true"]);
+});
+
+test("a reply goes to the DM its message came from, even when the tokens change", async () => {
+  opencode.state.turns.set("ses_jotaro", { outcome: "succeeded", text: "Hi." });
+  const first = say("jotaro: hi");
+  await pass();
+  await deliver();
+
+  // The daemon restarts with a bot token whose DM with the owner is another conversation.
+  fake.state.dm = "DOTHER";
+  await Effect.runPromise(slackChat(db, fake.connect(), opencode.layer, started));
+
+  expect(row(first)).toMatchObject({ channel: dm, state: "posted" });
+  expect(fake.state.posts).toMatchObject([{ channel: dm, markdown_text: "Hi." }]);
 });
 
 const match = (n: number, user: string, channel: Record<string, unknown>, text = "hey") => ({

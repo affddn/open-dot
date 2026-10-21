@@ -94,7 +94,7 @@ settings:
   token_rotation_enabled: false
 ```
 
-If your workspace requires approval, ask an admin to approve this internal app with these scopes. The bot scopes let it read and write only its own DMs with you, post replies under a dot's name, and tag replies so a lost post can be found. The user scopes let it search messages you can see and read DM read state on your behalf; it never posts or marks anything as you. Install it yourself, so the user token is yours. Then copy the **Bot User OAuth Token** (`xoxb-…`) and the **User OAuth Token** (`xoxp-…`) from **OAuth & Permissions** into the Keychain:
+If your workspace requires approval, ask an admin to approve this internal app with these scopes. The bot scopes let it read and write only its own DMs with you, post replies under a dot's name, and tag replies so a lost post can be found. The user scopes let it search messages you can see and read DM read state on your behalf; it never posts or marks anything as you. Once an admin approves it, install it yourself: the user token belongs to whoever installs the app, and whoever that is can instruct your dots. The daemon logs `Slack: acting for <name> (<user ID>)` so you can check. Then copy the **Bot User OAuth Token** (`xoxb-…`) and the **User OAuth Token** (`xoxp-…`) from **OAuth & Permissions** into the Keychain:
 
 ```sh
 security add-generic-password -a "$USER" -s open-dot-slack-bot -w
