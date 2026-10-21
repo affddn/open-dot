@@ -339,11 +339,19 @@ struct SourceMark: View {
   let source: String
 
   var body: some View {
-    Text(source == "github" ? "G" : source == "linear" ? "L" : String(source.prefix(1)).uppercased())
+    Text(source == "github" ? "G" : source == "linear" ? "L" : source == "slack" ? "S" : String(source.prefix(1)).uppercased())
       .font(.system(size: 10, weight: .bold, design: .rounded))
       .frame(width: 18, height: 18)
-      .background(RoundedRectangle(cornerRadius: 5).fill(source == "linear" ? Color.indigo : Color.white.opacity(0.2)))
-      .help(source == "github" ? "GitHub" : source == "linear" ? "Linear" : source)
+      .background(RoundedRectangle(cornerRadius: 5).fill(fill))
+      .help(source == "github" ? "GitHub" : source == "linear" ? "Linear" : source == "slack" ? "Slack" : source)
+  }
+
+  private var fill: Color {
+    switch source {
+    case "linear": Color.indigo
+    case "slack": Color(red: 0.29, green: 0.08, blue: 0.29)
+    default: Color.white.opacity(0.2)
+    }
   }
 }
 
