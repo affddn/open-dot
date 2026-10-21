@@ -4,7 +4,7 @@ import { Cause, Effect, type Layer, Schema } from "effect";
 import type { Db } from "./db";
 import { listDots } from "./dots";
 import { type Fetch, output, type Source } from "./feed";
-import { OpenCode, type OpenCodeError } from "./opencode";
+import { OpenCode, type OpenCodeError, type Turn } from "./opencode";
 import { dots, outbox, slack } from "./schema";
 
 type Kind = "bot" | "user";
@@ -313,18 +313,31 @@ export function slackChat(
     if (waiting.length === 0) return;
     yield* Effect.gen(function* () {
       const opencode = yield* OpenCode;
+      // Messages that share a turn's end get one reply, on the newest of them.
+      const ended = new Map<string, { ts: string; turn: Turn }[]>();
       for (const row of waiting) {
         // The session may already be busy with a later message, so only this turn's end counts.
         const turn = yield* opencode.turnAfter(row);
         if (!turn) continue;
-        db.update(slack)
-          .set({
-            state: "posting",
-            replyID: crypto.randomUUID(),
-            replyText: turn.text ?? `(no reply: ${turn.outcome})`,
-          })
-          .where(and(eq(slack.ts, row.ts), eq(slack.state, "waiting")))
-          .run();
+        const key = `${row.sessionID} ${turn.end}`;
+        ended.set(key, [...(ended.get(key) ?? []), { ts: row.ts, turn }]);
+      }
+      for (const group of ended.values()) {
+        group.forEach(({ ts, turn }, index) =>
+          db
+            .update(slack)
+            .set(
+              index === group.length - 1
+                ? {
+                    state: "posting",
+                    replyID: crypto.randomUUID(),
+                    replyText: turn.text ?? `(no reply: ${turn.outcome})`,
+                  }
+                : { state: "answered" },
+            )
+            .where(and(eq(slack.ts, ts), eq(slack.state, "waiting")))
+            .run(),
+        );
       }
     }).pipe(Effect.provide(layer));
   });

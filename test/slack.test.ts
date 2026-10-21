@@ -282,6 +282,27 @@ test("a finished reply posts while the dot is busy with something else", async (
   expect(fake.state.posts).toMatchObject([{ markdown_text: "Done." }]);
 });
 
+test("messages OpenCode answers in one turn get one reply, on the newest", async () => {
+  const first = say("jotaro: run something long");
+  await pass();
+  const second = say("and then this");
+  await pass();
+  await deliver();
+  // The second message arrived mid-turn, so both turns end at the same idle.
+  opencode.state.turns.set("ses_jotaro", {
+    outcome: "succeeded",
+    text: "Both done.",
+    end: "idl_1",
+  });
+
+  await pass();
+  await pass();
+
+  expect(row(first)).toMatchObject({ state: "answered", replyID: null, replyText: null });
+  expect(row(second)?.state).toBe("posted");
+  expect(fake.state.posts).toMatchObject([{ markdown_text: "Both done." }]);
+});
+
 const match = (n: number, user: string, channel: Record<string, unknown>, text = "hey") => ({
   ts: ts(n),
   user,

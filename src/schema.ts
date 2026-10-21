@@ -127,6 +127,9 @@ export const slack = sqliteTable("slack", {
   replyTS: text("reply_ts"),
   // "posting" means the reply is surely not posted yet. A row turns "unknown" just before the post,
   // and stays so if its outcome is lost; it's looked up by reply ID before any new post.
-  state: text({ enum: ["waiting", "posting", "unknown", "posted", "failed"] }).notNull(),
+  // "answered" means OpenCode answered it in the same turn as a later message, which gets the reply.
+  state: text({
+    enum: ["waiting", "posting", "unknown", "posted", "failed", "answered"],
+  }).notNull(),
   createdAt: integer("created_at").notNull(),
 });

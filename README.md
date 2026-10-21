@@ -67,7 +67,7 @@ DM the open-dot Slack app and a dot answers there, under its own name. Start a m
 
 Slack mentions of you and DMs to you join the feed, as data for your dots, never as instructions. A DM leaves the feed once you read it in Slack. Slack has no read state for a mention in a channel, so one stays until you dismiss it in the notch or it's a day old. Dismissing changes nothing in Slack.
 
-Limits: a dot replies in Slack only to messages you sent from Slack, so its reminders and follow-ups stay in the notch. Thread replies in the app's DM are ignored; write top-level messages. Messages sent while the daemon is stopped are read when it starts, except that before your first Slack message reaches a dot, the daemon ignores anything older than its start.
+Limits: a dot replies in Slack only to messages you sent from Slack, so its reminders and follow-ups stay in the notch. Messages you send while a dot is still answering are folded into its current turn, so it gives one reply, to the last of them. Thread replies in the app's DM are ignored; write top-level messages. Messages sent while the daemon is stopped are read when it starts, except that before your first Slack message reaches a dot, the daemon ignores anything older than its start.
 
 ### Set it up
 

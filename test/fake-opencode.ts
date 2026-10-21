@@ -19,7 +19,7 @@ export function fakeOpenCode() {
     prompted: [] as string[],
     texts: [] as { sessionID: string; text: string }[],
     active: new Set<string>(),
-    turns: new Map<string, Turn>(),
+    turns: new Map<string, Omit<Turn, "end"> & { end?: string }>(),
     approvals: new Map<string, Approval>(),
     history: new Map<string, Entry[]>(),
     create: "ok" as "ok" | "fail",
@@ -43,7 +43,12 @@ export function fakeOpenCode() {
       return state.prompt === "lost" ? broken("connection reset") : Effect.void;
     },
     activeSessions: Effect.sync(() => new Set(state.active)),
-    turnAfter: ({ sessionID }) => Effect.sync(() => state.turns.get(sessionID)),
+    // Each message's turn ends at its own idle unless the test names a shared one.
+    turnAfter: ({ sessionID, messageID }) =>
+      Effect.sync(() => {
+        const turn = state.turns.get(sessionID);
+        return turn && { end: `idle_${messageID}`, ...turn };
+      }),
     pendingApproval: (sessionID) => Effect.sync(() => state.approvals.get(sessionID)),
     recentMessages: (sessionID, limit) =>
       Effect.sync(() => (state.history.get(sessionID) ?? []).slice(-limit)),

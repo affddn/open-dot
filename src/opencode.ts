@@ -106,6 +106,8 @@ export interface Turn {
   readonly outcome: "succeeded" | "failed" | "interrupted";
   /** The text of the turn's last assistant message, if it wrote any. */
   readonly text: string | undefined;
+  /** The idle that ended the turn. OpenCode folds a message sent mid-turn into that turn, so several messages can share one. */
+  readonly end: string;
 }
 
 export interface Approval {
@@ -266,7 +268,7 @@ export class OpenCode extends Context.Service<
               for (const item of page.data) {
                 if (!prompted) prompted = item.id === messageID;
                 else if (item.type === "idle")
-                  return { outcome: item.outcome, text: lastText(turn) };
+                  return { outcome: item.outcome, text: lastText(turn), end: item.id };
                 else turn.push(item);
               }
               if (page.data.length < limit) return undefined;
