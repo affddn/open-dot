@@ -97,7 +97,7 @@ export function dismiss(db: Db, id: number) {
  * A command's trimmed output, or undefined when it fails, isn't installed or takes over 10 seconds,
  * such as a Keychain prompt nobody answers. It runs without blocking the daemon.
  */
-async function output(command: string[]) {
+export async function output(command: string[]) {
   try {
     const child = Bun.spawn(command, { stdout: "pipe", stderr: "ignore", timeout: 10_000 });
     const [text, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);

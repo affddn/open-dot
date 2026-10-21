@@ -109,3 +109,21 @@ export const feed = sqliteTable(
 );
 
 export type FeedItem = typeof feed.$inferSelect;
+
+/** Each message the owner sent a dot from Slack, and the dot's reply on its way back there. */
+export const slack = sqliteTable("slack", {
+  // The owner's Slack message, which also dedups polls.
+  ts: text().primaryKey(),
+  dot: text()
+    .notNull()
+    .references(() => dots.name),
+  // The outbox message that carried it to the dot.
+  messageID: text("message_id").notNull(),
+  // Saved before the reply is posted, and tagged on the post so a lost outcome can be found.
+  replyID: text("reply_id"),
+  replyText: text("reply_text"),
+  replyTS: text("reply_ts"),
+  // "unknown" means the post's outcome was lost; it's looked up by reply ID before any new post.
+  state: text({ enum: ["waiting", "posting", "unknown", "posted", "failed"] }).notNull(),
+  createdAt: integer("created_at").notNull(),
+});

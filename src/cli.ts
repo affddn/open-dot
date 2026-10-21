@@ -9,6 +9,7 @@ import { createDot, ensureSession, listDots, pickDot } from "./dots";
 import { collect, github, linear } from "./feed";
 import { apiPath, databasePath } from "./home";
 import { OpenCode } from "./opencode";
+import { slackChat, slackClient } from "./slack";
 
 const usage = `Usage:
   open-dot create <name> [purpose]   Create a dot and its OpenCode session
@@ -72,7 +73,11 @@ const serve = Effect.sync(() => {
   console.log(`open-dot API on http://127.0.0.1:${server.port}`);
 });
 
+const slack = slackClient();
 const sources = [github(), linear()];
+
+/** One pass of the owner's chat with the dots in Slack. Problems are logged inside. */
+const converse = slackChat(db, slack, OpenCode.layer);
 
 /** Collects each source's feed. One failing source doesn't stop the others. */
 const gather = Effect.promise(() =>
@@ -93,6 +98,7 @@ const daemon = Effect.sync(() => console.log(`open-dot daemon watching ${databas
     Effect.all(
       [
         Effect.repeat(tick, Schedule.spaced("1 second")),
+        Effect.repeat(converse, Schedule.spaced("3 seconds")),
         // GitHub asks clients to poll notifications at most once a minute.
         Effect.repeat(gather, Schedule.spaced("1 minute")),
       ],
