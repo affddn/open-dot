@@ -35,7 +35,7 @@ struct RootView: View {
         HStack {
           if store.dots.contains(where: \.busy) { BusyDot() }
           Spacer()
-          if store.dots.contains(where: { store.unread($0.name) }) { UnreadDot() }
+          if store.feedUnread || store.dots.contains(where: { store.unread($0.name) }) { UnreadDot() }
         }
         .padding(.horizontal, 10)
         .frame(height: notch.height)
@@ -72,13 +72,19 @@ struct ExpandedView: View {
     VStack(alignment: .leading, spacing: 10) {
       if let status = store.status {
         centered(status)
-      } else if let name = store.selected, let dot = store.dots.first(where: { $0.name == name }) {
-        tabs
-        Conversation(store: store, name: name)
-        if !dot.workers.isEmpty { workers(dot.workers) }
-        composer(name)
+      } else if !store.loaded {
+        centered("Connecting…")
       } else {
-        centered(store.loaded ? "No dots yet. Create one with open-dot create." : "Connecting…")
+        tabs
+        if store.showingFeed {
+          FeedList(store: store)
+        } else if let name = store.selected, let dot = store.dots.first(where: { $0.name == name }) {
+          Conversation(store: store, name: name)
+          if !dot.workers.isEmpty { workers(dot.workers) }
+          composer(name)
+        } else {
+          centered("No dots yet. Create one with open-dot create.")
+        }
       }
     }
     .padding(.top, topInset + 6)
@@ -94,6 +100,24 @@ struct ExpandedView: View {
   private var tabs: some View {
     ScrollView(.horizontal) {
       HStack(spacing: 4) {
+        Button { store.openFeed() } label: {
+          HStack(spacing: 5) {
+            Text("Feed").font(.callout.weight(.medium))
+            if !store.feed.isEmpty {
+              Text("\(store.feed.count)")
+                .font(.caption2.weight(.semibold).monospacedDigit())
+                .padding(.horizontal, 5)
+                .background(Capsule().fill(.white.opacity(0.18)))
+            }
+            if store.feedUnread { UnreadDot() }
+          }
+          .padding(.horizontal, 10)
+          .padding(.vertical, 4)
+          .background(Capsule().fill(.white.opacity(store.showingFeed ? 0.18 : 0)))
+          .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("feed-tab")
         ForEach(store.dots, id: \.name) { dot in
           Button { store.select(dot.name) } label: {
             HStack(spacing: 5) {
@@ -103,7 +127,7 @@ struct ExpandedView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
-            .background(Capsule().fill(.white.opacity(dot.name == store.selected ? 0.18 : 0)))
+            .background(Capsule().fill(.white.opacity(!store.showingFeed && dot.name == store.selected ? 0.18 : 0)))
             .contentShape(Capsule())
           }
           .buttonStyle(.plain)
@@ -184,6 +208,140 @@ struct Conversation: View {
     }
     .accessibilityElement(children: .contain)
     .accessibilityIdentifier("message-list")
+  }
+}
+
+/// Reads like a live stream: it follows new items while you're at the bottom and leaves you in place when you've scrolled up.
+struct FeedList: View {
+  let store: Store
+  @State private var atBottom = true
+  @State private var unseen = 0
+
+  var body: some View {
+    let items = store.feed
+    if items.isEmpty {
+      Text("Nothing needs you right now.").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+    } else {
+      GeometryReader { viewport in
+        ScrollViewReader { proxy in
+          ScrollView {
+            VStack(spacing: 6) {
+              ForEach(items) { item in
+                FeedRow(item: item, error: store.feedErrors[item.id]) {
+                  store.dismissFeed(item)
+                } clearError: {
+                  store.clearFeedError(item.id)
+                }
+              }
+              Color.clear.frame(height: 1).id("end").background {
+                GeometryReader { end in
+                  Color.clear.onChange(of: end.frame(in: .named("feed")).minY <= viewport.size.height + 8, initial: true) {
+                    atBottom = $1
+                    if $1 { unseen = 0 }
+                  }
+                }
+              }
+            }
+          }
+          .coordinateSpace(name: "feed")
+          .scrollIndicators(.never)
+          .onAppear { proxy.scrollTo("end", anchor: .bottom) }
+          .onChange(of: items.map(\.id)) { old, new in
+            if atBottom {
+              proxy.scrollTo("end", anchor: .bottom)
+            } else {
+              unseen += Set(new).subtracting(old).count
+            }
+          }
+          .overlay(alignment: .bottom) {
+            if unseen > 0 {
+              Button { withAnimation { proxy.scrollTo("end", anchor: .bottom) } } label: {
+                Text("\(unseen) new")
+                  .font(.caption.weight(.semibold))
+                  .padding(.horizontal, 10)
+                  .padding(.vertical, 4)
+                  .background(Capsule().fill(messageBlue))
+              }
+              .buttonStyle(.plain)
+              .padding(.bottom, 6)
+              .accessibilityIdentifier("feed-new")
+            }
+          }
+        }
+      }
+      .accessibilityElement(children: .contain)
+      .accessibilityIdentifier("feed-list")
+    }
+  }
+}
+
+struct FeedRow: View {
+  let item: FeedItem
+  let error: String?
+  let dismiss: () -> Void
+  let clearError: () -> Void
+  @State private var hovering = false
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      HStack(alignment: .top, spacing: 8) {
+        SourceMark(source: item.source)
+        VStack(alignment: .leading, spacing: 2) {
+          HStack(spacing: 4) {
+            Text(verbatim: item.reason).font(.caption.weight(.semibold))
+            Text(verbatim: "· \(item.context)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            Spacer(minLength: 4)
+            Text(verbatim: ago(item.time)).font(.caption2).foregroundStyle(.tertiary)
+          }
+          Text(verbatim: item.title).font(.callout).lineLimit(2)
+        }
+        Button(action: dismiss) {
+          Image(systemName: "xmark").font(.caption2.weight(.bold)).padding(4).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .opacity(hovering ? 1 : 0.35)
+        .accessibilityLabel("Dismiss")
+        .accessibilityIdentifier("feed-dismiss-\(item.id)")
+      }
+      if let error {
+        Text("\(error) · click to clear").font(.caption2).foregroundStyle(.red).onTapGesture(perform: clearError)
+      }
+    }
+    .padding(8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(hovering ? 0.1 : 0.05)))
+    .contentShape(Rectangle())
+    .onHover { hovering = $0 }
+    .onTapGesture { open() }
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("feed-item-\(item.id)")
+  }
+
+  /// Feed links come from outside, so only web links open.
+  private func open() {
+    guard let link = item.url, let url = URL(string: link), ["http", "https"].contains(url.scheme?.lowercased()) else { return }
+    NSWorkspace.shared.open(url)
+  }
+
+  private func ago(_ time: Double) -> String {
+    let seconds = max(0, Date().timeIntervalSince1970 - time / 1000)
+    if seconds < 60 { return "now" }
+    if seconds < 3600 { return "\(Int(seconds / 60))m" }
+    if seconds < 86400 { return "\(Int(seconds / 3600))h" }
+    return "\(Int(seconds / 86400))d"
+  }
+}
+
+struct SourceMark: View {
+  let source: String
+
+  var body: some View {
+    Text(source == "github" ? "G" : source == "linear" ? "L" : String(source.prefix(1)).uppercased())
+      .font(.system(size: 10, weight: .bold, design: .rounded))
+      .frame(width: 18, height: 18)
+      .background(RoundedRectangle(cornerRadius: 5).fill(source == "linear" ? Color.indigo : Color.white.opacity(0.2)))
+      .help(source == "github" ? "GitHub" : source == "linear" ? "Linear" : source)
   }
 }
 

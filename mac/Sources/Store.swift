@@ -18,13 +18,24 @@ struct Pending: Identifiable {
   var pending: [String: [Pending]] = [:]
   var drafts: [String: String] = [:]
   var expanded = false
+  var feed: [FeedItem] = []
+  var feedErrors: [Int: String] = [:]
+  var showingFeed = false
   private var seen: [String: Double] = [:]
   private var newest: [String: Double] = [:]
+  private var feedSeen: Double?
+  private var feedNewest: Double = 0
+  @ObservationIgnored private var dismissing: Set<Int> = []
+  @ObservationIgnored private var dismissed: Set<Int> = []
   @ObservationIgnored private let api = API()
 
-  var showsIndicator: Bool { status == nil && dots.contains { $0.busy || unread($0.name) } }
+  var showsIndicator: Bool { status == nil && (feedUnread || dots.contains { $0.busy || unread($0.name) }) }
+
+  var feedUnread: Bool { feedNewest > (feedSeen ?? .infinity) }
 
   func unread(_ name: String) -> Bool { (newest[name] ?? 0) > (seen[name] ?? .infinity) }
+
+  private func visible(_ name: String) -> Bool { expanded && !showingFeed && selected == name }
 
   func start() {
     Task {
@@ -35,7 +46,7 @@ struct Pending: Identifiable {
     }
     Task {
       while true {
-        if expanded, let name = selected { await refreshMessages(name) }
+        if let name = selected, visible(name) { await refreshMessages(name) }
         try? await Task.sleep(for: .seconds(1))
       }
     }
@@ -43,7 +54,8 @@ struct Pending: Identifiable {
     // to light the unread indicator.
     Task {
       while true {
-        for dot in dots where !(expanded && dot.name == selected) { await refreshMessages(dot.name) }
+        await refreshFeed()
+        for dot in dots where !visible(dot.name) { await refreshMessages(dot.name) }
         try? await Task.sleep(for: .seconds(5))
       }
     }
@@ -51,10 +63,12 @@ struct Pending: Identifiable {
 
   func opened() {
     Task { await refreshDots() }
+    Task { await refreshFeed() }
     if let name = selected { Task { await refreshMessages(name) } }
   }
 
   func select(_ name: String) {
+    showingFeed = false
     selected = name
     seen[name] = newest[name]
     Task { await refreshMessages(name) }
@@ -81,6 +95,35 @@ struct Pending: Identifiable {
     pending[name]?.removeAll { $0.id == id }
   }
 
+  func openFeed() {
+    showingFeed = true
+    feedSeen = feedNewest
+    Task { await refreshFeed() }
+  }
+
+  func dismissFeed(_ item: FeedItem) {
+    dismissing.insert(item.id)
+    feed.removeAll { $0.id == item.id }
+    feedErrors[item.id] = nil
+    Task {
+      do {
+        try await api.dismissFeed(item.id)
+        dismissed.insert(item.id)
+      } catch {
+        dismissing.remove(item.id)
+        if !feed.contains(where: { $0.id == item.id }) {
+          feed.append(item)
+          feed.sort { $0.time < $1.time }
+        }
+        feedErrors[item.id] = Self.describe(error)
+      }
+    }
+  }
+
+  func clearFeedError(_ id: Int) {
+    feedErrors[id] = nil
+  }
+
   private func refreshDots() async {
     do {
       let next = try await api.dots()
@@ -95,6 +138,18 @@ struct Pending: Identifiable {
     loaded = true
   }
 
+  private func refreshFeed() async {
+    // A dismissed item stays hidden until a poll that started after its dismiss succeeded,
+    // so a poll already in flight can't bring it back.
+    let settled = dismissed
+    guard let items = try? await api.feed() else { return }
+    dismissing.subtract(settled)
+    dismissed.subtract(settled)
+    feed = items.filter { !dismissing.contains($0.id) }
+    feedNewest = feed.map(\.time).max() ?? 0
+    if feedSeen == nil || (expanded && showingFeed) { feedSeen = feedNewest }
+  }
+
   private func refreshMessages(_ name: String) async {
     guard let list = try? await api.messages(name) else { return }
     messages[name] = list
@@ -104,7 +159,7 @@ struct Pending: Identifiable {
     pending[name]?.removeAll { item in item.messageID.map { ids.contains($0) || oldest > item.sentAt } ?? false }
     let latest = list.filter { $0.kind != "owner" }.map(\.time).max() ?? 0
     newest[name] = latest
-    if seen[name] == nil || (expanded && selected == name) { seen[name] = latest }
+    if seen[name] == nil || visible(name) { seen[name] = latest }
   }
 
   private func update(_ name: String, _ id: UUID, _ change: (inout Pending) -> Void) {

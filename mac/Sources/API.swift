@@ -22,6 +22,16 @@ struct Message: Decodable, Equatable, Identifiable {
   let time: Double
 }
 
+struct FeedItem: Decodable, Equatable, Identifiable {
+  let id: Int
+  let source: String
+  let reason: String
+  let title: String
+  let context: String
+  let url: String?
+  let time: Double
+}
+
 enum APIError: Error {
   case unreachable
   case lost
@@ -67,6 +77,15 @@ enum APIError: Error {
     struct Body: Decodable { let id: String }
     let body = try JSONEncoder().encode(["text": text])
     return try decode(Body.self, await send("POST", "/dots/\(escape(dot))/messages", body: body)).id
+  }
+
+  func feed() async throws -> [FeedItem] {
+    struct Body: Decodable { let items: [FeedItem] }
+    return try decode(Body.self, await send("GET", "/feed")).items
+  }
+
+  func dismissFeed(_ id: Int) async throws {
+    _ = try await send("POST", "/feed/\(id)/dismiss")
   }
 
   // The daemon picks a new port and token on every start, so a failed connection or a 401
