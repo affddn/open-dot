@@ -17,6 +17,7 @@ import {
   reactions,
   reminders,
   responsibilities,
+  routeKey,
   workers,
 } from "./schema";
 
@@ -144,6 +145,36 @@ export default Plugin.define({
         ? current
         : undefined;
     };
+    const origin = async (call: { sessionID: string; messageID: string }) => {
+      if (!bound(call.sessionID)) throw new Error("The dot's conversation changed.");
+      const history = await context.session.context({ sessionID: call.sessionID });
+      if (!bound(call.sessionID)) throw new Error("The dot's conversation changed.");
+      const at = history.findIndex(
+        (item) => item.id === call.messageID && item.type === "assistant",
+      );
+      if (at < 0) throw new Error("Cannot establish the invoking turn from public context.");
+      const before = history.slice(0, at + 1);
+      const boundary = before.findLastIndex((item) => item.type === "idle");
+      const turn = before.slice(boundary + 1);
+      if (boundary < 0 && turn[0]?.type !== "user")
+        throw new Error("The beginning of the invoking turn is unavailable.");
+      if (turn.some((item) => item.type === "compaction"))
+        throw new Error("Cannot establish an origin across compaction.");
+      const users = turn.filter((item) => item.type === "user");
+      if (!users.length) throw new Error("The invoking turn has no visible prompt.");
+      const sources = messageSources(
+        db,
+        call.sessionID,
+        users.map((item) => item.id),
+      );
+      const routes = users.map((item) => sources.get(item.id)?.route ?? null);
+      if (new Set(routes.map(routeKey)).size !== 1)
+        throw new Error("The invoking turn has ambiguous reply destinations.");
+      const route = routes[0] ?? null;
+      if (route && (route.dot !== name || route.sessionID !== call.sessionID))
+        throw new Error("The saved origin belongs to another conversation.");
+      return route;
+    };
 
     await context.tool.transform((editor) => {
       editor.add({
@@ -184,7 +215,9 @@ export default Plugin.define({
           ),
         }),
         options: { codemode: false },
-        execute: async (input) => {
+        execute: async (input, call) => {
+          const route = await origin(call);
+          if (!bound(call.sessionID)) throw new Error("The dot's conversation changed.");
           const dueAt = Date.parse(input.at);
           if (!withOffset.test(input.at) || Number.isNaN(dueAt)) {
             throw new Error(`"${input.at}" is not an ISO 8601 time with a UTC offset.`);
@@ -197,6 +230,7 @@ export default Plugin.define({
             .insert(reminders)
             .values({
               dot: name,
+              route,
               text: input.text,
               dueAt,
               everyMinutes: every,
@@ -277,7 +311,9 @@ export default Plugin.define({
           ),
         }),
         options: { codemode: false },
-        execute: async (input) => {
+        execute: async (input, call) => {
+          const route = await origin(call);
+          if (!bound(call.sessionID)) throw new Error("The dot's conversation changed.");
           const directory = workingDirectory(name, input.directory);
           const source = input.directory === undefined ? undefined : repository(directory);
           // One transaction, so the daemon never sees the worker before its worktree is planned.
@@ -286,6 +322,7 @@ export default Plugin.define({
               .insert(workers)
               .values({
                 dot: name,
+                route,
                 task: input.task,
                 directory,
                 sessionID: Session.ID.create(),

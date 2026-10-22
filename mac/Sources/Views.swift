@@ -161,10 +161,20 @@ struct ExpandedView: View {
   }
 
   private func composer(_ name: String) -> some View {
-    Composer(placeholder: "Message \(name)", text: Binding { store.drafts[name] ?? "" } set: { store.drafts[name] = $0 }) {
-      store.send()
+    VStack(alignment: .leading, spacing: 4) {
+      if let quote = store.replyTargets[name] {
+        HStack {
+          MessageQuoteView(quote: quote, dot: name)
+          Button("Cancel") { store.replyTargets[name] = nil }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("chat-reply-cancel")
+        }
+      }
+      Composer(placeholder: "Message \(name)", text: Binding { store.drafts[name] ?? "" } set: { store.drafts[name] = $0 }, canSend: !store.sending.contains(name)) {
+        store.send()
+      }
+      .id(name)
     }
-    .id(name)
   }
 }
 
@@ -319,7 +329,7 @@ struct Conversation: View {
         LazyVStack(alignment: .leading, spacing: 8) {
           ForEach(messages) { MessageRow(store: store, dot: name, message: $0) }
           ForEach(pending) { item in
-            PendingRow(item: item).onTapGesture {
+            PendingRow(item: item, dot: name).onTapGesture {
               if item.error != nil { store.dismiss(name, item.id) }
             }
           }
@@ -617,6 +627,8 @@ struct MessageRow: View {
       HStack {
         Spacer(minLength: 60)
         VStack(alignment: .trailing, spacing: 4) {
+          replyButton
+          if let quote = message.quote { MessageQuoteView(quote: quote, dot: dot) }
           if let item = message.feed { QuoteCard(item: item).frame(maxWidth: 300) }
           if !message.text.isEmpty { Bubble(text: message.text, fill: messageBlue) }
           attachments
@@ -633,6 +645,8 @@ struct MessageRow: View {
             .allowsHitTesting(hovering || pickerOpen)
             .accessibilityHidden(!(hovering || pickerOpen))
           VStack(alignment: .leading, spacing: 3) {
+            replyButton
+            if let quote = message.quote { MessageQuoteView(quote: quote, dot: dot) }
             if !message.text.isEmpty { Bubble(text: message.text, fill: messageGray) }
             attachments
             if let tools = message.tools, !tools.isEmpty {
@@ -671,6 +685,13 @@ struct MessageRow: View {
 }
 
 extension MessageRow {
+  private var replyButton: some View {
+    Button("Reply") { store.reply(dot, to: message) }
+      .buttonStyle(.plain)
+      .font(.caption2)
+      .foregroundStyle(.secondary)
+      .accessibilityIdentifier("chat-reply-\(dot)-\(message.id)")
+  }
   private var key: ReactionKey { ReactionKey(dot: dot, message: message.id) }
 
   private var badge: Reaction? {
@@ -801,11 +822,13 @@ struct AttachmentView: View {
 
 struct PendingRow: View {
   let item: Pending
+  let dot: String
 
   var body: some View {
     HStack {
       Spacer(minLength: 60)
       VStack(alignment: .trailing, spacing: 3) {
+        if let quote = item.quote { MessageQuoteView(quote: quote, dot: dot).opacity(0.6) }
         if let feed = item.feed { QuoteCard(item: feed).frame(maxWidth: 300).opacity(0.6) }
         Bubble(text: item.text, fill: messageBlue).opacity(0.6)
         if let error = item.error {
@@ -815,6 +838,23 @@ struct PendingRow: View {
         }
       }
     }
+  }
+}
+
+struct MessageQuoteView: View {
+  let quote: MessageQuote
+  let dot: String
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 2) {
+      Text(verbatim: quote.author == "owner" ? "You" : quote.author == "dot" ? dot : "Slack participant")
+        .font(.caption2.weight(.semibold))
+      Text(verbatim: quote.text).font(.caption).lineLimit(2)
+    }
+    .padding(6)
+    .frame(maxWidth: 300, alignment: .leading)
+    .background(RoundedRectangle(cornerRadius: 6).strokeBorder(.white.opacity(0.2)))
+    .accessibilityElement(children: .combine)
   }
 }
 

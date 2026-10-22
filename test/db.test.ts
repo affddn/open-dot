@@ -6,7 +6,21 @@ import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { openDatabase } from "../src/db";
-import { feed, outbox, reactions, slack, slackApps, slackEvents } from "../src/schema";
+import {
+  feed,
+  outbox,
+  reactions,
+  slack,
+  slackApps,
+  slackEvents,
+  slackThreads,
+  slackPolls,
+  reminders,
+  workers,
+  routeKey,
+  type Route,
+  type QuoteSnapshot,
+} from "../src/schema";
 
 test("a database from before feed replies keeps its rows, and replies survive a restart", () => {
   // Build the database as the release before feed replies left it: every migration before 0012.
@@ -115,6 +129,137 @@ test("a database from before per-dot Slack apps keeps its Slack rows, and an app
   reopened.$client.close();
 });
 
+test("0015 preserves pre-thread rows and null origins, then persists quotes and unfinished scans across reopening", () => {
+  const dir = mkdtempSync(join(tmpdir(), "open-dot-threads-"));
+  const migrations = join(dir, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0015");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(dir, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',0)",
+  );
+  old.run(
+    "insert into outbox (session_id,message_id,text,state,from_owner,created_at) values ('ses_jojo','old','Keep','sent',1,7)",
+  );
+  old.run(
+    "insert into reminders (dot,text,due_at,state,created_at) values ('jojo','Keep',100,'scheduled',0)",
+  );
+  old.run(
+    "insert into workers (dot,task,directory,session_id,state,created_at) values ('jojo','Keep','/work','ses_worker','creating',0)",
+  );
+  old.run(
+    "insert into slack (ts,dot,channel,message_id,state,created_at) values ('1.1','jojo','D1','old','unknown',0)",
+  );
+  old.run(
+    "insert into slack_events (app,dot,kind,event_id,channel,ts,message_id,state,created_at) values ('A1','jojo','dm','E1','D2','2.1','old','unknown',0)",
+  );
+  old.run(
+    "insert into reactions (dot,session_id,message_id,actor,emoji,excerpt,updated_at) values ('jojo','ses_jojo','old','dot',null,'Keep',1)",
+  );
+  old.run("insert into notes (dot,text,created_at) values ('jojo','Keep',0)");
+  const tables = old
+    .query<{ name: string }, []>(
+      "select name from sqlite_master where type='table' and name not like 'sqlite_%' and name != '__drizzle_migrations'",
+    )
+    .all();
+  const columns = new Map(
+    tables.map(({ name }) => [
+      name,
+      old
+        .query<{ name: string }, []>(`pragma table_info("${name}")`)
+        .all()
+        .map((column) => `"${column.name}"`)
+        .join(","),
+    ]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map(({ name }) => [
+      name,
+      sqlite.query(`select ${columns.get(name)} from "${name}"`).all(),
+    ]);
+  const before = rows(old);
+  old.close();
+  const db = openDatabase(path);
+  expect(rows(db.$client)).toEqual(before);
+  expect(db.select().from(outbox).get()).toMatchObject({
+    route: null,
+    quote: null,
+    startedAt: 7,
+    turnEnd: null,
+  });
+  expect(db.select().from(reminders).get()?.route).toBeNull();
+  expect(db.select().from(workers).get()?.route).toBeNull();
+  expect(db.select().from(slack).get()?.route).toBeNull();
+  expect(db.select().from(slackEvents).get()).toMatchObject({ route: null, thread: null });
+  const route: Route = {
+    kind: "shared",
+    dot: "jojo",
+    sessionID: "ses_jojo",
+    owner: "U1",
+    team: "T1",
+    bot: "B1",
+    dm: true,
+    channel: "D1",
+    thread: "1.1",
+  };
+  const quote: QuoteSnapshot = {
+    prompt: "Reply",
+    parent: { source: "slack", id: "1.1", place: "D1", author: "owner", text: "Original" },
+  };
+  db.insert(outbox)
+    .values({
+      sessionID: "ses_jojo",
+      messageID: "new",
+      text: "framed",
+      ownerText: "Reply",
+      route,
+      quote,
+      state: "pending",
+      fromOwner: true,
+      createdAt: 10,
+    })
+    .run();
+  db.insert(slackThreads)
+    .values({
+      key: routeKey(route),
+      route,
+      parent: quote.parent,
+      oldest: "1.1",
+      newest: "1.9",
+      cursor: "next",
+      activeAt: 10,
+      polledAt: 11,
+    })
+    .run();
+  db.insert(slackPolls)
+    .values({ key: "identity", oldest: "1.0", newest: "1.9", cursor: "top-next" })
+    .run();
+  db.$client.close();
+  const reopened = openDatabase(path);
+  expect(
+    reopened
+      .select()
+      .from(outbox)
+      .all()
+      .find((row) => row.messageID === "new"),
+  ).toMatchObject({ route, quote, ownerText: "Reply" });
+  expect(reopened.select().from(slackThreads).get()).toMatchObject({
+    route,
+    parent: quote.parent,
+    oldest: "1.1",
+    newest: "1.9",
+    cursor: "next",
+  });
+  expect(reopened.select().from(slackPolls).get()?.cursor).toBe("top-next");
+  expect(reopened.select().from(slack).get()?.route).toBeNull();
+  reopened.$client.close();
+});
+
 test("reactions migrate additively and both actors and removal tombstones survive reopening", () => {
   const dir = mkdtempSync(join(tmpdir(), "open-dot-reactions-"));
   const migrations = join(dir, "drizzle");
@@ -141,8 +286,21 @@ test("reactions migrate additively and both actors and removal tombstones surviv
       "select name from sqlite_master where type = 'table' and name not like 'sqlite_%' and name != '__drizzle_migrations'",
     )
     .all();
+  const columns = new Map(
+    tables.map(({ name }) => [
+      name,
+      old
+        .query<{ name: string }, []>(`pragma table_info("${name}")`)
+        .all()
+        .map((column) => `"${column.name}"`)
+        .join(","),
+    ]),
+  );
   const rows = (sqlite: Database) =>
-    tables.map(({ name }) => [name, sqlite.query(`select * from "${name}"`).all()]);
+    tables.map(({ name }) => [
+      name,
+      sqlite.query(`select ${columns.get(name)} from "${name}"`).all(),
+    ]);
   const before = rows(old);
   old.close();
 

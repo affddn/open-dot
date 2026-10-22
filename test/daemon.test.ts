@@ -7,7 +7,7 @@ import { Effect } from "effect";
 import { claimDue, step } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
 import { worktreeDirectory } from "../src/home";
-import { dots, outbox, reminders, workers } from "../src/schema";
+import { dots, outbox, reminders, workers, slack, slackEvents, type Route } from "../src/schema";
 import { fakeOpenCode } from "./fake-opencode";
 
 let db: Db;
@@ -38,6 +38,112 @@ const tick = (now: number) => {
   claimDue(db, now);
   return Effect.runPromise(Effect.provide(step(db), fake.layer));
 };
+
+const sharedRoute = (thread: string): Route => ({
+  kind: "shared",
+  dot: "jojo",
+  sessionID: "ses_jojo",
+  owner: "U1",
+  team: "T1",
+  bot: "B1",
+  dm: true,
+  channel: "D1",
+  thread,
+});
+
+test("one gate serializes shared, per-dot and native destinations without same-route overtaking", async () => {
+  const a = sharedRoute("1.1");
+  const b: Route = { ...a, kind: "agent", app: "A2", bot: "B2", channel: "D2" };
+  for (const [id, route] of [
+    ["a", a],
+    ["a2", a],
+    ["b", b],
+    ["a3", a],
+    ["native", null],
+  ] as const)
+    db.insert(outbox)
+      .values({
+        sessionID: "ses_jojo",
+        messageID: id,
+        text: id,
+        route,
+        state: "pending",
+        createdAt: 0,
+      })
+      .run();
+  await tick(0);
+  expect(fake.state.prompted).toEqual(["a", "a2"]);
+  fake.state.active.add("ses_jojo");
+  await tick(0);
+  expect(fake.state.prompted).toEqual(["a", "a2"]);
+  for (const id of ["a", "a2"])
+    fake.state.messageTurns.set(id, { end: "idle_A", outcome: "succeeded", text: undefined });
+  fake.state.active.clear();
+  await tick(0);
+  expect(fake.state.prompted).toEqual(["a", "a2", "b"]);
+  fake.state.readFailure = true;
+  await tick(0);
+  expect(fake.state.prompted).toHaveLength(3);
+  fake.state.readFailure = false;
+  fake.state.messageTurns.set("b", { end: "idle_B", outcome: "succeeded", text: undefined });
+  await tick(0);
+  expect(fake.state.prompted).toEqual(["a", "a2", "b", "a3"]);
+  fake.state.messageTurns.set("a3", { end: "idle_A3", outcome: "succeeded", text: undefined });
+  await tick(0);
+  expect(fake.state.prompted).toEqual(["a", "a2", "b", "a3", "native"]);
+  expect(fake.state.created).toEqual([]);
+});
+
+test("lost admission survives reopening and holds a competing thread until public completion", async () => {
+  const path = join(mkdtempSync(join(tmpdir(), "open-dot-gate-")), "gate.db");
+  db.$client.close();
+  db = openDatabase(path);
+  for (const [id, route] of [
+    ["a", sharedRoute("1.1")],
+    ["b", sharedRoute("1.2")],
+  ] as const)
+    db.insert(outbox)
+      .values({
+        sessionID: "ses_jojo",
+        messageID: id,
+        text: id,
+        route,
+        state: "pending",
+        createdAt: 0,
+      })
+      .run();
+  fake.state.prompt = "lost";
+  await tick(0);
+  db.$client.close();
+  db = openDatabase(path);
+  fake.state.prompt = "ok";
+  await tick(0);
+  expect(fake.state.prompted).toEqual(["a"]);
+  expect(messages()[0]?.state).toBe("sent");
+  expect(messages()[0]?.turnEnd).toBeNull();
+  fake.state.messageTurns.set("a", { end: "idle_A", outcome: "interrupted", text: undefined });
+  await tick(0);
+  expect(fake.state.prompted).toEqual(["a", "b"]);
+  db.$client.close();
+});
+
+test("due notices retain their original DM destinations and remain unrouted in the dot chat", () => {
+  const a = sharedRoute("1.1");
+  const b: Route = { ...a, kind: "agent", app: "A2", bot: "B2", channel: "D2", thread: "2.1" };
+  for (const route of [a, b])
+    db.insert(reminders)
+      .values({ dot: "jojo", text: "Remember", dueAt: 1, state: "scheduled", route, createdAt: 0 })
+      .run();
+  db.update(dots).set({ sessionID: "ses_rebound" }).run();
+  claimDue(db, 2);
+  claimDue(db, 3);
+  expect(db.select().from(slack).all()).toMatchObject([{ route: a, state: "posting" }]);
+  expect(db.select().from(slackEvents).all()).toMatchObject([
+    { app: "A2", route: b, channel: "D2", thread: "2.1", state: "posting" },
+  ]);
+  expect(messages()).toHaveLength(2);
+  expect(messages().every((row) => row.route === null && row.sessionID === "ses_jojo")).toBe(true);
+});
 
 const git = (cwd: string, ...args: string[]) =>
   Bun.spawnSync(["git", "-C", cwd, ...args])

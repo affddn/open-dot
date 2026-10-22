@@ -9,13 +9,13 @@ import { openDatabase } from "../src/db";
 import { createDot } from "../src/dots";
 import { databasePath, home } from "../src/home";
 import plugin from "../src/plugin";
-import { dots, feed, outbox, reactions } from "../src/schema";
+import { dots, feed, outbox, reactions, reminders, workers, type Route } from "../src/schema";
 
 interface FakeTool {
   readonly name: string;
   readonly execute: (
     input: unknown,
-    call: { sessionID: string },
+    call: { sessionID: string; messageID: string },
   ) => Promise<{ readonly content?: unknown }>;
 }
 interface FakeMessage {
@@ -24,6 +24,13 @@ interface FakeMessage {
 }
 type ContextHook = (event: { sessionID: string; messages: FakeMessage[] }) => void | Promise<void>;
 type HistoryItem = { id: string; type: string; text: string; time: { created: number } };
+
+const historyItem = (id: string, type: string): HistoryItem => ({
+  id,
+  type,
+  text: "",
+  time: { created: 0 },
+});
 
 const fails = (promise: Promise<unknown>) =>
   promise.then(
@@ -37,10 +44,18 @@ beforeEach(() => {
   process.env.OPEN_DOT_HOME = mkdtempSync(join(tmpdir(), "open-dot-test-"));
   const db = openDatabase(databasePath());
   dot = Effect.runSync(createDot(db, "jojo", "Help."));
+  db.update(dots).set({ sessionState: "ready" }).where(eq(dots.name, "jojo")).run();
   db.$client.close();
 });
 
-async function load(directory: string, history: HistoryItem[] = []) {
+async function load(
+  directory: string,
+  history: HistoryItem[] = [
+    { id: "msg_native", type: "user", text: "Help", time: { created: 0 } },
+    { id: "msg_invocation", type: "assistant", text: "", time: { created: 1 } },
+  ],
+  onRead = () => {},
+) {
   const tools = new Map<string, FakeTool>();
   let hook: ContextHook | undefined;
   const reads: string[] = [];
@@ -54,6 +69,7 @@ async function load(directory: string, history: HistoryItem[] = []) {
     session: {
       context: async ({ sessionID }: { sessionID: string }) => {
         reads.push(sessionID);
+        onRead();
         return sessionID === dot.sessionID ? history : [];
       },
       prompt: async (input: unknown) => {
@@ -79,13 +95,143 @@ async function load(directory: string, history: HistoryItem[] = []) {
       .flatMap((message) => message.content.map((part) => part.text))
       .join("\n");
   };
-  const call = (name: string, input: unknown, sessionID = dot.sessionID) => {
+  const call = (
+    name: string,
+    input: unknown,
+    sessionID = dot.sessionID,
+    messageID = "msg_invocation",
+  ) => {
     const tool = tools.get(name);
     if (!tool) throw new Error(`missing tool ${name}`);
-    return tool.execute(input, { sessionID });
+    return tool.execute(input, { sessionID, messageID });
   };
   return { tools, injected, call, cleanup, reads, turns };
 }
+
+test("workers and reminders capture the invoking assistant's route, never a newer queued destination", async () => {
+  const db = openDatabase(databasePath());
+  const a: Route = {
+    kind: "shared",
+    dot: "jojo",
+    sessionID: dot.sessionID,
+    owner: "U1",
+    team: "T1",
+    bot: "B1",
+    dm: true,
+    channel: "D1",
+    thread: "1.1",
+  };
+  for (const [id, route, state] of [
+    ["msg_A", a, "sent"],
+    ["msg_B", { ...a, thread: "1.2" }, "pending"],
+  ] as const)
+    db.insert(outbox)
+      .values({
+        sessionID: dot.sessionID,
+        messageID: id,
+        text: id,
+        route,
+        state,
+        fromOwner: true,
+        createdAt: 0,
+      })
+      .run();
+  const history: HistoryItem[] = [
+    { id: "idle_before", type: "idle", text: "", time: { created: 0 } },
+    { id: "msg_A", type: "user", text: "do it", time: { created: 1 } },
+    { id: "msg_invocation", type: "assistant", text: "", time: { created: 2 } },
+    // Even visible later context must not become the earlier invocation's provenance.
+    { id: "idle_after", type: "idle", text: "", time: { created: 3 } },
+    { id: "msg_native", type: "user", text: "native", time: { created: 4 } },
+    { id: "msg_later", type: "assistant", text: "", time: { created: 5 } },
+  ];
+  const loaded = await load(dot.directory, history);
+  await loaded.call("dot_delegate", { task: "Original task" });
+  await loaded.call("dot_remind", { text: "Original reminder", at: "2099-01-01T09:00:00Z" });
+  await loaded.call(
+    "dot_remind",
+    { text: "Native reminder", at: "2099-01-01T09:00:00Z" },
+    dot.sessionID,
+    "msg_later",
+  );
+  expect(db.select().from(workers).get()?.route).toEqual(a);
+  expect(
+    db
+      .select()
+      .from(reminders)
+      .all()
+      .map((row) => row.route),
+  ).toEqual([a, null]);
+  expect(loaded.turns).toEqual([]);
+  await loaded.cleanup?.();
+  db.$client.close();
+});
+
+test("missing, compacted, mixed and failed public provenance create no delayed work", async () => {
+  const db = openDatabase(databasePath());
+  const a: Route = {
+    kind: "shared",
+    dot: "jojo",
+    sessionID: dot.sessionID,
+    owner: "U1",
+    team: "T1",
+    bot: "B1",
+    dm: true,
+    channel: "D1",
+    thread: "1.1",
+  };
+  db.insert(outbox)
+    .values({
+      sessionID: dot.sessionID,
+      messageID: "msg_A",
+      text: "a",
+      route: a,
+      state: "sent",
+      fromOwner: true,
+      createdAt: 0,
+    })
+    .run();
+  for (const history of [
+    [],
+    [historyItem("msg_A", "user")],
+    [
+      historyItem("compact", "compaction"),
+      historyItem("msg_A", "user"),
+      historyItem("msg_invocation", "assistant"),
+    ],
+    [
+      historyItem("msg_A", "user"),
+      historyItem("native", "user"),
+      historyItem("msg_invocation", "assistant"),
+    ],
+  ]) {
+    const loaded = await load(dot.directory, history);
+    expect(await fails(loaded.call("dot_delegate", { task: "No" }))).toBe(true);
+    expect(await fails(loaded.call("dot_remind", { text: "No", at: "2099-01-01T09:00:00Z" }))).toBe(
+      true,
+    );
+    await loaded.cleanup?.();
+  }
+  const failed = await load(dot.directory, undefined, () => {
+    throw new Error("context unavailable");
+  });
+  expect(await fails(failed.call("dot_delegate", { task: "No" }))).toBe(true);
+  await failed.cleanup?.();
+  expect(db.select().from(workers).all()).toEqual([]);
+  expect(db.select().from(reminders).all()).toEqual([]);
+  db.$client.close();
+});
+
+test("a conversation rebound during the provenance read cannot create a worker", async () => {
+  const db = openDatabase(databasePath());
+  const loaded = await load(dot.directory, undefined, () => {
+    db.update(dots).set({ sessionID: "ses_replaced" }).where(eq(dots.name, "jojo")).run();
+  });
+  expect(await fails(loaded.call("dot_delegate", { task: "No" }))).toBe(true);
+  expect(db.select().from(workers).all()).toEqual([]);
+  await loaded.cleanup?.();
+  db.$client.close();
+});
 
 test("other locations get no tools and no memory", async () => {
   const loaded = await load("/somewhere/else");

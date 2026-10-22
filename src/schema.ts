@@ -23,8 +23,78 @@ export const reminders = sqliteTable("reminders", {
   // A repeating reminder stays scheduled and moves to its next occurrence each time it is sent.
   everyMinutes: integer("every_minutes"),
   state: text({ enum: ["scheduled", "sent"] }).notNull(),
+  // The original Slack destination for the persisted reminder notice.
+  route: text({ mode: "json" }).$type<Route>(),
   createdAt: integer("created_at").notNull(),
 });
+
+/**
+ * Where the dot's answer to a message goes in Slack: a thread in the owner's DM with the shared
+ * app, or a DM or channel thread of the dot's own app, with the identities it was read under.
+ * Only the daemon sets one, from what Slack showed it; a model never chooses it.
+ */
+export type Route =
+  | {
+      readonly kind: "shared";
+      readonly dot: string;
+      readonly sessionID: string;
+      readonly owner: string;
+      readonly team: string;
+      readonly bot: string;
+      readonly dm: true;
+      readonly channel: string;
+      readonly thread: string;
+    }
+  | {
+      readonly kind: "agent";
+      readonly dot: string;
+      readonly sessionID: string;
+      readonly app: string;
+      readonly team: string;
+      readonly owner: string;
+      readonly bot: string;
+      readonly channel: string;
+      readonly thread: string;
+      // A DM with the app, as opposed to a channel the owner mentioned it in.
+      readonly dm: boolean;
+    };
+
+/** Messages with the same key may share a turn. Unrouted messages share the empty key. */
+export const routeKey = (route: Route | null | undefined) =>
+  route
+    ? JSON.stringify([
+        route.kind,
+        route.dot,
+        route.sessionID,
+        route.kind === "agent" ? route.app : null,
+        route.team,
+        route.owner,
+        route.bot,
+        route.channel,
+        route.thread,
+        route.dm,
+      ])
+    : "";
+
+/**
+ * The message the owner replied to, as the daemon read it when the reply was sent: from the dot's
+ * own conversation in the notch, or a Slack thread's first message. Never taken from the request.
+ */
+export interface QuoteSnapshot {
+  // The owner's own words, shown without the framing the dot gets.
+  readonly prompt: string;
+  readonly parent: {
+    readonly source: "notch" | "slack";
+    // The message ID in the dot's session, or the Slack thread's ts.
+    readonly id: string;
+    // The session it was read from, or the Slack conversation.
+    readonly place: string;
+    readonly author: "owner" | "dot" | "other";
+    readonly text: string;
+  };
+}
+
+export const quoteLimit = 240;
 
 /** Every message the daemon sends to a session. The message ID is saved before any OpenCode call. */
 export const outbox = sqliteTable("outbox", {
@@ -40,6 +110,11 @@ export const outbox = sqliteTable("outbox", {
   // A reply to a feed item: the owner's prompt and the item as the daemon read it from its own DB.
   // `text` holds both, with the item framed as data.
   feed: text({ mode: "json" }).$type<FeedSnapshot>(),
+  route: text({ mode: "json" }).$type<Route>(),
+  quote: text({ mode: "json" }).$type<QuoteSnapshot>(),
+  ownerText: text("owner_text"),
+  startedAt: integer("started_at"),
+  turnEnd: text("turn_end"),
   createdAt: integer("created_at").notNull(),
 });
 
@@ -121,6 +196,7 @@ export const workers = sqliteTable("workers", {
   // "creating" means the session ID is saved but OpenCode has not confirmed the session yet.
   state: text({ enum: ["creating", "running", "done"] }).notNull(),
   promptID: text("prompt_id"),
+  route: text({ mode: "json" }).$type<Route>(),
   outcome: text(),
   // The permission request the dot was last told about, so it is told only once.
   waitingOn: text("waiting_on"),
@@ -166,6 +242,7 @@ export const slack = sqliteTable("slack", {
     .references(() => dots.name),
   // The DM it was read from, where the reply goes even if the tokens change.
   channel: text().notNull(),
+  route: text({ mode: "json" }).$type<Route>(),
   // The outbox message that carried it to the dot.
   messageID: text("message_id").notNull(),
   // Saved before the reply is posted, and tagged on the post so a lost outcome can be found.
@@ -241,6 +318,7 @@ export const slackEvents = sqliteTable(
   {
     id: integer().primaryKey({ autoIncrement: true }),
     app: text().notNull(),
+    route: text({ mode: "json" }).$type<Route>(),
     dot: text()
       .notNull()
       .references(() => dots.name),
@@ -277,6 +355,26 @@ export const slackEvents = sqliteTable(
 );
 
 export type SlackEvent = typeof slackEvents.$inferSelect;
+
+export const slackThreads = sqliteTable("slack_threads", {
+  key: text().primaryKey(),
+  route: text({ mode: "json" }).$type<Route>().notNull(),
+  parent: text({ mode: "json" }).$type<QuoteSnapshot["parent"]>(),
+  oldest: text().notNull(),
+  newest: text().notNull(),
+  cursor: text().notNull().default(""),
+  rescan: integer({ mode: "boolean" }).notNull().default(false),
+  activeAt: integer("active_at").notNull(),
+  polledAt: integer("polled_at").notNull().default(0),
+});
+
+export const slackPolls = sqliteTable("slack_polls", {
+  key: text().primaryKey(),
+  oldest: text().notNull(),
+  newest: text().notNull(),
+  // JSON continuation: Slack cursor and owner messages waiting for oldest-first routing.
+  cursor: text().notNull().default(""),
+});
 
 /** The one note telling someone in a conversation that a bot only answers its owner. */
 export const slackNotices = sqliteTable(

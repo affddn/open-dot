@@ -1,17 +1,28 @@
 import { SessionMessage } from "@opencode/client/effect";
 import { and, asc, eq, inArray, isNull, or } from "drizzle-orm";
-import { Cause, Effect, type Layer, Schema } from "effect";
-import { quoted } from "./api";
+import { Cause, Effect, type Layer } from "effect";
+import { quoted, quoteText, replyPrompt } from "./replies";
 import type { Db } from "./db";
 import { findDot } from "./dots";
 import type { Fetch } from "./feed";
 import { OpenCode, type OpenCodeError, type Turn } from "./opencode";
-import { dots, outbox, type SlackApp, slackApps, type SlackEvent, slackEvents } from "./schema";
+import {
+  dots,
+  outbox,
+  routeKey,
+  type Route,
+  type QuoteSnapshot,
+  slack,
+  type SlackApp,
+  slackApps,
+  type SlackEvent,
+  slackEvents,
+} from "./schema";
 import { appItem, botItem } from "./slack-setup";
 import {
   after,
-  History,
   history,
+  thread,
   isRecord,
   keychain,
   notice,
@@ -59,22 +70,45 @@ const failure = (error: unknown) => (error instanceof Error ? error.message : St
 const present = (value: unknown) => value !== undefined && value !== null;
 const text = (value: unknown) => (typeof value === "string" && value !== "" ? value : undefined);
 
-/**
- * Queues a worker's report for the owner's DM with the dot's own app, in the transaction that
- * queues it to the dot. Only a report produced while the app is connected goes, and only there.
- */
-export function queueReport(tx: Tx, dot: string, report: string, messageID: string) {
+/** Saves a delayed notice beside its chat outbox row, retaining its original Slack identity. */
+export function queueReport(
+  tx: Tx,
+  dot: string,
+  report: string,
+  messageID: string,
+  route?: Route | null,
+) {
+  if (route?.kind === "shared") {
+    tx.insert(slack)
+      .values({
+        ts: `report:${messageID}`,
+        dot,
+        channel: route.channel,
+        route,
+        messageID,
+        replyID: crypto.randomUUID(),
+        replyText: report,
+        state: "posting",
+        createdAt: Date.now(),
+      })
+      .run();
+    return;
+  }
   const app = tx
     .select()
     .from(slackApps)
     .where(and(eq(slackApps.dot, dot), eq(slackApps.state, "active")))
     .get();
-  if (!app?.appID) return;
+  const appID = route?.app ?? app?.appID;
+  if (!appID) return;
   tx.insert(slackEvents)
     .values({
-      app: app.appID,
+      app: appID,
       dot,
       kind: "report",
+      route,
+      channel: route?.dm ? route.channel : null,
+      thread: route?.dm ? route.thread : null,
       messageID,
       replyID: crypto.randomUUID(),
       replyText: report,
@@ -109,6 +143,9 @@ export function accept(db: Db, app: SlackApp, payload: Record<string, unknown>, 
   const actorTeam = text(event.user_team) ?? text(event.team) ?? payload.team_id;
   const owner = user === app.ownerID && actorTeam === app.teamID;
   const threadTS = text(event.thread_ts);
+  const dot = findDot(db, app.dot);
+  if (owner && (dot?.sessionState !== "ready" || !app.ownerID || !app.teamID || !app.botID))
+    throw new Error("Cannot bind this owner event to a ready conversation and checked app.");
   db.insert(slackEvents)
     .values({
       app: app.appID,
@@ -118,7 +155,22 @@ export function accept(db: Db, app: SlackApp, payload: Record<string, unknown>, 
       channel,
       ts,
       // A reply to a mention always goes in its thread.
-      thread: owner && mention ? (threadTS ?? ts) : (threadTS ?? null),
+      thread: owner ? (threadTS ?? ts) : (threadTS ?? null),
+      route:
+        owner && app.ownerID && app.teamID && app.botID && dot?.sessionState === "ready"
+          ? {
+              kind: "agent",
+              dot: app.dot,
+              sessionID: dot.sessionID,
+              app: app.appID,
+              team: app.teamID,
+              owner: app.ownerID,
+              bot: app.botID,
+              channel,
+              thread: threadTS ?? ts,
+              dm,
+            }
+          : null,
       user,
       text: owner ? (text(event.text) ?? "") : null,
       state: "new",
@@ -126,26 +178,6 @@ export function accept(db: Db, app: SlackApp, payload: Record<string, unknown>, 
     })
     .onConflictDoNothing()
     .run();
-}
-
-/** Every message in a thread, across pages. Fails rather than give part of it. */
-async function thread(client: Slack, channel: string, ts: string, metadata = false) {
-  const messages: (typeof History.Type)["messages"][number][] = [];
-  for (let cursor = ""; ;) {
-    const body = await client.read("bot", "conversations.replies", {
-      channel,
-      ts,
-      limit: "200",
-      ...(metadata && { include_all_metadata: "true" }),
-      ...(cursor && { cursor }),
-    });
-    if (!body) throw new Error("the dot's bot token isn't usable");
-    const page = Schema.decodeUnknownSync(History)(body);
-    messages.push(...page.messages);
-    cursor = page.response_metadata?.next_cursor ?? "";
-    if (!cursor && body.has_more === true) throw new Error("a thread page had no cursor");
-    if (!cursor) return messages;
-  }
 }
 
 // chat.postMessage's limit for markdown_text.
@@ -367,6 +399,16 @@ export function slackAgents(
     const app = binding(row.dot);
     const live = lives.get(row.dot);
     if (app?.state !== "active" || app.appID !== row.app || !live || !app.botID) return undefined;
+    if (
+      row.route &&
+      (row.route.kind !== "agent" ||
+        row.route.team !== app.teamID ||
+        row.route.owner !== app.ownerID ||
+        row.route.bot !== app.botID ||
+        findDot(db, row.dot)?.sessionID !== row.route.sessionID ||
+        findDot(db, row.dot)?.sessionState !== "ready")
+    )
+      return undefined;
     const checked = live.client.botID();
     if (checked && checked !== app.botID) {
       live.client.forget("bot");
@@ -376,7 +418,14 @@ export function slackAgents(
   };
 
   /** Saves the message's outbox row and its new state in one transaction. */
-  const queue = (row: SlackEvent, sessionID: string, prompt: string, contextTS: string | null) =>
+  const queue = (
+    row: SlackEvent,
+    sessionID: string,
+    prompt: string,
+    contextTS: string | null,
+    own: string,
+    quote?: QuoteSnapshot,
+  ) =>
     db.transaction((tx) => {
       const messageID = SessionMessage.ID.create();
       const claimed = tx
@@ -390,9 +439,14 @@ export function slackAgents(
         .values({
           sessionID,
           messageID,
-          text: prompt,
+          text: row.route
+            ? `${prompt}\n\nSlack destination (untrusted data): ${quoted({ channel: row.route.channel, thread: row.route.thread })}`
+            : prompt,
           state: "pending",
           fromOwner: true,
+          route: row.route,
+          ownerText: own,
+          quote,
           createdAt: Date.now(),
         })
         .run();
@@ -452,7 +506,27 @@ Your owner mentioned you in a Slack thread, and your reply is posted there when 
 <slack-thread>
 ${context.join("\n")}
 </slack-thread>`;
-    return { prompt, contextTS: newest };
+    const root = messages.find((item) => item.ts === row.thread);
+    const quote: QuoteSnapshot | undefined =
+      root && root.ts !== row.ts
+        ? {
+            prompt: own,
+            parent: {
+              source: "slack",
+              id: root.ts,
+              place: row.channel,
+              author:
+                root.user === app.ownerID ? "owner" : root.bot_id === app.botID ? "dot" : "other",
+              text: quoteText(unescape(root.text ?? "")),
+            },
+          }
+        : undefined;
+    return {
+      prompt: quote ? replyPrompt({ ...quote, prompt }) : prompt,
+      contextTS: newest,
+      own,
+      quote,
+    };
   };
 
   /** Queues the owner's new messages to the dot, and gives each outsider their one note. */
@@ -487,7 +561,29 @@ ${context.join("\n")}
         if (dot?.sessionState !== "ready") continue;
         if (row.kind === "dm") {
           const own = unescape(row.text ?? "").trim();
-          if (own) queue(row, dot.sessionID, own, null);
+          let quote: QuoteSnapshot | undefined;
+          if (row.thread && row.thread !== row.ts) {
+            const messages = await thread(client, row.channel, row.thread);
+            const root = messages.find((item) => item.ts === row.thread);
+            if (root)
+              quote = {
+                prompt: own,
+                parent: {
+                  source: "slack",
+                  id: root.ts,
+                  place: row.channel,
+                  author:
+                    root.user === app.ownerID
+                      ? "owner"
+                      : root.bot_id === app.botID
+                        ? "dot"
+                        : "other",
+                  text: quoteText(unescape(root.text ?? "")),
+                },
+              };
+          }
+          if (findDot(db, row.dot)?.sessionID !== dot.sessionID || !clientFor(row)) continue;
+          if (own) queue(row, dot.sessionID, quote ? replyPrompt(quote) : own, null, own, quote);
           else
             db.update(slackEvents)
               .set({ state: "done" })
@@ -495,8 +591,9 @@ ${context.join("\n")}
               .run();
           continue;
         }
-        const { prompt, contextTS } = await mentionPrompt(row, app, client);
-        queue(row, dot.sessionID, prompt, contextTS);
+        const { prompt, contextTS, own, quote } = await mentionPrompt(row, app, client);
+        if (findDot(db, row.dot)?.sessionID !== dot.sessionID || !clientFor(row)) continue;
+        queue(row, dot.sessionID, prompt, contextTS, own, quote);
         note(`event ${row.id}`);
       } catch (error) {
         // Left "new", so it's tried again; other rows go on.
@@ -508,7 +605,7 @@ ${context.join("\n")}
   /** Saves each reply once its turn ends. A DM's messages that share a turn get one reply. */
   const finish = Effect.gen(function* () {
     const waiting = db
-      .select({ row: slackEvents, sessionID: dots.sessionID })
+      .select({ row: slackEvents, sessionID: outbox.sessionID })
       .from(slackEvents)
       .innerJoin(dots, eq(slackEvents.dot, dots.name))
       .innerJoin(outbox, eq(slackEvents.messageID, outbox.messageID))
@@ -535,7 +632,7 @@ ${context.join("\n")}
         // Each mention gets its own reply, even when OpenCode answered several in one turn.
         const key =
           row.kind === "dm"
-            ? `${row.app} ${row.channel} ${row.thread ?? ""} ${turn.end}`
+            ? `${sessionID} ${routeKey(row.route)} ${row.app} ${row.channel} ${row.thread ?? ""} ${turn.end}`
             : `${row.id}`;
         ended.set(key, [...(ended.get(key) ?? []), { id: row.id, turn }]);
       }
@@ -580,7 +677,8 @@ ${context.join("\n")}
     const found = messages?.find(
       (message) => replyID(message) === row.replyID && message.bot_id === app.botID,
     );
-    if (found) settle(row.id, "unknown", { state: "posted", replyTS: found.ts });
+    if (found && clientFor(row) && client.botID() === app.botID)
+      settle(row.id, "unknown", { state: "posted", replyTS: found.ts });
   };
 
   /** Posts each saved reply once, marked "unknown" just before the call. */
@@ -610,16 +708,22 @@ ${context.join("\n")}
           if (!settle(row.id, "posting", { channel: id })) continue;
           channel = id;
         }
+        if (!clientFor(row)) continue;
         if (!channel || !settle(row.id, "posting", { state: "unknown" })) continue;
-        const answer = await client.call("bot", "chat.postMessage", {
-          channel,
-          ...(row.thread && { thread_ts: row.thread }),
-          markdown_text: clip(row.replyText),
-          metadata: JSON.stringify({
-            event_type: replyEvent,
-            event_payload: { reply_id: row.replyID },
-          }),
-        });
+        const answer = await client.call(
+          "bot",
+          "chat.postMessage",
+          {
+            channel,
+            ...(row.thread && { thread_ts: row.thread }),
+            markdown_text: clip(row.replyText),
+            metadata: JSON.stringify({
+              event_type: replyEvent,
+              event_payload: { reply_id: row.replyID },
+            }),
+          },
+          () => Boolean(clientFor(row)) && client.botID() === (row.route?.bot ?? app.botID),
+        );
         if (answer?.kind === "ok") {
           settle(row.id, "unknown", { state: "posted", replyTS: text(answer.body.ts) ?? null });
         } else if (!answer || (answer.kind === "refused" && answer.error === "ratelimited")) {

@@ -1,7 +1,8 @@
 import { beforeEach, expect, spyOn, test } from "bun:test";
+import assert from "node:assert/strict";
 import { eq } from "drizzle-orm";
 import { Effect } from "effect";
-import { advanceWorkers, step } from "../src/daemon";
+import { advanceWorkers, claimDue, step } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
 import {
   dots,
@@ -11,8 +12,10 @@ import {
   slackEvents,
   slackNotices,
   workers,
+  reminders,
+  slack,
 } from "../src/schema";
-import { sharedNotices, slackClient } from "../src/slack";
+import { receive, sharedNotices, slackChat, slackClient } from "../src/slack";
 import { type Socket, slackAgents } from "../src/slack-agents";
 import {
   attachApp,
@@ -68,6 +71,8 @@ function fakeSlack() {
     ephemeral: "ok" as Mode,
     missing: new Set<string>(),
     calls: [] as string[],
+    requests: [] as { method: string; params: Record<string, string> }[],
+    onReplies: () => {},
     // The configuration API.
     refresh: "xoxe-1-r0",
     configUser: owner,
@@ -107,6 +112,7 @@ function fakeSlack() {
     );
     const token = new Headers(init.headers).get("authorization")?.replace("Bearer ", "") ?? "";
     state.calls.push(`${token || "-"} ${method}`);
+    state.requests.push({ method, params });
     if (state.missing.has(method)) return json({ ok: false, error: "missing_scope" });
     if (state.revoked.has(token)) return json({ ok: false, error: "token_revoked" });
     const bot = state.bots.get(token);
@@ -131,6 +137,7 @@ function fakeSlack() {
           : json({ ok: false, error: "invalid_auth" });
       }
       case "conversations.replies": {
+        state.onReplies();
         const messages = (state.threads.get(`${params.channel} ${params.ts}`) ?? []).map(
           ({ metadata, ...message }) =>
             params.include_all_metadata === "true" ? { ...message, metadata } : message,
@@ -662,7 +669,8 @@ test("each of the owner's mentions gets one reply in its thread, with every unse
   await tick();
   const third = prompts()[2]?.text ?? "";
   expect(third).toContain('"text":"late reply"');
-  expect(third).not.toContain("kick off");
+  expect(third.split("</slack-thread>")[0]).not.toContain("kick off");
+  expect(prompts()[2]?.quote?.parent.text).toBe("kick off");
   expect(third).not.toContain("Summary.");
   // Duplicates add nothing.
   send({
@@ -693,7 +701,7 @@ test("a thread that can't be read in full queues nothing, and doesn't hold up ot
       ts: ts(301),
     });
     await tick();
-    expect(prompts().map((row) => row.text)).toEqual(["and here"]);
+    expect(prompts().map((row) => row.ownerText)).toEqual(["and here"]);
     expect(events().map((row) => row.state)).toEqual(["new", "waiting"]);
 
     fake.state.missing.clear();
@@ -907,6 +915,14 @@ test("a lost reply is only looked up, by its ID among the dot's own posts, and n
     fake.state.post = "ok";
     await tick();
     expect(events().at(-1)).toMatchObject({ state: "posted" });
+    expect(
+      fake.state.requests.some(
+        ({ method, params }) =>
+          method === "conversations.replies" &&
+          params.ts === ts(10) &&
+          params.include_all_metadata === "true",
+      ),
+    ).toBe(true);
 
     // It never landed: it stays unknown, and isn't posted again.
     fake.state.post = "dropped";
@@ -917,8 +933,8 @@ test("a lost reply is only looked up, by its ID among the dot's own posts, and n
     fake.state.post = "ok";
     // Another bot's message with the same reply ID doesn't count.
     const replyID = events().at(-1)?.replyID;
-    fake.state.history.set("DJ", [
-      ...(fake.state.history.get("DJ") ?? []),
+    fake.state.threads.set(`DJ ${ts(20)}`, [
+      ...(fake.state.threads.get(`DJ ${ts(20)}`) ?? []),
       {
         ts: ts(21),
         user: "UOTHERBOT",
@@ -985,6 +1001,253 @@ test("a worker's report goes once to the owner's DM with the dot's app, never to
   expect(fake.state.posts[0]).toMatchObject({ channel: `D-${owner}-${appID}` });
   expect(fake.state.posts[0]?.thread_ts).toBeUndefined();
   expect(fake.state.posts[0]?.markdown_text).toContain("New work.");
+});
+
+test("shared and per-dot producers use the same turn gate and preserve A/B/A arrival order", async () => {
+  await connected();
+  const sharedDM = `D-${owner}-ASHARED`;
+  const origin = { owner, team, bot: "BSHARED", thread: ts(1) };
+  receive(db, sharedDM, ts(1), "jotaro: shared A", origin);
+  send({
+    type: "message",
+    channel_type: "im",
+    channel: "DJ",
+    user: owner,
+    text: "agent B",
+    ts: ts(2),
+  });
+  await tick();
+  receive(db, sharedDM, ts(3), "more A", origin);
+  const [a, b, more] = prompts();
+  assert(a && b && more, "The A/B/A prompts must all be persisted");
+  expect(a?.route?.kind).toBe("shared");
+  expect(b?.route?.kind).toBe("agent");
+  await deliver();
+  expect(opencode.state.prompted).toEqual([a.messageID]);
+  agents.stop();
+  agents = start();
+  await tick();
+  await deliver();
+  expect(opencode.state.prompted).toHaveLength(1);
+  opencode.state.messageTurns.set(a.messageID, {
+    end: "idle_A",
+    outcome: "succeeded",
+    text: "Only A",
+  });
+  await deliver();
+  expect(opencode.state.prompted).toEqual([a.messageID, b.messageID]);
+  await Effect.runPromise(slackChat(db, shared, opencode.layer, time));
+  await tick();
+  expect(fake.state.posts).toMatchObject([
+    { channel: sharedDM, thread_ts: ts(1), markdown_text: "Only A" },
+  ]);
+  opencode.state.messageTurns.set(b.messageID, {
+    end: "idle_B",
+    outcome: "succeeded",
+    text: "Only B",
+  });
+  await deliver();
+  await tick();
+  expect(opencode.state.prompted).toEqual([a.messageID, b.messageID, more.messageID]);
+  expect(fake.state.posts.at(-1)).toMatchObject({
+    channel: "DJ",
+    thread_ts: ts(2),
+    markdown_text: "Only B",
+  });
+  worker(12);
+  db.update(workers).set({ route: a.route }).where(eq(workers.id, 12)).run();
+  opencode.state.turns.set("ses_w12", { outcome: "succeeded", text: "Late shared result" });
+  await advance();
+  await Effect.runPromise(slackChat(db, shared, opencode.layer, time));
+  expect(
+    db
+      .select()
+      .from(slack)
+      .all()
+      .find((row) => row.ts.startsWith("report:"))?.route,
+  ).toEqual(a.route);
+  expect(fake.state.posts.at(-1)).toMatchObject({ channel: sharedDM, thread_ts: ts(1) });
+  expect(fake.state.posts.at(-1)?.markdown_text).toContain("Late shared result");
+  expect(opencode.state.created).toEqual([]);
+});
+
+test("per-dot DM replies quote the actual root, fold only together, and retain thread destinations", async () => {
+  await connected();
+  say(`DJ ${ts(1)}`, { ts: ts(1), user: owner, text: "Root </reply-quote> &amp; text" });
+  send({
+    type: "message",
+    channel_type: "im",
+    channel: "DJ",
+    user: owner,
+    text: "Root",
+    ts: ts(1),
+  });
+  send({
+    type: "message",
+    channel_type: "im",
+    channel: "DJ",
+    user: owner,
+    text: "Continue",
+    ts: ts(2),
+    thread_ts: ts(1),
+  });
+  send({
+    type: "message",
+    channel_type: "im",
+    channel: "DJ",
+    user: owner,
+    text: "Separate",
+    ts: ts(3),
+  });
+  await tick();
+  const [first, second, third] = prompts();
+  assert(first && second && third, "All three DM prompts must be persisted");
+  expect(second?.quote?.parent).toMatchObject({
+    source: "slack",
+    id: ts(1),
+    place: "DJ",
+    author: "owner",
+    text: "Root </reply-quote> & text",
+  });
+  expect(second?.text).toContain("\\u003c/reply-quote\\u003e");
+  expect(second?.ownerText).toBe("Continue");
+  await deliver();
+  expect(opencode.state.prompted).toEqual([first.messageID, second.messageID]);
+  for (const prompt of [first, second])
+    opencode.state.messageTurns.set(prompt.messageID, {
+      end: "idle_shared",
+      outcome: "succeeded",
+      text: "Together",
+    });
+  await tick();
+  expect(events().map((row) => row.state)).toEqual(["answered", "posted", "waiting"]);
+  expect(fake.state.posts).toMatchObject([
+    { channel: "DJ", thread_ts: ts(1), markdown_text: "Together" },
+  ]);
+  await deliver();
+  expect(opencode.state.prompted.at(-1)).toBe(third.messageID);
+});
+
+test("a rebound during a root read queues nothing and a missing root invents no quote", async () => {
+  await connected();
+  send({
+    type: "message",
+    channel_type: "im",
+    channel: "DJ",
+    user: owner,
+    text: "Reply",
+    ts: ts(2),
+    thread_ts: ts(1),
+  });
+  fake.state.onReplies = () => {
+    db.update(dots).set({ sessionID: "ses_replaced" }).where(eq(dots.name, "jotaro")).run();
+  };
+  await tick();
+  expect(prompts()).toEqual([]);
+  expect(events()[0]?.state).toBe("new");
+  fake.state.onReplies = () => {};
+  db.update(dots).set({ sessionID: "ses_jotaro" }).where(eq(dots.name, "jotaro")).run();
+  await tick();
+  expect(prompts()[0]?.quote).toBeNull();
+  expect(prompts()[0]?.route).toMatchObject({ channel: "DJ", thread: ts(1) });
+});
+
+test("late worker and reminder notices keep the original DM thread after another thread and restart", async () => {
+  await connected();
+  send({
+    type: "message",
+    channel_type: "im",
+    channel: "DJ",
+    user: owner,
+    text: "Start",
+    ts: ts(1),
+  });
+  await tick();
+  const [originPrompt] = prompts();
+  assert(originPrompt, "The originating DM prompt must be persisted");
+  const route = originPrompt.route;
+  assert(route, "The originating DM prompt must have a route");
+  worker(10);
+  db.update(workers).set({ route }).where(eq(workers.id, 10)).run();
+  db.insert(reminders)
+    .values({ dot: "jotaro", route, text: "Reminder", dueAt: 1, state: "scheduled", createdAt: 0 })
+    .run();
+  send({
+    type: "message",
+    channel_type: "im",
+    channel: "DJ",
+    user: owner,
+    text: "Other",
+    ts: ts(2),
+  });
+  await tick();
+  opencode.state.turns.set("ses_w10", { outcome: "succeeded", text: "Result" });
+  await advance();
+  claimDue(db, 2);
+  agents.stop();
+  agents = start();
+  await tick();
+  await advance();
+  claimDue(db, 3);
+  await tick();
+  expect(fake.state.posts).toHaveLength(2);
+  expect(fake.state.posts.every((post) => post.channel === "DJ" && post.thread_ts === ts(1))).toBe(
+    true,
+  );
+  expect(
+    events()
+      .filter((event) => event.kind === "report")
+      .every((event) => event.route?.thread === ts(1)),
+  ).toBe(true);
+  expect(
+    prompts()
+      .filter((prompt) => !prompt.fromOwner)
+      .every((prompt) => prompt.route === null),
+  ).toBe(true);
+});
+
+test("channel-origin delayed work posts only in the original app's owner DM and blocks replacement identities", async () => {
+  await connected();
+  send({ type: "app_mention", channel: "C1", user: owner, text: "Start", ts: ts(1), team });
+  await tick();
+  const [originPrompt] = prompts();
+  assert(originPrompt, "The originating mention prompt must be persisted");
+  const route = originPrompt.route;
+  assert(route, "The originating mention prompt must have a route");
+  worker(10);
+  db.update(workers).set({ route }).where(eq(workers.id, 10)).run();
+  opencode.state.turns.set("ses_w10", { outcome: "succeeded", text: "Channel result" });
+  await advance();
+  await tick();
+  expect(fake.state.posts).toMatchObject([{ channel: `D-${owner}-${appID}` }]);
+  expect(fake.state.posts[0]?.thread_ts).toBeUndefined();
+  for (const change of [
+    { ownerID: "UOTHER" },
+    { teamID: "TOTHER" },
+    { botID: "BOTHER" },
+    { appID: "AOTHER" },
+  ]) {
+    db.update(slackApps)
+      .set({ ownerID: owner, teamID: team, botID, appID, ...change })
+      .run();
+    db.insert(reminders)
+      .values({ dot: "jotaro", route, text: "Blocked", dueAt: 1, state: "scheduled", createdAt: 0 })
+      .run();
+    claimDue(db, 2);
+    await tick();
+  }
+  db.update(slackApps).set({ ownerID: owner, teamID: team, botID, appID }).run();
+  db.update(dots).set({ sessionID: "ses_replaced" }).where(eq(dots.name, "jotaro")).run();
+  await tick();
+  expect(fake.state.posts).toHaveLength(1);
+  expect(
+    events().filter((event) => event.kind === "report" && event.state === "posting"),
+  ).toHaveLength(4);
+  expect(
+    events()
+      .filter((event) => event.kind === "report")
+      .every((event) => event.app === appID),
+  ).toBe(true);
 });
 
 const hello = JSON.stringify({ type: "hello", connection_info: { app_id: appID } });

@@ -20,6 +20,9 @@ export function fakeOpenCode() {
     texts: [] as { sessionID: string; text: string }[],
     active: new Set<string>(),
     turns: new Map<string, Omit<Turn, "end"> & { end?: string }>(),
+    messageTurns: new Map<string, Turn>(),
+    readFailure: false,
+    onMessage: () => {},
     approvals: new Map<string, Approval>(),
     history: new Map<string, Entry[]>(),
     create: "ok" as "ok" | "fail",
@@ -45,13 +48,28 @@ export function fakeOpenCode() {
     activeSessions: Effect.sync(() => new Set(state.active)),
     // Each message's turn ends at its own idle unless the test names a shared one.
     turnAfter: ({ sessionID, messageID }) =>
-      Effect.sync(() => {
-        const turn = state.turns.get(sessionID);
-        return turn && { end: `idle_${messageID}`, ...turn };
-      }),
+      Effect.suspend(() =>
+        state.readFailure
+          ? broken("history unavailable")
+          : Effect.sync(() => {
+              if (state.messageTurns.has(messageID)) return state.messageTurns.get(messageID);
+              const turn = state.turns.get(sessionID);
+              return turn && { end: `idle_${messageID}`, ...turn };
+            }),
+      ),
     pendingApproval: (sessionID) => Effect.sync(() => state.approvals.get(sessionID)),
     recentMessages: (sessionID, limit) =>
       Effect.sync(() => (state.history.get(sessionID) ?? []).slice(-limit)),
+    message: ({ sessionID, messageID }) =>
+      Effect.suspend(() =>
+        state.readFailure
+          ? broken("history unavailable")
+          : Effect.sync(() => {
+              const item = state.history.get(sessionID)?.find((entry) => entry.id === messageID);
+              state.onMessage();
+              return item;
+            }),
+      ),
   });
 
   return { state, layer };

@@ -34,8 +34,17 @@ struct Message: Decodable, Equatable, Identifiable {
   let attachments: [Attachment]?
   /// The feed item the owner replied to, as the daemon read it when the message was sent.
   let feed: FeedItem?
+  var quote: MessageQuote? = nil
   let time: Double
   var reactions: [Reaction]?
+}
+
+struct MessageQuote: Decodable, Equatable {
+  let source: String
+  let id: String
+  let place: String
+  let author: String
+  let text: String
 }
 
 struct Reaction: Decodable, Equatable {
@@ -119,10 +128,10 @@ enum APIError: Error {
   }
 
   /// Queues the text, as a reply to a feed item when `feed` is its ID. Never retried on its own.
-  func post(_ dot: String, text: String, feed: Int? = nil) async throws -> String {
-    struct Request: Encodable { let text: String; let feed: Int? }
+  func post(_ dot: String, text: String, feed: Int? = nil, replyTo: String? = nil) async throws -> String {
+    struct Request: Encodable { let text: String; let feed: Int?; let replyTo: String? }
     struct Body: Decodable { let id: String }
-    let body = try JSONEncoder().encode(Request(text: text, feed: feed))
+    let body = try JSONEncoder().encode(Request(text: text, feed: feed, replyTo: replyTo))
     return try decode(Body.self, await send("POST", "/dots/\(escape(dot))/messages", body: body)).id
   }
 

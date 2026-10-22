@@ -188,6 +188,7 @@ export class OpenCode extends Context.Service<
       sessionID: string,
       limit: number,
     ) => Effect.Effect<readonly Entry[], OpenCodeError>;
+    readonly message: (ref: MessageRef) => Effect.Effect<Entry | undefined, OpenCodeError>;
   }
 >()("open-dot/OpenCode") {
   static readonly layer = Layer.effect(
@@ -300,6 +301,17 @@ export class OpenCode extends Context.Service<
             Effect.map((page) => page.data.flatMap(entry).toReversed()),
             Effect.mapError(failed(`Could not read session ${sessionID}`)),
           ),
+        message: ({ sessionID, messageID }) =>
+          client.session.message
+            .get({
+              sessionID: Session.ID.make(sessionID),
+              messageID: SessionMessage.ID.make(messageID),
+            })
+            .pipe(
+              Effect.map((item) => entry(item)[0]),
+              Effect.catchTag("MessageNotFoundError", () => Effect.succeed(undefined)),
+              Effect.mapError(failed(`Could not read message ${messageID}`)),
+            ),
       };
     }),
   );

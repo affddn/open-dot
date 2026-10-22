@@ -1,12 +1,12 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { SessionMessage } from "@opencode/client/effect";
-import { and, asc, eq, isNull, lte, ne } from "drizzle-orm";
+import { and, asc, eq, isNull, lte, ne, or, isNotNull } from "drizzle-orm";
 import { Effect } from "effect";
 import type { Db } from "./db";
 import { worktreeDirectory } from "./home";
 import { OpenCode, type Turn } from "./opencode";
-import { dots, outbox, reminders, type Worker, workers } from "./schema";
+import { dots, outbox, reminders, routeKey, type Worker, workers } from "./schema";
 import { queueReport } from "./slack-agents";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -47,6 +47,8 @@ export function claimDue(db: Db, now: number) {
       dueAt: reminders.dueAt,
       everyMinutes: reminders.everyMinutes,
       sessionID: dots.sessionID,
+      route: reminders.route,
+      dot: reminders.dot,
     })
     .from(reminders)
     .innerJoin(dots, eq(reminders.dot, dots.name))
@@ -72,11 +74,13 @@ export function claimDue(db: Db, now: number) {
       const repeat = reminder.everyMinutes
         ? ` (repeats every ${reminder.everyMinutes} minutes)`
         : "";
-      enqueue(
+      const message = enqueue(
         tx,
-        reminder.sessionID,
+        reminder.route?.sessionID ?? reminder.sessionID,
         `Reminder you scheduled for ${at}${repeat}:\n\n${reminder.text}`,
       );
+      if (reminder.route)
+        queueReport(tx, reminder.dot, message.text, message.messageID, reminder.route);
     });
   }
 }
@@ -89,6 +93,10 @@ export const deliver = (db: Db, message: Message) =>
   Effect.gen(function* () {
     const opencode = yield* OpenCode;
     const ref = { sessionID: message.sessionID, messageID: message.messageID };
+    db.update(outbox)
+      .set({ startedAt: message.startedAt ?? Date.now() })
+      .where(eq(outbox.id, message.id))
+      .run();
     if (!(yield* opencode.messageExists(ref))) {
       yield* opencode.queuePrompt({ ...ref, text: message.text });
     }
@@ -102,16 +110,52 @@ export const hasWork = (db: Db) =>
   db.select({ id: workers.id }).from(workers).where(ne(workers.state, "done")).get() !== undefined;
 
 export const deliverAll = (db: Db) =>
-  Effect.forEach(
-    db.select().from(outbox).where(eq(outbox.state, "pending")).orderBy(asc(outbox.id)).all(),
-    (message) =>
-      deliver(db, message).pipe(
+  Effect.gen(function* () {
+    const opencode = yield* OpenCode;
+    const rows = db
+      .select()
+      .from(outbox)
+      .where(
+        or(eq(outbox.state, "pending"), and(isNotNull(outbox.startedAt), isNull(outbox.turnEnd))),
+      )
+      .orderBy(asc(outbox.id))
+      .all();
+    for (const [sessionID, messages] of Object.entries(
+      Object.groupBy(rows, (row) => row.sessionID),
+    )) {
+      if (!messages) continue;
+      yield* Effect.gen(function* () {
+        let activeRoute: string | undefined;
+        for (const row of messages.filter((item) => item.startedAt !== null)) {
+          const turn = yield* opencode.turnAfter({ sessionID, messageID: row.messageID });
+          if (turn)
+            db.update(outbox)
+              .set({ turnEnd: turn.end, state: "sent" })
+              .where(eq(outbox.id, row.id))
+              .run();
+          else {
+            const key = routeKey(row.route);
+            if (activeRoute !== undefined && activeRoute !== key) return;
+            activeRoute = key;
+          }
+        }
+        // An independently started native turn must finish before a Slack route can enter it.
+        if (activeRoute === undefined && (yield* opencode.activeSessions).has(sessionID)) return;
+        for (const row of messages) {
+          const current = db.select().from(outbox).where(eq(outbox.id, row.id)).get();
+          if (!current || current.state !== "pending") continue;
+          const key = routeKey(current.route);
+          if (activeRoute !== undefined && key !== activeRoute) break;
+          yield* deliver(db, current);
+          activeRoute = key;
+        }
+      }).pipe(
         Effect.catch((error) =>
-          Effect.sync(() => console.error(`Message ${message.messageID}: ${error.message}`)),
+          Effect.sync(() => console.error(`Delivery ${sessionID}: ${error.message}`)),
         ),
-      ),
-    { discard: true },
-  );
+      );
+    }
+  });
 
 const headline = (task: string) => {
   const line = task.trim().split("\n")[0] ?? "";
@@ -191,10 +235,10 @@ const start = (db: Db, worker: Worker, dotSessionID: string) =>
         if (!failed) return;
         const report = enqueue(
           tx,
-          dotSessionID,
+          worker.route?.sessionID ?? dotSessionID,
           `Worker #${worker.id} could not start, because git could not create its worktree: ${error}\nTask: ${headline(worker.task)}`,
         );
-        queueReport(tx, worker.dot, report.text, report.messageID);
+        queueReport(tx, worker.dot, report.text, report.messageID, worker.route);
       });
       return;
     }
@@ -262,8 +306,8 @@ const check = (db: Db, worker: Worker, dotSessionID: string, active: ReadonlySet
         .get();
       if (!finished) return;
       // The owner also gets the report in the dot's own Slack DM, if it has one.
-      const report = enqueue(tx, dotSessionID, reportText(worker, turn));
-      queueReport(tx, worker.dot, report.text, report.messageID);
+      const report = enqueue(tx, worker.route?.sessionID ?? dotSessionID, reportText(worker, turn));
+      queueReport(tx, worker.dot, report.text, report.messageID, worker.route);
     });
   });
 

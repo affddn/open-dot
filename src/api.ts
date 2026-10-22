@@ -12,7 +12,18 @@ import {
   messageSources,
   saveReaction,
 } from "./reactions";
-import { type Dot, feed, type FeedItem, type FeedSnapshot, outbox, workers } from "./schema";
+import { quoted, quoteText, replyPrompt } from "./replies";
+import {
+  type Dot,
+  feed,
+  type FeedItem,
+  type FeedSnapshot,
+  type QuoteSnapshot,
+  outbox,
+  workers,
+} from "./schema";
+
+export { quoted } from "./replies";
 
 const error = (status: number, message: string) => Response.json({ error: message }, { status });
 
@@ -72,6 +83,15 @@ const conversation = (db: Db, dot: Dot) =>
       }
       const row = sent.get(item.id);
       const kind = messageKind(item.role, row);
+      if (row?.fromOwner && (row.quote || row.ownerText !== null))
+        return [
+          {
+            ...base,
+            kind: "owner",
+            text: row.quote?.prompt ?? row.ownerText ?? item.text,
+            quote: row.quote?.parent,
+          },
+        ];
       // A reply to a feed item shows the owner's prompt and the item's card, not the framing.
       if (row?.fromOwner && row.feed)
         return [{ ...base, kind: "owner", text: row.feed.prompt, feed: row.feed.item }];
@@ -177,13 +197,6 @@ const attachment = (dot: Dot, id: string, index: string) =>
 
 const sourceNames = { github: "GitHub", linear: "Linear", slack: "Slack" } as const;
 
-// JSON keeps each field on one line, and escaping <, > and & keeps a title from closing the block.
-export const quoted = (value: unknown) =>
-  JSON.stringify(value).replace(
-    /[<>&]/g,
-    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
-  );
-
 /** The owner's prompt is the instruction. The item follows it, framed as data. */
 const feedMessage = ({ prompt, item }: FeedSnapshot) => `${prompt}
 
@@ -227,12 +240,48 @@ const send = (db: Db, dot: Dot, request: Request) =>
     const text = "text" in fields && typeof fields.text === "string" ? fields.text.trim() : "";
     if (!text) return error(400, "Send a JSON body with a non-empty text.");
     const feedID = "feed" in fields ? fields.feed : undefined;
+    const replyTo = "replyTo" in fields ? fields.replyTo : undefined;
+    if (replyTo !== undefined && (typeof replyTo !== "string" || !replyTo || feedID !== undefined))
+      return error(400, "replyTo must be a message ID, without feed.");
     if (
       feedID !== undefined &&
       !(typeof feedID === "number" && Number.isSafeInteger(feedID) && feedID > 0)
     )
       return error(400, "feed must be a feed item's ID.");
     if (dot.sessionState !== "ready") return error(400, `${dot.name} isn't ready yet.`);
+    let quote: QuoteSnapshot | undefined;
+    if (typeof replyTo === "string") {
+      const target = yield* (yield* OpenCode).message({
+        sessionID: dot.sessionID,
+        messageID: replyTo,
+      });
+      const source = messageSources(db, dot.sessionID, [replyTo]).get(replyTo);
+      const kind = target && messageKind(target.role, source);
+      if (
+        !target ||
+        (source && source.state !== "sent") ||
+        (kind !== "owner" && kind !== "dot") ||
+        (!target.text &&
+          !target.files.length &&
+          !target.tools.some((tool) => tool.startsWith("dot_")))
+      )
+        return error(404, "There's no eligible reply target in this conversation.");
+      quote = {
+        prompt: text,
+        parent: {
+          source: "notch",
+          id: target.id,
+          place: dot.sessionID,
+          author: kind,
+          text: quoteText(
+            source?.quote?.prompt ?? source?.feed?.prompt ?? source?.ownerText ?? target.text,
+          ),
+        },
+      };
+    }
+    const current = findDot(db, dot.name);
+    if (current?.sessionID !== dot.sessionID || current.sessionState !== "ready")
+      return error(409, "The dot's conversation changed. Refresh before replying.");
     const row = db.transaction((tx) => {
       const item =
         typeof feedID === "number" ? tx.select().from(feed).where(eq(feed.id, feedID)).get() : null;
@@ -243,7 +292,8 @@ const send = (db: Db, dot: Dot, request: Request) =>
         .values({
           sessionID: dot.sessionID,
           messageID: SessionMessage.ID.create(),
-          text: reply ? feedMessage(reply) : text,
+          text: reply ? feedMessage(reply) : quote ? replyPrompt(quote) : text,
+          quote,
           state: "pending",
           fromOwner: true,
           feed: reply,

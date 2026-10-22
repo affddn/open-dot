@@ -1,11 +1,23 @@
 import { SessionMessage } from "@opencode/client/effect";
-import { and, asc, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, gte, or, ne } from "drizzle-orm";
 import { Cause, Effect, type Layer, Schema } from "effect";
 import type { Db } from "./db";
 import { listDots } from "./dots";
+import { quoted, quoteText, replyPrompt } from "./replies";
 import { type Fetch, output, type Source } from "./feed";
 import { OpenCode, type OpenCodeError, type Turn } from "./opencode";
-import { dots, outbox, slack, slackConfig, slackNotices } from "./schema";
+import {
+  dots,
+  outbox,
+  slack,
+  slackConfig,
+  slackNotices,
+  slackThreads,
+  slackPolls,
+  routeKey,
+  type Route,
+  type QuoteSnapshot,
+} from "./schema";
 
 type Kind = "bot" | "user" | "app";
 
@@ -112,6 +124,7 @@ export function slackClient(
   let announced: string | undefined;
   let bot: string | undefined;
   let botID: string | undefined;
+  let botTeam: string | undefined;
   let channel: string | undefined;
   let wrongBot = false;
   // The last refusal of a bot token check, so it's logged once.
@@ -122,7 +135,7 @@ export function slackClient(
   const forget = (kind: Kind) => {
     saved[kind].forget();
     if (kind === "user") owner = ownerName = team = userScopes = channel = undefined;
-    if (kind === "bot") bot = botID = channel = undefined;
+    if (kind === "bot") bot = botID = botTeam = channel = undefined;
   };
 
   /** One call with the given token, without any identity check. */
@@ -213,6 +226,7 @@ export function slackClient(
     }
     bot = body.user_id;
     botID = body.bot_id;
+    botTeam = typeof body.team_id === "string" ? body.team_id : undefined;
     wrongBot = false;
     return true;
   };
@@ -226,6 +240,7 @@ export function slackClient(
     kind: Kind,
     method: string,
     params: Record<string, string> = {},
+    guard?: () => boolean,
   ): Promise<Answer | undefined> => {
     const token = await saved[kind].get();
     if (!token) return undefined;
@@ -243,6 +258,7 @@ export function slackClient(
       unchecked = undefined;
       if (method === "auth.test") return { kind: "ok", body: { user_id: bot, bot_id: botID } };
     }
+    if (guard && !guard()) return undefined;
     return send(kind, token, method, params);
   };
 
@@ -276,6 +292,7 @@ export function slackClient(
     ownerName: () => ownerName,
     /** The owner's workspace from the user token's auth.test, once it has run. */
     team: () => team,
+    knownOwner: () => owner,
     /** Whether the user token has `scope`, or undefined while Slack hasn't said. */
     userScope: (scope: string) => userScopes?.has(scope),
     /** The bot's own user ID, from the bot token. Undefined when the token isn't fit to use. */
@@ -289,6 +306,7 @@ export function slackClient(
     },
     /** The bot's bot ID, once its token has been checked. */
     botID: () => botID,
+    botTeam: () => botTeam,
     /** Drops a token, so the Keychain is read again a minute later. */
     forget,
     /** The owner's DM with the bot. Opening it again returns the same conversation. */
@@ -350,6 +368,25 @@ export async function history(client: Slack, channel: string, params: Record<str
   }
 }
 
+export async function thread(client: Slack, channel: string, ts: string, metadata = false) {
+  const messages: (typeof HistoryMessage.Type)[] = [];
+  for (let cursor = ""; ;) {
+    const body = await client.read("bot", "conversations.replies", {
+      channel,
+      ts,
+      limit: "100",
+      ...(metadata && { include_all_metadata: "true" }),
+      ...(cursor && { cursor }),
+    });
+    if (!body) throw new Error("Slack thread could not be read");
+    const page = Schema.decodeUnknownSync(History)(body);
+    messages.push(...page.messages);
+    cursor = page.response_metadata?.next_cursor ?? "";
+    if (!cursor && body.has_more === true) throw new Error("A thread page had no cursor");
+    if (!cursor) return messages;
+  }
+}
+
 export const replyEvent = "open_dot_reply";
 
 export const replyID = (message: typeof HistoryMessage.Type) => {
@@ -366,30 +403,122 @@ const addressed = /^(?:@([a-z][a-z0-9-]*)[\s:,]|([a-z][a-z0-9-]*)[:,])\s*/i;
  * The dot is the one the message names, or the one last messaged from Slack, or the first.
  * False when there's no dot.
  */
-export function receive(db: Db, channel: string, ts: string, text: string) {
+export function receive(
+  db: Db,
+  channel: string,
+  ts: string,
+  text: string,
+  origin?: {
+    owner: string;
+    team: string;
+    bot: string;
+    thread: string;
+    parent?: QuoteSnapshot["parent"] | null;
+  },
+) {
   const ready = listDots(db).filter((dot) => dot.sessionState === "ready");
+  const pinned =
+    origin &&
+    db
+      .select()
+      .from(slackThreads)
+      .all()
+      .find(
+        ({ route }) =>
+          route.kind === "shared" &&
+          route.channel === channel &&
+          route.thread === origin.thread &&
+          route.owner === origin.owner &&
+          route.team === origin.team &&
+          route.bot === origin.bot,
+      );
+  if (origin && origin.thread !== ts && !pinned) return false;
   const match = addressed.exec(text);
   const name = (match?.[1] ?? match?.[2])?.toLowerCase();
   const named = ready.find((dot) => dot.name === name);
-  const last = db.select({ dot: slack.dot }).from(slack).orderBy(desc(slack.ts)).limit(1).get();
-  const dot = named ?? ready.find((candidate) => candidate.name === last?.dot) ?? ready[0];
+  const last = db
+    .select()
+    .from(slack)
+    .where(eq(slack.channel, channel))
+    .orderBy(desc(slack.ts))
+    .all()
+    .find(
+      (row) =>
+        /^\d+\.\d+$/.test(row.ts) &&
+        (!origin ||
+          !row.route ||
+          (row.route.owner === origin.owner &&
+            row.route.team === origin.team &&
+            row.route.bot === origin.bot)),
+    );
+  const dot = pinned
+    ? ready.find(
+        (candidate) =>
+          candidate.name === pinned.route.dot && candidate.sessionID === pinned.route.sessionID,
+      )
+    : (named ?? ready.find((candidate) => candidate.name === last?.dot) ?? ready[0]);
   if (!dot) return false;
-  const body = (named && match ? text.slice(match[0].length) : text).trim();
+  const body = (!pinned && named && match ? text.slice(match[0].length) : text).trim();
   if (!body) return true;
+  const route: Route | null = origin
+    ? (pinned?.route ?? {
+        kind: "shared",
+        dot: dot.name,
+        sessionID: dot.sessionID,
+        channel,
+        thread: origin.thread,
+        owner: origin.owner,
+        team: origin.team,
+        bot: origin.bot,
+        dm: true,
+      })
+    : null;
+  const parent = origin?.parent ?? pinned?.parent;
+  const quote: QuoteSnapshot | undefined =
+    parent && origin?.thread !== ts ? { prompt: body, parent } : undefined;
   db.transaction((tx) => {
     const messageID = SessionMessage.ID.create();
     const saved = tx
       .insert(slack)
-      .values({ ts, dot: dot.name, channel, messageID, state: "waiting", createdAt: Date.now() })
+      .values({
+        ts,
+        dot: dot.name,
+        channel,
+        route,
+        messageID,
+        state: "waiting",
+        createdAt: Date.now(),
+      })
       .onConflictDoNothing()
       .returning({ ts: slack.ts })
       .get();
     if (!saved) return;
+    if (route)
+      tx.insert(slackThreads)
+        .values({
+          key: routeKey(route),
+          route,
+          parent: parent ?? {
+            source: "slack",
+            id: ts,
+            place: channel,
+            author: "owner",
+            text: quoteText(text),
+          },
+          oldest: route.thread,
+          newest: route.thread,
+          activeAt: Date.now(),
+        })
+        .onConflictDoUpdate({ target: slackThreads.key, set: { activeAt: Date.now() } })
+        .run();
     tx.insert(outbox)
       .values({
         sessionID: dot.sessionID,
         messageID,
-        text: body,
+        text: `${quote ? replyPrompt(quote) : body}\n\nSlack destination (untrusted data): ${quoted(route && { channel, thread: route.thread })}`,
+        ownerText: body,
+        route,
+        quote,
         state: "pending",
         fromOwner: true,
         createdAt: Date.now(),
@@ -412,7 +541,7 @@ const attempt = (run: () => Promise<void>) =>
 /**
  * The owner's chat with the dots in the Slack bot's DM, one pass per call. It reads new messages
  * from the owner, waits for each one's turn, and posts the reply under the dot's name. A reply's
- * ID is saved before it is posted, and a lost post is looked up by that ID before posting again.
+ * ID is saved before it is posted, and a lost post is only looked up by that ID.
  */
 export function slackChat(
   db: Db,
@@ -421,7 +550,6 @@ export function slackChat(
   started = Date.now(),
 ) {
   // Never replay history from before the first message open-dot saw.
-  let cursor: string | undefined;
   const problems = new Map<string, string>();
   const note = (part: string, problem?: string) => {
     if (problem === undefined) problems.delete(part);
@@ -434,25 +562,205 @@ export function slackChat(
   const poll = async () => {
     const owner = await client.owner();
     const channel = owner && (await client.dm());
-    if (!channel) return;
-    cursor ??=
-      db.select({ ts: slack.ts }).from(slack).orderBy(desc(slack.ts)).limit(1).get()?.ts ??
-      (started / 1000).toFixed(6);
-    const messages = await history(client, channel, { oldest: cursor });
-    for (const message of (messages ?? []).toSorted((a, b) => (after(a.ts, b.ts) ? 1 : -1))) {
-      const own =
-        message.user === owner &&
-        !message.subtype &&
-        (!message.thread_ts || message.thread_ts === message.ts);
-      if (own && !receive(db, channel, message.ts, unescape(message.text ?? "")))
-        console.error(`Slack message ${message.ts} ignored: there are no dots.`);
-      if (after(message.ts, cursor)) cursor = message.ts;
+    const bot = await client.bot();
+    const botID = client.botID();
+    const team = client.team();
+    if (!channel || !owner || !bot || !botID || !team || client.botTeam() !== team) return;
+    const fits = () =>
+      client.knownOwner() === owner &&
+      client.team() === team &&
+      client.botID() === botID &&
+      client.botTeam() === team;
+    const key = JSON.stringify([owner, team, botID, channel]);
+    const baseline =
+      db
+        .select()
+        .from(slack)
+        .all()
+        .filter(
+          (row) =>
+            row.channel === channel &&
+            /^\d+\.\d+$/.test(row.ts) &&
+            (!row.route || row.route.thread === row.ts),
+        )
+        .map((row) => row.ts)
+        .toSorted((a, b) => (after(a, b) ? -1 : 1))[0] ?? (started / 1000).toFixed(6);
+    db.insert(slackPolls)
+      .values({ key, oldest: baseline, newest: baseline })
+      .onConflictDoNothing()
+      .run();
+    const scan = db.select().from(slackPolls).where(eq(slackPolls.key, key)).get();
+    if (!scan) throw new Error("The saved Slack polling checkpoint is missing");
+    const continuation = scan.cursor
+      ? Schema.decodeUnknownSync(
+          Schema.Struct({
+            cursor: Schema.String,
+            messages: Schema.Array(Schema.Struct({ ts: Schema.String, text: Schema.String })),
+          }),
+        )(JSON.parse(scan.cursor))
+      : { cursor: "", messages: [] };
+    const topBody = await client
+      .read("bot", "conversations.history", {
+        channel,
+        oldest: scan.oldest,
+        limit: "100",
+        ...(continuation.cursor && { cursor: continuation.cursor }),
+      })
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.message === "conversations.history: invalid_cursor")
+          db.update(slackPolls).set({ cursor: "" }).where(eq(slackPolls.key, key)).run();
+        throw error;
+      });
+    if (!topBody || !fits()) return;
+    const top = Schema.decodeUnknownSync(History)(topBody);
+    const topNext = top.response_metadata?.next_cursor ?? "";
+    if (!topNext && topBody.has_more === true) throw new Error("A history page had no cursor");
+    db.transaction(() => {
+      let newest = scan.newest;
+      const pending = [...continuation.messages];
+      for (const message of top.messages.toSorted((a, b) => (after(a.ts, b.ts) ? 1 : -1))) {
+        const own =
+          message.user === owner &&
+          !message.bot_id &&
+          !message.subtype &&
+          (!message.thread_ts || message.thread_ts === message.ts);
+        if (own) pending.push({ ts: message.ts, text: unescape(message.text ?? "") });
+        if (after(message.ts, newest)) newest = message.ts;
+      }
+      // Slack history pages run backwards. Delay routing until the scan is complete, so a name on
+      // an older page still selects the dot for an unprefixed message on a newer page.
+      if (!topNext)
+        for (const message of pending.toSorted((a, b) => (after(a.ts, b.ts) ? 1 : -1))) {
+          if (
+            !receive(db, channel, message.ts, message.text, {
+              owner,
+              team,
+              bot: botID,
+              thread: message.ts,
+            })
+          )
+            console.error(`Slack message ${message.ts} ignored: there are no dots.`);
+        }
+      db.update(slackPolls)
+        .set({
+          newest,
+          oldest: topNext ? scan.oldest : newest,
+          cursor: topNext ? JSON.stringify({ cursor: topNext, messages: pending }) : "",
+        })
+        .where(eq(slackPolls.key, key))
+        .run();
+    });
+    // Four one-page visits per tick, least recently polled first; unfinished scans survive restarts.
+    const threads = db
+      .select()
+      .from(slackThreads)
+      .where(
+        or(
+          gte(slackThreads.activeAt, Date.now() - 7 * 86400_000),
+          ne(slackThreads.cursor, ""),
+          eq(slackThreads.rescan, true),
+        ),
+      )
+      .orderBy(asc(slackThreads.polledAt), asc(slackThreads.key))
+      .all()
+      .filter(
+        ({ route }) =>
+          route.kind === "shared" &&
+          route.owner === owner &&
+          route.team === team &&
+          route.bot === botID &&
+          route.channel === channel,
+      )
+      .slice(0, 4);
+    for (const saved of threads) {
+      const last =
+        db
+          .select({ at: slackThreads.polledAt })
+          .from(slackThreads)
+          .orderBy(desc(slackThreads.polledAt))
+          .limit(1)
+          .get()?.at ?? 0;
+      db.update(slackThreads)
+        .set({ polledAt: Math.max(Date.now(), last + 1) })
+        .where(eq(slackThreads.key, saved.key))
+        .run();
+      const pageBody = await client
+        .read("bot", "conversations.replies", {
+          channel,
+          ts: saved.route.thread,
+          oldest: saved.oldest,
+          limit: "100",
+          ...(saved.cursor && { cursor: saved.cursor }),
+        })
+        .catch((error: unknown) => {
+          if (error instanceof Error && error.message === "conversations.replies: invalid_cursor")
+            db.update(slackThreads)
+              .set({ cursor: "", rescan: true })
+              .where(eq(slackThreads.key, saved.key))
+              .run();
+          throw error;
+        });
+      if (!pageBody || !fits()) return;
+      const page = Schema.decodeUnknownSync(History)(pageBody);
+      const next = page.response_metadata?.next_cursor ?? "";
+      if (!next && pageBody.has_more === true) throw new Error("A thread page had no cursor");
+      const root = page.messages.find((message) => message.ts === saved.route.thread);
+      const parent =
+        saved.parent ??
+        (root
+          ? {
+              source: "slack" as const,
+              id: root.ts,
+              place: channel,
+              author:
+                root.user === owner
+                  ? ("owner" as const)
+                  : root.bot_id === botID
+                    ? ("dot" as const)
+                    : ("other" as const),
+              text: quoteText(unescape(root.text ?? "")),
+            }
+          : null);
+      db.transaction(() => {
+        let newest = saved.newest;
+        for (const message of page.messages.toSorted((a, b) => (after(a.ts, b.ts) ? 1 : -1))) {
+          if (after(message.ts, newest)) newest = message.ts;
+          if (
+            message.ts !== saved.route.thread &&
+            message.user === owner &&
+            !message.bot_id &&
+            !message.subtype
+          )
+            receive(db, channel, message.ts, unescape(message.text ?? ""), {
+              owner,
+              team,
+              bot: botID,
+              thread: saved.route.thread,
+              parent,
+            });
+        }
+        db.update(slackThreads)
+          .set({
+            cursor: next,
+            rescan: false,
+            newest,
+            oldest: next ? saved.oldest : newest,
+            parent,
+          })
+          .where(eq(slackThreads.key, saved.key))
+          .run();
+      });
     }
   };
 
   const finish = Effect.gen(function* () {
     const waiting = db
-      .select({ ts: slack.ts, messageID: slack.messageID, sessionID: dots.sessionID })
+      .select({
+        ts: slack.ts,
+        messageID: slack.messageID,
+        sessionID: outbox.sessionID,
+        route: slack.route,
+      })
       .from(slack)
       .innerJoin(dots, eq(slack.dot, dots.name))
       .innerJoin(outbox, eq(slack.messageID, outbox.messageID))
@@ -468,7 +776,7 @@ export function slackChat(
         // The session may already be busy with a later message, so only this turn's end counts.
         const turn = yield* opencode.turnAfter(row);
         if (!turn) continue;
-        const key = `${row.sessionID} ${turn.end}`;
+        const key = `${row.sessionID} ${routeKey(row.route)} ${turn.end}`;
         ended.set(key, [...(ended.get(key) ?? []), { ts: row.ts, turn }]);
       }
       for (const group of ended.values()) {
@@ -513,36 +821,66 @@ export function slackChat(
       .all();
     for (const row of rows) {
       if (!row.replyID || row.replyText === null) continue;
+      const bot = await client.bot();
+      const botID = client.botID();
+      if (!bot || !botID) continue;
+      if (row.route) await client.owner();
+      const fits = () =>
+        client.botID() === botID &&
+        (!row.route ||
+          (row.route.kind === "shared" &&
+            row.route.owner === client.knownOwner() &&
+            row.route.team === client.team() &&
+            row.route.team === client.botTeam() &&
+            row.route.bot === botID &&
+            db
+              .select()
+              .from(dots)
+              .where(and(eq(dots.name, row.dot), eq(dots.sessionState, "ready")))
+              .get()?.sessionID === row.route.sessionID));
+      if (!fits()) continue;
       if (row.state === "unknown") {
-        const messages = await history(client, row.channel, {
-          oldest: row.ts,
-          include_all_metadata: "true",
-        });
+        const messages = row.route
+          ? await thread(client, row.channel, row.route.thread, true)
+          : await history(client, row.channel, {
+              oldest: row.ts,
+              include_all_metadata: "true",
+            });
         if (!messages) return;
-        const found = messages.find((message) => replyID(message) === row.replyID);
-        settle(
-          row.ts,
-          "unknown",
-          found ? { state: "posted", replyTS: found.ts } : { state: "posting" },
+        const found = messages.find(
+          (message) => replyID(message) === row.replyID && message.bot_id === botID,
         );
+        if (found && fits()) settle(row.ts, "unknown", { state: "posted", replyTS: found.ts });
         continue;
       }
       // From here a crash leaves the row "unknown", so it's looked up rather than posted again.
       if (!settle(row.ts, "posting", { state: "unknown" })) continue;
-      const answer = await client.call("bot", "chat.postMessage", {
-        channel: row.channel,
-        username: row.dot,
-        markdown_text: clip(row.replyText),
-        metadata: JSON.stringify({
-          event_type: replyEvent,
-          event_payload: { reply_id: row.replyID },
-        }),
-      });
+      const answer = await client.call(
+        "bot",
+        "chat.postMessage",
+        {
+          channel: row.channel,
+          ...(row.route && { thread_ts: row.route.thread }),
+          username: row.dot,
+          markdown_text: clip(row.replyText),
+          metadata: JSON.stringify({
+            event_type: replyEvent,
+            event_payload: { reply_id: row.replyID },
+          }),
+        },
+        fits,
+      );
       if (answer?.kind === "ok") {
         const ts = typeof answer.body.ts === "string" ? answer.body.ts : null;
         settle(row.ts, "unknown", { state: "posted", replyTS: ts });
-      } else if (answer?.kind === "lost") {
-        console.error(`Slack reply to ${row.ts} is unknown, looking it up: ${answer.reason}`);
+      } else if (
+        answer?.kind === "lost" ||
+        (answer?.kind === "refused" &&
+          ["fatal_error", "internal_error", "service_unavailable", "request_timeout"].includes(
+            answer.error,
+          ))
+      ) {
+        console.error(`Slack reply to ${row.ts} is unknown, lookup only`);
       } else if (!answer || answer.error === "ratelimited") {
         // Nothing was sent, so it's posted on a later pass.
         settle(row.ts, "unknown", { state: "posting" });

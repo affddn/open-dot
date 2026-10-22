@@ -8,6 +8,7 @@ struct Pending: Identifiable {
   let sentAt = Date().timeIntervalSince1970 * 1000
   /// The feed item it replies to.
   var feed: FeedItem?
+  var quote: MessageQuote?
   var messageID: String?
   var error: String?
 }
@@ -20,6 +21,8 @@ struct Pending: Identifiable {
   var messages: [String: [Message]] = [:]
   var pending: [String: [Pending]] = [:]
   var drafts: [String: String] = [:]
+  var replyTargets: [String: MessageQuote] = [:]
+  var sending: Set<String> = []
   var expanded = false
   var feed: [FeedItem] = []
   var handedOff: [FeedItem] = []
@@ -97,20 +100,33 @@ struct Pending: Identifiable {
   }
 
   func send() {
-    guard let name = selected else { return }
-    let text = (drafts[name] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let name = selected, !sending.contains(name) else { return }
+    let draft = drafts[name] ?? ""
+    let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty else { return }
-    drafts[name] = nil
-    let item = Pending(text: text)
+    let quote = replyTargets[name]
+    let item = Pending(text: text, quote: quote)
     pending[name, default: []].append(item)
+    sending.insert(name)
     Task {
+      defer { sending.remove(name) }
       do {
-        let id = try await api.post(name, text: text)
+        let id = try await api.post(name, text: text, replyTo: quote?.id)
         update(name, item.id) { $0.messageID = id }
+        if drafts[name] == draft && replyTargets[name] == quote {
+          drafts[name] = nil
+          replyTargets[name] = nil
+        }
       } catch {
         update(name, item.id) { $0.error = Self.describe(error) }
       }
     }
+  }
+
+  func reply(_ name: String, to message: Message) {
+    guard message.kind == "owner" || message.kind == "dot" else { return }
+    replyTargets[name] = MessageQuote(source: "notch", id: message.id, place: name,
+      author: message.kind, text: String(message.text.prefix(240)))
   }
 
   static let startPrompt = "Take this on. Work out what it needs and get it done, delegating a worker or tracking it as a responsibility if it's more than a quick answer. Tell me what you decide."
