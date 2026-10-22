@@ -1,12 +1,15 @@
 import { beforeEach, expect, spyOn, test } from "bun:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Effect, Layer } from "effect";
 import { api } from "../src/api";
 import { step } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
 import { type Attachment, OpenCode, OpenCodeError } from "../src/opencode";
-import { dots, feed, outbox, reactions, workers } from "../src/schema";
+import { dots, feed, hiddenMessages, outbox, reactions, workers } from "../src/schema";
 import { fakeOpenCode } from "./fake-opencode";
 
 let db: Db;
@@ -347,6 +350,48 @@ test("an image's bytes come only from a message in the dot's own session, with t
   expect((await get("msg_1/attachments/0", { method: "POST" })).status).toBe(404);
   expect((await get("msg_1/attachments/0/more")).status).toBe(404);
   expect((await get("msg_1")).status).toBe(404);
+});
+
+const pinnedImage = (query = "") => call(`/dots/jojo/messages/msg_same/attachments/0${query}`);
+
+test("a session-pinned image read refuses a wrong or rebinding session, and unpinned reads still work", async () => {
+  const other = Buffer.from([...png.subarray(0, 8), 9, 9, 9]);
+  attached("msg_same", [file("image/png", png)]);
+  attached("msg_same", [file("image/png", other)], "ses_new");
+  const pinned = await pinnedImage("?sessionID=ses_jojo");
+  expect(pinned.status).toBe(200);
+  expect(Buffer.from(await pinned.arrayBuffer())).toEqual(png);
+  for (const query of ["?sessionID=", `?sessionID=${"s".repeat(256)}`])
+    expect((await pinnedImage(query)).status).toBe(400);
+
+  // The notch captured ses_jojo, but the dot was rebound before it asked.
+  db.update(dots).set({ sessionID: "ses_new" }).where(eq(dots.name, "jojo")).run();
+  let reads = 0;
+  fake.state.onRecent = () => {
+    reads += 1;
+  };
+  expect((await pinnedImage("?sessionID=ses_jojo")).status).toBe(409);
+  expect(reads).toBe(0);
+  // Without a session, older thumbnail clients get the current binding's bytes, as before.
+  const legacy = await pinnedImage();
+  expect(legacy.status).toBe(200);
+  expect(Buffer.from(await legacy.arrayBuffer())).toEqual(other);
+  expect(reads).toBe(1);
+
+  // A rebinding during the read refuses rather than returning bytes for a session it left.
+  fake.state.onRecent = () => {
+    db.update(dots).set({ sessionID: "ses_jojo" }).where(eq(dots.name, "jojo")).run();
+  };
+  expect((await pinnedImage("?sessionID=ses_new")).status).toBe(409);
+  fake.state.onRecent = () => {};
+  const again = await pinnedImage("?sessionID=ses_jojo");
+  expect(again.status).toBe(200);
+  expect(Buffer.from(await again.arrayBuffer())).toEqual(png);
+
+  db.update(dots).set({ sessionState: "creating" }).where(eq(dots.name, "jojo")).run();
+  expect((await pinnedImage("?sessionID=ses_jojo")).status).toBe(409);
+  expect((await pinnedImage()).status).toBe(404);
+  expect(fake.state.prompted).toEqual([]);
 });
 
 test("only an inline image of an allowed type, matching bytes and size is served, and nothing is fetched", async () => {
@@ -770,4 +815,188 @@ test("replies to several dots list each dot once, and a bad or unknown feed ID q
     expect((await reply("jojo", { text: "Hi", feed: bad })).status).toBe(400);
   expect((await reply("jojo", { text: " ", feed: item.id })).status).toBe(400);
   expect(db.select().from(outbox).all()).toHaveLength(3);
+});
+
+const hideMessage = (id: string, body: unknown = { sessionID: "ses_jojo", hidden: true }) =>
+  call(`/dots/jojo/messages/${id}/hidden`, {
+    method: "PUT",
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  });
+
+const listed = async () => {
+  const body = (await (await call("/dots/jojo/messages")).json()) as {
+    messages: { id: string; kind: string; sessionID: string; hidden: boolean }[];
+  };
+  return body.messages;
+};
+
+test("hiding works for every visible kind, keeps its first time, and changes no delivery, reaction, image or reply", async () => {
+  queued("msg_owner", "owner", { fromOwner: true });
+  queued("msg_notice", "Reminder", {});
+  queued("msg_peer", "framed", { fromDot: "polnareff" });
+  fake.state.history.set("ses_jojo", [
+    entry("msg_owner", "user", "owner", [], [file("image/png", png, "shot.png")]),
+    entry("msg_notice", "user", "Reminder"),
+    entry("msg_peer", "user", "framed"),
+    entry("msg_answer", "assistant", "answer"),
+    entry("msg_kept", "assistant", "kept"),
+  ]);
+  db.insert(reactions)
+    .values({
+      dot: "jojo",
+      sessionID: "ses_jojo",
+      messageID: "msg_owner",
+      actor: "dot",
+      emoji: "❤️",
+      excerpt: "owner",
+      updatedAt: 1,
+    })
+    .run();
+  const outboxBefore = db.select().from(outbox).all();
+  const reactionsBefore = db.select().from(reactions).all();
+  const historyBefore = structuredClone(fake.state.history.get("ses_jojo"));
+  const hidden = ["msg_owner", "msg_notice", "msg_peer", "msg_answer"];
+  const now = spyOn(Date, "now").mockReturnValue(1_000);
+  try {
+    for (const id of hidden) {
+      const response = await hideMessage(id);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        hidden: { dot: "jojo", sessionID: "ses_jojo", messageID: id, hiddenAt: 1_000 },
+      });
+    }
+    now.mockReturnValue(2_000);
+    expect(await (await hideMessage("msg_answer")).json()).toMatchObject({
+      hidden: { messageID: "msg_answer", hiddenAt: 1_000 },
+    });
+  } finally {
+    now.mockRestore();
+  }
+  const markers = db.select().from(hiddenMessages).all();
+  expect(markers).toHaveLength(4);
+  // Hidden messages stay in the response, so the notch can still match pending sends by ID.
+  expect(await listed()).toMatchObject([
+    { id: "msg_owner", kind: "owner", sessionID: "ses_jojo", hidden: true },
+    { id: "msg_notice", kind: "notice", sessionID: "ses_jojo", hidden: true },
+    { id: "msg_peer", kind: "peer", sessionID: "ses_jojo", hidden: true },
+    { id: "msg_answer", kind: "dot", sessionID: "ses_jojo", hidden: true },
+    { id: "msg_kept", kind: "dot", sessionID: "ses_jojo", hidden: false },
+  ]);
+  expect((await listed())[0]).toMatchObject({ reactions: [{ actor: "dot", emoji: "❤️" }] });
+  expect(db.select().from(outbox).all()).toEqual(outboxBefore);
+  expect(db.select().from(reactions).all()).toEqual(reactionsBefore);
+  expect(fake.state.history.get("ses_jojo")).toEqual(historyBefore);
+  expect(fake.state.prompted).toEqual([]);
+
+  // Hiding is display state, not deletion or revoked authority.
+  expect((await call("/dots/jojo/messages/msg_owner/attachments/0")).status).toBe(200);
+  expect((await putReaction("👍")).status).toBe(200);
+  expect((await reply("jojo", { text: "Why?", replyTo: "msg_answer" })).status).toBe(202);
+  expect(db.select().from(hiddenMessages).all()).toEqual(markers);
+});
+
+test("hiding rejects bad auth, shapes, sessions, targets and undelivered rows without a marker", async () => {
+  db.insert(outbox)
+    .values({
+      sessionID: "ses_jojo",
+      messageID: "msg_pending",
+      text: "Hi",
+      state: "pending",
+      fromOwner: true,
+      createdAt: 0,
+    })
+    .run();
+  fake.state.history.set("ses_jojo", [
+    entry("msg_pending", "user", "Hi"),
+    entry("msg_tools", "assistant", "", ["read"]),
+    entry("msg_answer", "assistant", "answer"),
+  ]);
+  fake.state.history.set("ses_polnareff", [entry("msg_foreign", "assistant", "foreign")]);
+  const path = "/dots/jojo/messages/msg_answer/hidden";
+  const valid = JSON.stringify({ sessionID: "ses_jojo", hidden: true });
+  const wrong = { authorization: "Bearer wrong" };
+  expect((await call(path, { method: "PUT", body: valid, headers: wrong })).status).toBe(401);
+  for (const body of [
+    "{",
+    "null",
+    "[]",
+    "{}",
+    { sessionID: "ses_jojo" },
+    { hidden: true },
+    { sessionID: "ses_jojo", hidden: false },
+    { sessionID: "ses_jojo", hidden: "true" },
+    { sessionID: 1, hidden: true },
+    { sessionID: "", hidden: true },
+    { sessionID: "x".repeat(256), hidden: true },
+    { sessionID: "ses_jojo", hidden: true, text: "forged" },
+  ])
+    expect((await hideMessage("msg_answer", body)).status).toBe(400);
+  const padded = { sessionID: "ses_jojo", hidden: true, pad: "x".repeat(2048) };
+  expect((await hideMessage("msg_answer", padded)).status).toBe(413);
+  const other = { sessionID: "ses_other", hidden: true };
+  expect((await hideMessage("msg_answer", other)).status).toBe(409);
+  for (const id of ["msg_tools", "msg_missing", "msg_foreign", "m".repeat(256)])
+    expect((await hideMessage(id)).status).toBe(404);
+  expect((await hideMessage("msg_pending")).status).toBe(409);
+  expect((await call(path, { method: "POST", body: valid })).status).toBe(404);
+  const down = Layer.effect(OpenCode, Effect.fail(new OpenCodeError({ message: "Not running" })));
+  expect((await call(path, { method: "PUT", body: valid }, down)).status).toBe(503);
+  db.update(dots).set({ sessionState: "creating" }).where(eq(dots.name, "jojo")).run();
+  expect((await hideMessage("msg_answer")).status).toBe(409);
+  expect(db.select().from(hiddenMessages).all()).toEqual([]);
+  expect(fake.state.prompted).toEqual([]);
+});
+
+test("a rebinding during a hide or a read refuses rather than redirecting", async () => {
+  fake.state.history.set("ses_jojo", [entry("msg_answer", "assistant", "answer")]);
+  fake.state.history.set("ses_new", [entry("msg_answer", "assistant", "other")]);
+  fake.state.onRecent = () => {
+    db.update(dots).set({ sessionID: "ses_new" }).where(eq(dots.name, "jojo")).run();
+  };
+  expect((await hideMessage("msg_answer")).status).toBe(409);
+  db.update(dots).set({ sessionID: "ses_jojo" }).where(eq(dots.name, "jojo")).run();
+  expect((await call("/dots/jojo/messages")).status).toBe(409);
+  fake.state.onRecent = () => {};
+  expect(db.select().from(hiddenMessages).all()).toEqual([]);
+  expect(await listed()).toMatchObject([{ id: "msg_answer", sessionID: "ses_new", hidden: false }]);
+});
+
+test("a marker survives reopening and doesn't follow the same message ID into a new session", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-hidden-"));
+  const path = join(directory, "open-dot.db");
+  db = openDatabase(path);
+  try {
+    db.insert(dots)
+      .values({
+        name: "jojo",
+        directory: "/dots/jojo",
+        sessionID: "ses_jojo",
+        sessionState: "ready",
+        createdAt: 0,
+      })
+      .run();
+    fake.state.history.set("ses_jojo", [entry("msg_same", "assistant", "first")]);
+    expect((await hideMessage("msg_same")).status).toBe(200);
+    db.$client.close();
+    db = openDatabase(path);
+    const kept = await listed();
+    expect(kept).toMatchObject([{ id: "msg_same", sessionID: "ses_jojo", hidden: true }]);
+    db.update(dots).set({ sessionID: "ses_next" }).where(eq(dots.name, "jojo")).run();
+    fake.state.history.set("ses_next", [entry("msg_same", "assistant", "second")]);
+    const rebound = await listed();
+    expect(rebound).toMatchObject([{ id: "msg_same", sessionID: "ses_next", hidden: false }]);
+    expect((await hideMessage("msg_same")).status).toBe(409);
+    const next = { sessionID: "ses_next", hidden: true };
+    expect((await hideMessage("msg_same", next)).status).toBe(200);
+    expect(
+      db
+        .select()
+        .from(hiddenMessages)
+        .all()
+        .map((row) => row.sessionID),
+    ).toEqual(["ses_jojo", "ses_next"]);
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

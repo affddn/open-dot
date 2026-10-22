@@ -25,6 +25,7 @@ export function fakeOpenCode() {
     messageTurns: new Map<string, Turn>(),
     readFailure: false,
     onMessage: () => {},
+    onRecent: () => {},
     approvals: new Map<string, Approval>(),
     history: new Map<string, Entry[]>(),
     create: "ok" as "ok" | "fail",
@@ -62,7 +63,11 @@ export function fakeOpenCode() {
       ),
     pendingApproval: (sessionID) => Effect.sync(() => state.approvals.get(sessionID)),
     recentMessages: (sessionID, limit) =>
-      Effect.sync(() => (state.history.get(sessionID) ?? []).slice(-limit)),
+      Effect.sync(() => {
+        const items = (state.history.get(sessionID) ?? []).slice(-limit);
+        state.onRecent();
+        return items;
+      }),
     message: ({ sessionID, messageID }) =>
       Effect.suspend(() =>
         state.readFailure

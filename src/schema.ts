@@ -161,6 +161,23 @@ export const reactions = sqliteTable(
 
 export type Reaction = typeof reactions.$inferSelect;
 
+/**
+ * Messages the owner deleted from the notch chat, in the session they were seen in. Only the notch
+ * hides them: OpenCode history, the dot's context, reactions and delivery are unchanged.
+ */
+export const hiddenMessages = sqliteTable(
+  "hidden_messages",
+  {
+    dot: text()
+      .notNull()
+      .references(() => dots.name),
+    sessionID: text("session_id").notNull(),
+    messageID: text("message_id").notNull(),
+    hiddenAt: integer("hidden_at").notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.dot, table.sessionID, table.messageID] })],
+);
+
 export const notes = sqliteTable("notes", {
   id: integer().primaryKey({ autoIncrement: true }),
   dot: text()

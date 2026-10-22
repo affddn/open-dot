@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,7 @@ import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { openDatabase } from "../src/db";
 import {
   feed,
+  hiddenMessages,
   outbox,
   reactions,
   slack,
@@ -22,6 +24,49 @@ import {
   type Route,
   type QuoteSnapshot,
 } from "../src/schema";
+
+const repoMigrations = join(import.meta.dir, "..", "drizzle");
+
+type LedgerRow = { seq: number; id: unknown; hash: string; created_at: number };
+
+function ledgerOf(sqlite: Database) {
+  return sqlite
+    .query<LedgerRow, []>("select rowid as seq, * from __drizzle_migrations order by rowid")
+    .all();
+}
+
+// Every repository migration from `tag` on, as drizzle's migrator records it in the ledger.
+function ledgerFrom(tag: string) {
+  const { entries } = JSON.parse(
+    readFileSync(join(repoMigrations, "meta", "_journal.json"), "utf8"),
+  ) as { entries: { tag: string; when: number }[] };
+  const pending = entries.filter((entry) => entry.tag >= tag);
+  assert(pending[0]?.tag.startsWith(tag), `Missing migration ${tag}`);
+  return pending.map((entry) => ({
+    hash: createHash("sha256")
+      .update(readFileSync(join(repoMigrations, `${entry.tag}.sql`), "utf8"))
+      .digest("hex"),
+    created_at: entry.when,
+  }));
+}
+
+// The old ledger stays byte-for-byte, followed by exactly the migrations from `tag` onward.
+function expectLedger(sqlite: Database, old: LedgerRow[], tag: string) {
+  const ledger = ledgerOf(sqlite);
+  expect(ledger.slice(0, old.length)).toEqual(old);
+  expect(ledger.slice(old.length).map(({ hash, created_at }) => ({ hash, created_at }))).toEqual(
+    ledgerFrom(tag),
+  );
+}
+
+function tableNames(sqlite: Database) {
+  return sqlite
+    .query<{ name: string }, []>(
+      "select name from sqlite_master where type='table' and name not like 'sqlite_%' and name != '__drizzle_migrations' order by name",
+    )
+    .all()
+    .map((table) => table.name);
+}
 
 test("a database from before feed replies keeps its rows, and replies survive a restart", () => {
   // Build the database as the release before feed replies left it: every migration before 0012.
@@ -394,14 +439,12 @@ test("0016 adds only nullable outbox files and preserves every 0015 column, row 
         .all(),
     ]);
   const before = rows(old);
-  const ledger = old.query("select * from __drizzle_migrations order by id").all();
+  const ledger = ledgerOf(old);
   old.close();
   let db = openDatabase(path);
   try {
     expect(rows(db.$client)).toEqual(before);
-    expect(
-      db.$client.query("select * from __drizzle_migrations order by id").all().slice(0, -1),
-    ).toEqual(ledger);
+    expectLedger(db.$client, ledger, "0016");
     for (const { name } of tables) {
       const after = db.$client.query<Column, []>(`pragma table_info("${name}")`).all();
       const stored = columns.get(name);
@@ -434,9 +477,80 @@ test("0016 adds only nullable outbox files and preserves every 0015 column, row 
     db = openDatabase(path);
     expect(db.select().from(outbox).all().at(-1)?.files).toEqual(files);
     expect(db.select().from(slackThreads).get()?.rescan).toBe(true);
-    expect(db.$client.query("select * from __drizzle_migrations order by id").all()).toHaveLength(
-      ledger.length + 1,
-    );
+    expectLedger(db.$client, ledger, "0016");
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0017 adds only hidden_messages and preserves every 0016 table, column, row and ledger entry", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-hidden-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0017");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run(
+    "insert into outbox (session_id,message_id,text,files,state,from_owner,quote,created_at) values ('ses_jojo','old','Keep','[]','sent',1,'{}',1)",
+  );
+  old.run(
+    "insert into reactions (dot,session_id,message_id,actor,emoji,excerpt,updated_at) values ('jojo','ses_jojo','old','dot',null,'Keep',1)",
+  );
+  old.run("insert into notes (dot,text,created_at) values ('jojo','Keep',1)");
+  old.run(
+    "insert into slack_threads (key,route,oldest,newest,cursor,rescan,active_at,polled_at) values ('thread','{}','1','2','',1,1,4)",
+  );
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+  const before = rows(old);
+  const ledger = ledgerOf(old);
+  old.close();
+  let db = openDatabase(path);
+  try {
+    expect(rows(db.$client)).toEqual(before);
+    for (const name of tables) {
+      const stored = columns.get(name);
+      assert(stored, `Missing stored columns for ${name}`);
+      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(stored);
+    }
+    const added = tableNames(db.$client).filter((name) => !tables.includes(name));
+    // Later migrations may add tables; 0017 itself is one CREATE TABLE.
+    expect(added).toContain("hidden_messages");
+    const statements = readFileSync(join(repoMigrations, "0017_hidden_messages.sql"), "utf8")
+      .split("--> statement-breakpoint")
+      .map((statement) => statement.trim())
+      .filter(Boolean);
+    expect(statements).toHaveLength(1);
+    expect(statements[0]).toStartWith("CREATE TABLE `hidden_messages` (");
+    expect(db.$client.query('pragma table_info("hidden_messages")').all()).toMatchObject([
+      { name: "dot", type: expect.stringMatching(/^text$/i), notnull: 1, pk: 1 },
+      { name: "session_id", type: expect.stringMatching(/^text$/i), notnull: 1, pk: 2 },
+      { name: "message_id", type: expect.stringMatching(/^text$/i), notnull: 1, pk: 3 },
+      { name: "hidden_at", type: expect.stringMatching(/^integer$/i), notnull: 1, pk: 0 },
+    ]);
+    expect(db.$client.query('pragma foreign_key_list("hidden_messages")').all()).toMatchObject([
+      { table: "dots", from: "dot", to: "name" },
+    ]);
+    expectLedger(db.$client, ledger, "0017");
+    const marker = { dot: "jojo", sessionID: "ses_jojo", messageID: "old", hiddenAt: 2 };
+    db.insert(hiddenMessages).values(marker).run();
+    db.$client.close();
+    db = openDatabase(path);
+    expect(db.select().from(hiddenMessages).all()).toEqual([marker]);
+    expect(rows(db.$client)).toEqual(before);
+    expectLedger(db.$client, ledger, "0017");
   } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });

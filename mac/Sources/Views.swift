@@ -191,6 +191,11 @@ struct ExpandedView: View {
       if let error = store.imageErrors[name] {
         Text(error).font(.caption2).foregroundStyle(.red)
       }
+      if let error = store.chatActionErrors[name] {
+        Text("\(error) · click to clear").font(.caption2).foregroundStyle(.red)
+          .onTapGesture { store.chatActionErrors[name] = nil }
+          .accessibilityIdentifier("chat-action-error")
+      }
       Composer(placeholder: "Message \(name)", text: Binding { store.drafts[name] ?? "" } set: { store.drafts[name] = $0 }, canSend: !store.sending.contains(name), hasImages: !(store.draftImages[name] ?? []).isEmpty,
         pasteImages: { store.pasteImages($0, to: name) }, pickImages: { store.pickImages(name) }) {
         store.send(name)
@@ -386,7 +391,8 @@ struct Conversation: View {
   let name: String
 
   var body: some View {
-    let messages = store.messages[name] ?? []
+    // Messages deleted in the notch stay in the store, so pending sends still match their IDs.
+    let messages = (store.messages[name] ?? []).filter { $0.hidden != true }
     let pending = store.pending[name] ?? []
     ScrollViewReader { proxy in
       ScrollView {
@@ -394,7 +400,7 @@ struct Conversation: View {
         LazyVStack(alignment: .leading, spacing: 8) {
           ForEach(messages) { MessageRow(store: store, dot: name, message: $0) }
           ForEach(pending) { item in
-            PendingRow(item: item, dot: name).onTapGesture {
+            PendingRow(store: store, item: item, dot: name).onTapGesture {
               if item.error != nil { store.dismiss(name, item.id) }
             }
           }
@@ -678,39 +684,47 @@ struct SourceMark: View {
   }
 }
 
+/// Tapbacks and every other message action live in the message's context menu: a secondary click
+/// or Control-click on it, or its "Message actions" accessibility action.
 struct MessageRow: View {
   let store: Store
   let dot: String
   let message: Message
   @State private var open = false
-  @State private var hovering = false
-  @State private var pickerOpen = false
 
   var body: some View {
     switch message.kind {
     case "owner":
       HStack {
         Spacer(minLength: 60)
-        VStack(alignment: .trailing, spacing: 4) {
-          replyButton
-          if let quote = message.quote { MessageQuoteView(quote: quote, dot: dot) }
-          if let item = message.feed { QuoteCard(item: item).frame(maxWidth: 300) }
-          if !message.text.isEmpty { Bubble(text: message.text, fill: messageBlue) }
-          attachments
+        VStack(alignment: .trailing, spacing: 2) {
+          VStack(alignment: .trailing, spacing: 4) {
+            HStack(spacing: 8) {
+              replyButton
+              MessageActionsButton(id: anchorID)
+            }
+            if let quote = message.quote { MessageQuoteView(quote: quote, dot: dot) }
+            if let item = message.feed { QuoteCard(item: item).frame(maxWidth: 300) }
+            if !message.text.isEmpty { Bubble(text: message.text, fill: messageBlue) }
+            attachments
+          }
+          .padding(.bottom, badge == nil ? 0 : 22)
+          .overlay(alignment: .bottomTrailing) { reactionBadge }
+          .background(menuAnchor)
+          .accessibilityElement(children: .contain)
+          .accessibilityAction(named: "Message actions") { MenuAnchorView.open(anchorID) }
+          .accessibilityIdentifier(anchorID)
+          actionError
         }
-        .padding(.bottom, badge == nil ? 0 : 22)
-        .overlay(alignment: .bottomTrailing) { reactionBadge }
       }
     case "dot":
       HStack {
-        VStack(alignment: .leading, spacing: 0) {
-          picker
-            .frame(height: 32)
-            .opacity(hovering || pickerOpen ? 1 : 0)
-            .allowsHitTesting(hovering || pickerOpen)
-            .accessibilityHidden(!(hovering || pickerOpen))
+        VStack(alignment: .leading, spacing: 2) {
           VStack(alignment: .leading, spacing: 3) {
-            replyButton
+            HStack(spacing: 8) {
+              replyButton
+              MessageActionsButton(id: anchorID)
+            }
             if let quote = message.quote { MessageQuoteView(quote: quote, dot: dot) }
             if !message.text.isEmpty { Bubble(text: message.text, fill: messageGray) }
             attachments
@@ -720,6 +734,10 @@ struct MessageRow: View {
           }
           .padding(.bottom, badge == nil ? 0 : 22)
           .overlay(alignment: .bottomTrailing) { reactionBadge }
+          .background(menuAnchor)
+          .accessibilityElement(children: .contain)
+          .accessibilityAction(named: "Message actions") { MenuAnchorView.open(anchorID) }
+          .accessibilityIdentifier(anchorID)
           if store.reacting.contains(key) {
             Text("Saving reaction…").font(.caption2).foregroundStyle(.secondary)
           }
@@ -727,24 +745,32 @@ struct MessageRow: View {
             Text(error).font(.caption2).foregroundStyle(.red)
               .accessibilityIdentifier("reaction-error-\(dot)-\(message.id)")
           }
+          actionError
         }
-        .contentShape(Rectangle())
-        .onHover { hovering = $0 }
-        .accessibilityAction(named: "React") { pickerOpen.toggle() }
         Spacer(minLength: 60)
       }
     default:
       VStack(alignment: .leading, spacing: 2) {
-        Text(message.kind == "peer" ? "from \(message.peer ?? "another dot")" : "open-dot")
-          .font(.caption2.weight(.semibold))
-        if !message.text.isEmpty { Text(message.text).font(.caption).lineLimit(open ? nil : 4) }
-        attachments
+        VStack(alignment: .leading, spacing: 2) {
+          HStack(spacing: 8) {
+            Text(message.kind == "peer" ? "from \(message.peer ?? "another dot")" : "open-dot")
+              .font(.caption2.weight(.semibold))
+            MessageActionsButton(id: anchorID)
+          }
+          if !message.text.isEmpty { Text(message.text).font(.caption).lineLimit(open ? nil : 4) }
+          attachments
+        }
+        .foregroundStyle(.secondary)
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(.white.opacity(0.05)))
+        .background(menuAnchor)
+        .onTapGesture { open.toggle() }
+        .accessibilityElement(children: .contain)
+        .accessibilityAction(named: "Message actions") { MenuAnchorView.open(anchorID) }
+        .accessibilityIdentifier(anchorID)
+        actionError
       }
-      .foregroundStyle(.secondary)
-      .padding(8)
-      .frame(maxWidth: .infinity, alignment: .leading)
-      .background(RoundedRectangle(cornerRadius: 8).fill(.white.opacity(0.05)))
-      .onTapGesture { open.toggle() }
     }
   }
 }
@@ -757,7 +783,24 @@ extension MessageRow {
       .foregroundStyle(.secondary)
       .accessibilityIdentifier("chat-reply-\(dot)-\(message.id)")
   }
-  private var key: ReactionKey { ReactionKey(dot: dot, message: message.id) }
+  private var key: MessageKey { MessageKey(dot: dot, message: message.id) }
+
+  private var anchorID: String { "message-\(dot)-\(message.id)" }
+
+  /// The menu captures this rendering of the message, so its actions refuse a changed one.
+  private var menuAnchor: some View {
+    MenuAnchor(id: anchorID, store: store) { anchor in
+      messageMenu(store, dot: dot, message: message, anchor: anchor)
+    }
+  }
+
+  @ViewBuilder private var actionError: some View {
+    if let error = store.actionErrors[key] {
+      Text("\(error) · click to clear").font(.caption2).foregroundStyle(.red)
+        .onTapGesture { store.actionErrors[key] = nil }
+        .accessibilityIdentifier("message-error-\(dot)-\(message.id)")
+    }
+  }
 
   private var badge: Reaction? {
     message.reactions?.first { $0.actor == (message.kind == "dot" ? "owner" : "dot") && $0.emoji != nil }
@@ -773,27 +816,6 @@ extension MessageRow {
         .accessibilityLabel("\(reaction.actor == "owner" ? "You" : dot) reacted \(emoji)")
         .accessibilityIdentifier("reaction-badge-\(dot)-\(message.id)")
     }
-  }
-
-  private var picker: some View {
-    let selected = message.reactions?.first(where: { $0.actor == "owner" })?.emoji
-    return HStack(spacing: 2) {
-      ForEach(["❤️", "👍", "👎", "😂", "‼️", "❓"], id: \.self) { emoji in
-        Button { store.react(key, emoji: emoji) } label: {
-          Text(emoji).font(.system(size: 16))
-            .frame(width: 28, height: 26)
-            .background(RoundedRectangle(cornerRadius: 6).fill(selected == emoji ? messageBlue : .clear))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(store.reacting.contains(key))
-        .accessibilityLabel(selected == emoji ? "Remove your \(emoji) reaction" : "React \(emoji)")
-        .accessibilityAddTraits(selected == emoji ? .isSelected : [])
-        .accessibilityIdentifier("react-\(dot)-\(message.id)-\(emoji)")
-      }
-    }
-    .padding(.horizontal, 3)
-    .background(Capsule().fill(messageGray))
   }
 
   @ViewBuilder fileprivate var attachments: some View {
@@ -886,10 +908,12 @@ struct AttachmentView: View {
 }
 
 struct PendingRow: View {
+  let store: Store
   let item: Pending
   let dot: String
 
   var body: some View {
+    let anchorID = "pending-\(dot)-\(item.id)"
     HStack {
       Spacer(minLength: 60)
       VStack(alignment: .trailing, spacing: 3) {
@@ -906,12 +930,19 @@ struct PendingRow: View {
             }
           }.frame(maxWidth: 300).frame(height: 48).scrollIndicators(.never).opacity(0.6)
         }
-        if let error = item.error {
-          Text("\(error) · click to dismiss").font(.caption2).foregroundStyle(.red)
-        } else {
-          Text(item.messageID == nil ? "sending…" : "queued").font(.caption2).foregroundStyle(.tertiary)
+        HStack(spacing: 8) {
+          if let error = item.error {
+            Text("\(error) · click to dismiss").font(.caption2).foregroundStyle(.red)
+          } else {
+            Text(item.messageID == nil ? "sending…" : "queued").font(.caption2).foregroundStyle(.tertiary)
+          }
+          MessageActionsButton(id: anchorID)
         }
       }
+      .background(MenuAnchor(id: anchorID, store: store) { pendingMenu(store, dot: dot, item: item, anchor: $0) })
+      .accessibilityElement(children: .contain)
+      .accessibilityAction(named: "Message actions") { MenuAnchorView.open(anchorID) }
+      .accessibilityIdentifier(anchorID)
     }
   }
 }
@@ -956,4 +987,256 @@ struct Bubble: View {
     }
     return string
   }
+}
+
+/// Opens a message's menu from the keyboard: with Keyboard Navigation on, Control-Tab out of the
+/// message box reaches it, and Space opens the menu. A click opens it too.
+struct MessageActionsButton: View {
+  let id: String
+
+  var body: some View {
+    Button { MenuAnchorView.open(id) } label: {
+      Image(systemName: "ellipsis.circle").font(.caption2)
+    }
+    .buttonStyle(.plain)
+    .foregroundStyle(.secondary)
+    .help("Message actions")
+    .accessibilityLabel("Message actions")
+    .accessibilityIdentifier("actions-\(id)")
+  }
+}
+
+/// Marks a message's content for its context menu. It never takes a click itself: the panel hands
+/// it only a secondary click or Control-click, so ordinary clicks, text selection, links and
+/// thumbnails keep their own handlers.
+struct MenuAnchor: NSViewRepresentable {
+  let id: String
+  let store: Store
+  let menu: (NSView) -> NSMenu
+
+  func makeNSView(context: Context) -> MenuAnchorView { MenuAnchorView() }
+
+  func updateNSView(_ view: MenuAnchorView, context: Context) {
+    view.id = id
+    view.store = store
+    view.makeMenu = menu
+  }
+}
+
+final class MenuAnchorView: NSView {
+  var id = ""
+  weak var store: Store?
+  var makeMenu: (NSView) -> NSMenu = { _ in NSMenu() }
+  private static let anchors = NSHashTable<MenuAnchorView>.weakObjects()
+
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    if window == nil { Self.anchors.remove(self) } else { Self.anchors.add(self) }
+  }
+
+  /// Opens the menu of the message under a secondary click or Control-click, before the panel's
+  /// Quit menu or a text view's own menu can. Returns false for any other event.
+  static func handle(_ event: NSEvent) -> Bool {
+    guard event.type == .rightMouseDown || (event.type == .leftMouseDown && event.modifierFlags.contains(.control)),
+      let anchor = anchors.allObjects.last(where: { $0.contains(event) }) else { return false }
+    anchor.popUp(event)
+    return true
+  }
+
+  /// Opens a message's menu without a click, for VoiceOver's "Message actions".
+  static func open(_ id: String) {
+    anchors.allObjects.first { $0.id == id }?.popUp(nil)
+  }
+
+  /// Only the part of the message left visible by its scroll view counts.
+  private func contains(_ event: NSEvent) -> Bool {
+    guard window === event.window, !isHiddenOrHasHiddenAncestor else { return false }
+    return visibleRect.contains(convert(event.locationInWindow, from: nil))
+  }
+
+  /// Both calls return once the menu closes, so the notch is held open just while it's up.
+  private func popUp(_ event: NSEvent?) {
+    guard let store else { return }
+    let menu = makeMenu(self)
+    store.hold()
+    if let event {
+      NSMenu.popUpContextMenu(menu, with: event, for: self)
+    } else {
+      _ = menu.popUp(positioning: nil, at: NSPoint(x: 0, y: isFlipped ? bounds.maxY : 0), in: self)
+    }
+    store.release()
+  }
+}
+
+/// A menu item's action, run after menu tracking ends so an alert or the share picker never opens
+/// inside it. Its item keeps it alive.
+@MainActor final class MenuAction: NSObject {
+  private let run: () -> Void
+
+  init(_ run: @escaping () -> Void) { self.run = run }
+
+  @objc func fire(_ sender: NSMenuItem) {
+    var root = sender.menu
+    while let parent = root?.supermenu { root = parent }
+    root?.cancelTracking()
+    Task { run() }
+  }
+}
+
+@MainActor private func action(_ title: String, symbol: String?, id: String, enabled: Bool = true, _ run: @escaping () -> Void) -> NSMenuItem {
+  let target = MenuAction(run)
+  let item = NSMenuItem(title: title, action: #selector(MenuAction.fire(_:)), keyEquivalent: "")
+  item.target = target
+  item.representedObject = target
+  if let symbol { item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) }
+  item.isEnabled = enabled
+  item.identifier = NSUserInterfaceItemIdentifier(id)
+  item.setAccessibilityIdentifier(id)
+  return item
+}
+
+/// Why an action is unavailable, as a line in the menu, where VoiceOver reads it too.
+@MainActor private func note(_ text: String) -> NSMenuItem {
+  let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+  item.isEnabled = false
+  return item
+}
+
+/// In the order the daemon accepts them.
+private let tapbackNames = [
+  ("❤️", "Heart"), ("👍", "Thumbs Up"), ("👎", "Thumbs Down"), ("😂", "Ha Ha"), ("‼️", "Exclamation Marks"), ("❓", "Question Mark"),
+]
+
+/// The six Tapbacks as AppKit's inline palette: a row of standard menu items shown in place of the
+/// item that holds them, so arrow keys, Return, VoiceOver and the selected state all work, which a
+/// custom view in a menu can't offer. The selected one is drawn on the accent color.
+@MainActor private func tapbacks(selected: String?, enabled: Bool, id: String, choose: @escaping (String) -> Void) -> NSMenuItem {
+  let palette = NSMenu(title: "Tapback")
+  palette.presentationStyle = .palette
+  palette.autoenablesItems = false
+  for (emoji, name) in tapbackNames {
+    let item = action(name, symbol: nil, id: "tapback-\(id)-\(emoji)", enabled: enabled) { choose(emoji) }
+    item.image = tapbackImage(emoji, selected: selected == emoji)
+    item.state = selected == emoji ? .on : .off
+    item.toolTip = selected == emoji ? "Remove your \(name)" : name
+    item.setAccessibilityLabel(selected == emoji ? "\(name), selected. Remove your Tapback" : "\(name) Tapback")
+    palette.addItem(item)
+  }
+  let row = NSMenuItem(title: "Tapback", action: nil, keyEquivalent: "")
+  row.submenu = palette
+  row.identifier = NSUserInterfaceItemIdentifier("message-menu-tapbacks")
+  row.setAccessibilityIdentifier("message-menu-tapbacks")
+  return row
+}
+
+private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
+  // AppKit may draw the image off the main thread, so the handler uses only its own values.
+  NSImage(size: NSSize(width: 36, height: 32), flipped: false) { @Sendable rect in
+    if selected {
+      NSColor.controlAccentColor.setFill()
+      NSBezierPath(roundedRect: rect, xRadius: 9, yRadius: 9).fill()
+    }
+    let glyph = NSAttributedString(string: emoji, attributes: [.font: NSFont.systemFont(ofSize: 22)])
+    let size = glyph.size()
+    glyph.draw(at: NSPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2))
+    return true
+  }
+}
+
+/// A delivered message's menu. Every action keeps the dot, message and session it was opened for,
+/// and refuses rather than act on a message that has changed since.
+@MainActor func messageMenu(_ store: Store, dot: String, message: Message, anchor: NSView) -> NSMenu {
+  let key = MessageKey(dot: dot, message: message.id)
+  let session = message.sessionID
+  let menu = NSMenu()
+  menu.autoenablesItems = false
+  let selected = message.reactions?.first { $0.actor == "owner" }?.emoji
+  let reactable = message.kind == "dot" && !store.reacting.contains(key)
+  menu.addItem(tapbacks(selected: selected, enabled: reactable, id: "\(dot)-\(message.id)") { emoji in
+    if store.stillShown(key, session: session) != nil { store.react(key, emoji: emoji) }
+  })
+  menu.addItem(.separator())
+  let reacted = message.reactions?.contains { $0.emoji != nil } ?? false
+  menu.addItem(action("Tapback Details…", symbol: "info.circle", id: "message-menu-details", enabled: reacted) {
+    if let current = store.stillShown(key, session: session) { showDetails(current, dot: dot, store: store) }
+  })
+  let repliable = message.kind == "owner" || message.kind == "dot"
+  menu.addItem(action("Reply…", symbol: "arrowshape.turn.up.left", id: "message-menu-reply", enabled: repliable) {
+    if let current = store.stillShown(key, session: session) { store.reply(dot, to: current) }
+  })
+  menu.addItem(.separator())
+  let content = !message.text.isEmpty || message.attachments?.contains(where: \.isImage) == true
+  menu.addItem(action("Copy", symbol: "doc.on.doc", id: "message-menu-copy", enabled: content) {
+    store.copy(key, session: session)
+  })
+  menu.addItem(action("Share…", symbol: "square.and.arrow.up", id: "message-menu-share", enabled: content) { [weak anchor] in
+    guard let anchor else {
+      return store.report("The message scrolled away, so nothing was shared.", dot: dot, key: key)
+    }
+    store.share(key, session: session, from: anchor)
+  })
+  menu.addItem(.separator())
+  menu.addItem(action("Delete…", symbol: "trash", id: "message-menu-delete", enabled: session != nil && !store.hiding.contains(key)) {
+    if let session { confirmHide(key, session: session, store: store) }
+  })
+  let reasons = [
+    message.kind == "dot" ? nil : "Tapbacks are only for \(dot)'s messages.",
+    repliable ? nil : "Reply is only for your messages and \(dot)'s.",
+    content ? nil : "There's no text or image to copy or share.",
+    session == nil ? "Delete needs the updated open-dot daemon." : nil,
+  ].compactMap { $0 }
+  if !reasons.isEmpty { menu.addItem(.separator()) }
+  for reason in reasons { menu.addItem(note(reason)) }
+  return menu
+}
+
+/// A message not yet delivered can only be copied, and shared when it has no images: it keeps just
+/// their previews. Reactions, replies and Delete need the delivered message.
+@MainActor func pendingMenu(_ store: Store, dot: String, item: Pending, anchor: NSView) -> NSMenu {
+  let menu = NSMenu()
+  menu.autoenablesItems = false
+  let text = item.text
+  menu.addItem(action("Copy", symbol: "doc.on.doc", id: "message-menu-copy", enabled: !text.isEmpty) {
+    Store.copyText(text)
+  })
+  menu.addItem(action("Share…", symbol: "square.and.arrow.up", id: "message-menu-share", enabled: !text.isEmpty && item.images.isEmpty) { [weak anchor] in
+    // A refusal shows above the message box, since a pending bubble has no error line of its own.
+    store.present([text], dot: dot, key: nil, from: anchor)
+  })
+  menu.addItem(.separator())
+  menu.addItem(note("Tapbacks, Reply and Delete wait until it's delivered."))
+  if !item.images.isEmpty { menu.addItem(note("Its images copy and share once delivered.")) }
+  return menu
+}
+
+/// Runs an alert while holding the notch open, so it doesn't fold away behind it.
+@MainActor private func runAlert(_ alert: NSAlert, _ store: Store) -> NSApplication.ModalResponse {
+  store.hold()
+  defer { store.release() }
+  NSApp.activate()
+  return alert.runModal()
+}
+
+@MainActor private func showDetails(_ message: Message, dot: String, store: Store) {
+  let lines = (message.reactions ?? [])
+    .sorted { $0.actor == "owner" && $1.actor != "owner" }
+    .compactMap { reaction in reaction.emoji.map { "\(reaction.actor == "owner" ? "You" : dot): \($0)" } }
+  let alert = NSAlert()
+  alert.messageText = "Tapback Details"
+  alert.informativeText = lines.isEmpty ? "No Tapbacks." : lines.joined(separator: "\n")
+  alert.addButton(withTitle: "OK")
+  _ = runAlert(alert, store)
+}
+
+@MainActor private func confirmHide(_ key: MessageKey, session: String, store: Store) {
+  let alert = NSAlert()
+  alert.messageText = "Delete this message from the notch?"
+  alert.informativeText = "This only hides it in the notch, and it stays hidden after a restart. \(key.dot) still remembers it: its conversation, memory, Tapbacks and Slack don't change."
+  // Cancel comes first, so Return and Escape both keep the message.
+  alert.addButton(withTitle: "Cancel")
+  alert.addButton(withTitle: "Delete").hasDestructiveAction = true
+  guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
+  store.hide(key, session: session)
 }

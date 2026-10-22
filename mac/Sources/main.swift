@@ -4,6 +4,13 @@ import SwiftUI
 final class Panel: NSPanel {
   override var canBecomeKey: Bool { true }
   override var canBecomeMain: Bool { false }
+
+  /// A secondary click or Control-click on a chat message opens its menu before anything else
+  /// sees the event. Every other event, including ordinary clicks, goes on as before.
+  override func sendEvent(_ event: NSEvent) {
+    if MenuAnchorView.handle(event) { return }
+    super.sendEvent(event)
+  }
 }
 
 final class HostingView<Content: View>: NSHostingView<Content> {
@@ -104,6 +111,12 @@ struct Notch {
     hover.onHover = { [weak self] inside in self?.hover(inside) }
     panel.contentView = hover
     store.expanded = pinned
+    // A menu, alert or share picker hides the pointer's exit from the panel, so its end checks again.
+    store.onRelease = { [weak self] in
+      guard let self else { return }
+      // The local `hover` view shadows the method here.
+      self.hover(self.panel.frame.contains(NSEvent.mouseLocation))
+    }
     screenChanged()
     panel.orderFrontRegardless()
     store.start()
@@ -157,7 +170,7 @@ struct Notch {
     if inside { return expand(true) }
     collapse = Task {
       try? await Task.sleep(for: .milliseconds(400))
-      if !Task.isCancelled { expand(false) }
+      if !Task.isCancelled && !store.held { expand(false) }
     }
   }
 

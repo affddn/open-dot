@@ -54,9 +54,21 @@ struct Pending: Identifiable {
   var showingFeed = false
   var thumbnails: [AttachmentKey: NSImage] = [:]
   var unavailable: Set<AttachmentKey> = []
-  var reacting: Set<ReactionKey> = []
-  var reactionErrors: [ReactionKey: String] = [:]
-  @ObservationIgnored private var reactionEpoch: [String: Int] = [:]
+  var reacting: Set<MessageKey> = []
+  var reactionErrors: [MessageKey: String] = [:]
+  var hiding: Set<MessageKey> = []
+  /// Why the last menu action on a message failed, shown under it.
+  var actionErrors: [MessageKey: String] = [:]
+  /// Why a menu action failed once its message isn't shown, or for a message still being sent,
+  /// shown above the dot's message box.
+  var chatActionErrors: [String: String] = [:]
+  /// Bumped around each reaction or hide, so a poll that overlaps one is discarded.
+  @ObservationIgnored private var writeEpoch: [String: Int] = [:]
+  /// Menus, alerts and the share picker keep the notch open while they're up.
+  @ObservationIgnored private var holds = 0
+  @ObservationIgnored var onRelease: () -> Void = {}
+  @ObservationIgnored private var exporting: Set<MessageKey> = []
+  @ObservationIgnored private var sharing: ShareDelegate?
   @ObservationIgnored private var messageReads: [String: Int] = [:]
   private var seen: [String: Double] = [:]
   private var newest: [String: Double] = [:]
@@ -343,17 +355,17 @@ struct Pending: Identifiable {
     pending[name]?.removeAll { $0.id == id }
   }
 
-  func react(_ key: ReactionKey, emoji: String) {
+  func react(_ key: MessageKey, emoji: String) {
     guard let message = messages[key.dot]?.first(where: { $0.id == key.message }),
       message.kind == "dot", reacting.insert(key).inserted else { return }
     let selected = message.reactions?.first(where: { $0.actor == "owner" })?.emoji
     let next = selected == emoji ? nil : emoji
-    reactionEpoch[key.dot, default: 0] += 1
+    writeEpoch[key.dot, default: 0] += 1
     reactionErrors[key] = nil
     Task {
       defer {
         reacting.remove(key)
-        reactionEpoch[key.dot, default: 0] += 1
+        writeEpoch[key.dot, default: 0] += 1
       }
       do {
         let confirmed = try await api.react(key, emoji: next)
@@ -376,6 +388,187 @@ struct Pending: Identifiable {
         }
       }
     }
+  }
+
+  var held: Bool { holds > 0 }
+
+  func hold() { holds += 1 }
+
+  func release() {
+    holds = max(0, holds - 1)
+    if holds == 0 { onRelease() }
+  }
+
+  /// The message as shown now, only while it's still the one in the session a menu was opened for.
+  func current(_ key: MessageKey, session: String?) -> Message? {
+    messages[key.dot]?.first { $0.id == key.message && $0.sessionID == session && $0.hidden != true }
+  }
+
+  /// A delayed action's message, or nil, saying so, once it's gone or the dot's session changed.
+  /// The action is refused rather than applied to whatever is shown now.
+  func stillShown(_ key: MessageKey, session: String?) -> Message? {
+    if let message = current(key, session: session) { return message }
+    fail(key, "This message changed or is gone, so nothing was done.")
+    return nil
+  }
+
+  /// Copies the message's plain text, not its rendered Markdown. An image-only message copies its
+  /// images. If any fails to load, the clipboard is left as it was.
+  func copy(_ key: MessageKey, session: String?) {
+    guard let message = stillShown(key, session: session) else { return }
+    actionErrors[key] = nil
+    chatActionErrors[key.dot] = nil
+    if !message.text.isEmpty { return Self.copyText(message.text) }
+    let items = message.attachments?.filter(\.isImage) ?? []
+    guard !items.isEmpty else { return fail(key, "There's nothing to copy.") }
+    export(key, session: session, items, verb: "copied") { images in
+      let board = NSPasteboard.general
+      board.clearContents()
+      board.writeObjects(images.map { image in
+        let item = NSPasteboardItem()
+        item.setData(image.data, forType: image.type)
+        return item
+      })
+    }
+  }
+
+  static func copyText(_ text: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+  }
+
+  /// Shares the plain text and every supported image, or nothing if any image fails to load.
+  func share(_ key: MessageKey, session: String?, from view: NSView) {
+    guard let message = stillShown(key, session: session) else { return }
+    actionErrors[key] = nil
+    chatActionErrors[key.dot] = nil
+    let items = message.attachments?.filter(\.isImage) ?? []
+    guard !message.text.isEmpty || !items.isEmpty else { return fail(key, "There's nothing to share.") }
+    let text = message.text
+    export(key, session: session, items, verb: "shared") { [self, weak view] images in
+      let shared = images.compactMap { NSImage(data: $0.data) }
+      guard shared.count == images.count else {
+        return fail(key, "Couldn't read every image, so nothing was shared.")
+      }
+      var all: [Any] = text.isEmpty ? [] : [text]
+      all.append(contentsOf: shared)
+      present(all, dot: key.dot, key: key, from: view)
+    }
+  }
+
+  private static let shareTimeout = Duration.seconds(60)
+
+  /// Shows the share picker beside the view, closing any earlier one, and keeps the notch open
+  /// until it closes. If AppKit never reports back, the picker is closed after a minute, saying so.
+  /// The picker holds the only reference to the items, so they go when it does.
+  func present(_ items: [Any], dot: String, key: MessageKey?, from view: NSView?) {
+    guard let view, view.window != nil else {
+      return report("The message scrolled away, so nothing was shared.", dot: dot, key: key)
+    }
+    guard !items.isEmpty else { return report("There's nothing to share.", dot: dot, key: key) }
+    // Held before the earlier picker lets go, so the notch doesn't fold in between.
+    hold()
+    sharing?.close()
+    let picker = NSSharingServicePicker(items: items)
+    let delegate = ShareDelegate(picker, timeout: Self.shareTimeout) { [weak self] timedOut in
+      guard let self else { return }
+      sharing = nil
+      release()
+      if timedOut {
+        report("The share menu didn't answer within a minute, so it was closed. Nothing more will be shared from it.", dot: dot, key: key)
+      }
+    }
+    picker.delegate = delegate
+    sharing = delegate
+    picker.show(relativeTo: view.bounds, of: view, preferredEdge: .minY)
+  }
+
+  private struct Original {
+    let type: NSPasteboard.PasteboardType
+    let data: Data
+  }
+
+  private static let exportLimit = 10
+
+  /// Reads each image again through the daemon, checked like every decode, and hands them all to
+  /// `use` only if every one loaded and the message is still shown. The notch stays open meanwhile.
+  private func export(_ key: MessageKey, session: String?, _ items: [Message.Attachment], verb: String, _ use: @escaping ([Original]) -> Void) {
+    guard items.count <= Self.exportLimit else {
+      return fail(key, "This message has more than \(Self.exportLimit) images, so nothing was \(verb).")
+    }
+    guard exporting.insert(key).inserted else { return }
+    hold()
+    Task {
+      defer {
+        exporting.remove(key)
+        release()
+      }
+      var images: [Original] = []
+      for item in items {
+        // Pinned to the captured session, so an unseen rebinding can't export another session's bytes.
+        let data = try? await api.attachment(AttachmentKey(dot: key.dot, message: key.message, index: item.index), session: session)
+        guard let data, let checked = Self.checked(data) else {
+          return fail(key, "Couldn't load every image, so nothing was \(verb). No automatic retry.")
+        }
+        images.append(Original(type: NSPasteboard.PasteboardType(checked.type), data: data))
+      }
+      guard current(key, session: session) != nil else {
+        return fail(key, "This message changed or is gone, so nothing was \(verb).")
+      }
+      use(images)
+    }
+  }
+
+  /// Hides the message in the notch only. OpenCode history and the dot's memory keep it.
+  func hide(_ key: MessageKey, session: String) {
+    guard stillShown(key, session: session) != nil, hiding.insert(key).inserted else { return }
+    writeEpoch[key.dot, default: 0] += 1
+    actionErrors[key] = nil
+    chatActionErrors[key.dot] = nil
+    Task {
+      defer {
+        hiding.remove(key)
+        writeEpoch[key.dot, default: 0] += 1
+      }
+      do {
+        let marker = try await api.hide(key, session: session)
+        guard marker.dot == key.dot, marker.sessionID == session, marker.messageID == key.message else {
+          return fail(key, "Delete outcome unknown: unexpected response. The next refresh shows the saved state.")
+        }
+        if let index = messages[key.dot]?.firstIndex(where: { $0.id == key.message && $0.sessionID == session }) {
+          messages[key.dot]![index].hidden = true
+        }
+        // Queued replies keep their own quote; only the unsent selection goes.
+        if replyTargets[key.dot]?.id == key.message { replyTargets[key.dot] = nil }
+      } catch {
+        if let failure = error as? APIError, case .lost = failure {
+          fail(key, "Delete outcome unknown: no response. It may be hidden after the next refresh. No automatic retry.")
+        } else {
+          fail(key, "Not deleted. \(Self.describe(error)) No automatic retry.")
+        }
+      }
+    }
+  }
+
+  private func fail(_ key: MessageKey, _ text: String) { report(text, dot: key.dot, key: key) }
+
+  /// Shows a failure under its message while that message is shown, otherwise above the dot's
+  /// message box, so it's never only spoken, and reads it aloud.
+  func report(_ text: String, dot: String, key: MessageKey?) {
+    if let key, messages[dot]?.contains(where: { $0.id == key.message && $0.hidden != true }) == true {
+      actionErrors[key] = text
+    } else {
+      chatActionErrors[dot] = text
+    }
+    Self.announce(text)
+  }
+
+  /// Reads a failure aloud with VoiceOver, since a menu action has no control left to report on.
+  static func announce(_ text: String) {
+    NSAccessibility.post(element: NSApp as NSApplication, notification: .announcementRequested, userInfo: [
+      .announcement: text,
+      .priority: NSAccessibilityPriorityLevel.high.rawValue,
+    ])
   }
 
   func openFeed() {
@@ -441,9 +634,10 @@ struct Pending: Identifiable {
     }
   }
 
-  /// Decodes only PNG, JPEG, GIF and WebP, whatever the bytes claim to be, and only up to 40
-  /// million pixels, read from the header first, so a small file can't expand into a huge bitmap.
-  private static func decode(_ data: Data, maxPixels: Int?) -> NSImage? {
+  /// Accepts only PNG, JPEG, GIF and WebP, whatever the bytes claim to be, and only up to 40
+  /// million pixels, read from the header without decoding, so a small file can't expand into a
+  /// huge bitmap. The type is the image's UTI, which is also its pasteboard type.
+  private static func checked(_ data: Data) -> (source: CGImageSource, type: String, side: Int)? {
     let allowed: Set<String> = ["public.png", "public.jpeg", "com.compuserve.gif", "org.webmproject.webp"]
     guard let source = CGImageSourceCreateWithData(data as CFData, nil),
       let type = CGImageSourceGetType(source) as String?, allowed.contains(type),
@@ -451,11 +645,16 @@ struct Pending: Identifiable {
       let width = properties[kCGImagePropertyPixelWidth] as? Int,
       let height = properties[kCGImagePropertyPixelHeight] as? Int,
       width > 0, height > 0, width <= 40_000_000 / height else { return nil }
+    return (source, type, max(width, height))
+  }
+
+  private static func decode(_ data: Data, maxPixels: Int?) -> NSImage? {
+    guard let checked = Self.checked(data) else { return nil }
     // The thumbnail API at full size too, so both apply the photo's orientation.
-    let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+    let image = CGImageSourceCreateThumbnailAtIndex(checked.source, 0, [
       kCGImageSourceCreateThumbnailFromImageAlways: true,
       kCGImageSourceCreateThumbnailWithTransform: true,
-      kCGImageSourceThumbnailMaxPixelSize: maxPixels ?? max(width, height),
+      kCGImageSourceThumbnailMaxPixelSize: maxPixels ?? checked.side,
     ] as CFDictionary)
     return image.map { NSImage(cgImage: $0, size: .zero) }
   }
@@ -496,23 +695,25 @@ struct Pending: Identifiable {
   }
 
   private func refreshMessages(_ name: String) async {
-    let epoch = reactionEpoch[name, default: 0]
+    let epoch = writeEpoch[name, default: 0]
     messageReads[name, default: 0] += 1
     let read = messageReads[name]
     guard let list = try? await api.messages(name) else { return }
     // Discard polls begun before/during a write, and older overlapping reads.
-    guard epoch == reactionEpoch[name, default: 0], read == messageReads[name],
-      !reacting.contains(where: { $0.dot == name }) else { return }
+    guard epoch == writeEpoch[name, default: 0], read == messageReads[name],
+      !reacting.contains(where: { $0.dot == name }), !hiding.contains(where: { $0.dot == name }) else { return }
     messages[name] = list
+    // Hidden messages still count here, so a pending send matches its delivered ID.
     let ids = Set(list.map(\.id))
-    // Forget images of messages that have scrolled out, but write only when something goes.
-    let gone = { (key: AttachmentKey) in key.dot == name && !ids.contains(key.message) }
+    let shown = Set(list.filter { $0.hidden != true }.map(\.id))
+    // Forget images of messages that have scrolled out or were hidden, but write only when something goes.
+    let gone = { (key: AttachmentKey) in key.dot == name && !shown.contains(key.message) }
     if thumbnails.keys.contains(where: gone) { thumbnails = thumbnails.filter { !gone($0.key) } }
     if unavailable.contains(where: gone) { unavailable = unavailable.filter { !gone($0) } }
     let oldest = list.first?.time ?? 0
     // An accepted message older than everything shown was delivered and has scrolled out.
     pending[name]?.removeAll { item in item.messageID.map { ids.contains($0) || oldest > item.sentAt } ?? false }
-    let latest = list.filter { $0.kind != "owner" }.map(\.time).max() ?? 0
+    let latest = list.filter { $0.kind != "owner" && $0.hidden != true }.map(\.time).max() ?? 0
     newest[name] = latest
     if seen[name] == nil || visible(name) { seen[name] = latest }
   }
@@ -524,5 +725,47 @@ struct Pending: Identifiable {
 
   private static func describe(_ error: Error) -> String {
     (error as? APIError)?.message ?? error.localizedDescription
+  }
+}
+
+/// Ends the notch's hold once the share picker closes, with or without a choice, or once its time
+/// limit passes without an answer. AppKit doesn't mark the picker's delegate main-actor, though it
+/// calls it on the main thread.
+@MainActor final class ShareDelegate: NSObject, @preconcurrency NSSharingServicePickerDelegate {
+  private var picker: NSSharingServicePicker?
+  private var done: ((_ timedOut: Bool) -> Void)?
+  private var timeout: Task<Void, Never>?
+
+  init(_ picker: NSSharingServicePicker, timeout limit: Duration, done: @escaping (_ timedOut: Bool) -> Void) {
+    self.picker = picker
+    self.done = done
+    super.init()
+    // Weak, so a picker AppKit never answers for can't keep this delegate alive past its limit.
+    timeout = Task { [weak self] in
+      try? await Task.sleep(for: limit)
+      guard !Task.isCancelled else { return }
+      self?.close(timedOut: true)
+    }
+  }
+
+  func sharingServicePicker(_ sharingServicePicker: NSSharingServicePicker, didChoose service: NSSharingService?) {
+    finish(timedOut: false)
+  }
+
+  /// Closes the picker if it's still up. Finishing first means the `didChoose` that `close()`
+  /// sends finds nothing left to report.
+  func close(timedOut: Bool = false) {
+    let picker = self.picker
+    finish(timedOut: timedOut)
+    picker?.close()
+  }
+
+  private func finish(timedOut: Bool) {
+    timeout?.cancel()
+    timeout = nil
+    let done = self.done
+    self.done = nil
+    picker = nil
+    done?(timedOut)
   }
 }

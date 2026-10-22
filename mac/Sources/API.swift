@@ -27,6 +27,10 @@ struct Message: Decodable, Equatable, Identifiable {
   }
 
   let id: String
+  /// The session the daemon read it from. Missing from a daemon older than Delete.
+  let sessionID: String?
+  /// Deleted from the notch only. The daemon keeps listing it so pending sends still match by ID.
+  var hidden: Bool?
   let kind: String
   let peer: String?
   let text: String
@@ -56,7 +60,13 @@ struct Reaction: Decodable, Equatable {
   let updatedAt: Double
 }
 
-struct ReactionKey: Hashable {
+struct HiddenMarker: Decodable, Equatable {
+  let dot: String
+  let sessionID: String
+  let messageID: String
+}
+
+struct MessageKey: Hashable {
   let dot: String
   let message: String
 }
@@ -126,11 +136,18 @@ enum APIError: Error {
     return try decode(Body.self, await send("GET", "/dots/\(escape(dot))/messages")).messages
   }
 
-  func react(_ key: ReactionKey, emoji: String?) async throws -> Reaction {
+  func react(_ key: MessageKey, emoji: String?) async throws -> Reaction {
     struct Body: Decodable { let reaction: Reaction }
     // JSONEncoder omits nil optional fields; removal needs an explicit JSON null.
     let body = try JSONSerialization.data(withJSONObject: ["emoji": emoji as Any? ?? NSNull()])
     return try decode(Body.self, await send("PUT", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/reaction", body: body)).reaction
+  }
+
+  /// Hides the message in the notch only, for the session it was read from. Never retried on its own.
+  func hide(_ key: MessageKey, session: String) async throws -> HiddenMarker {
+    struct Body: Decodable { let hidden: HiddenMarker }
+    let body = try JSONSerialization.data(withJSONObject: ["sessionID": session, "hidden": true] as [String: Any])
+    return try decode(Body.self, await send("PUT", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/hidden", body: body)).hidden
   }
 
   /// Queues the text, as a reply to a feed item when `feed` is its ID. Never retried on its own.
@@ -144,8 +161,12 @@ enum APIError: Error {
   }
 
   /// An attachment's bytes, read through the daemon from the dot's own session, never from a URL.
-  func attachment(_ key: AttachmentKey) async throws -> Data {
-    try await send("GET", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/attachments/\(key.index)")
+  /// With a session, the daemon refuses with 409 unless the dot is bound to it before and after
+  /// the read, so a rebinding can't hand back another session's bytes.
+  func attachment(_ key: AttachmentKey, session: String? = nil) async throws -> Data {
+    let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+    let pin = session.map { "?sessionID=\($0.addingPercentEncoding(withAllowedCharacters: unreserved) ?? $0)" } ?? ""
+    return try await send("GET", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/attachments/\(key.index)\(pin)")
   }
 
   func feed() async throws -> (items: [FeedItem], handedOff: [FeedItem]) {

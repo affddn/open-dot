@@ -1,5 +1,5 @@
 import { SessionMessage } from "@opencode/client/effect";
-import { eq, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { Effect, type Layer } from "effect";
 import type { Db } from "./db";
 import { findDot, listDots } from "./dots";
@@ -18,6 +18,7 @@ import {
   feed,
   type FeedItem,
   type FeedSnapshot,
+  hiddenMessages,
   type QuoteSnapshot,
   outbox,
   workers,
@@ -53,53 +54,90 @@ const listAll = (db: Db) =>
     );
   });
 
-/** Who wrote each message: the owner, the dot, another dot, or open-dot itself (a notice). */
+/** True once the dot's binding no longer matches the one a request began with. */
+const rebound = (db: Db, dot: Dot) => {
+  const current = findDot(db, dot.name);
+  return current?.sessionID !== dot.sessionID || current.sessionState !== "ready";
+};
+
+const hiddenIDs = (db: Db, dot: Dot, ids: string[]) =>
+  new Set(
+    ids.length
+      ? db
+          .select({ id: hiddenMessages.messageID })
+          .from(hiddenMessages)
+          .where(
+            and(
+              eq(hiddenMessages.dot, dot.name),
+              eq(hiddenMessages.sessionID, dot.sessionID),
+              inArray(hiddenMessages.messageID, ids),
+            ),
+          )
+          .all()
+          .map((row) => row.id)
+      : [],
+  );
+
+/**
+ * The messages the notch can show, newest last: who wrote each one (the owner, the dot, another
+ * dot, or open-dot itself, a notice), with its reactions and whether the owner hid it in the notch.
+ */
+const visibleMessages = (db: Db, dot: Dot, entries: readonly Entry[]) => {
+  const ids = entries.map((item) => item.id);
+  const sent = messageSources(db, dot.sessionID, ids);
+  const saved = currentReactions(db, dot, ids);
+  const hidden = hiddenIDs(db, dot, ids);
+  const label = (item: Entry) => {
+    const base = {
+      id: item.id,
+      sessionID: dot.sessionID,
+      // Hidden messages stay listed, so the notch can still match its pending sends by ID.
+      hidden: hidden.has(item.id),
+      text: item.text,
+      tools: item.tools,
+      // Metadata only: the notch loads each image's bytes on its own.
+      attachments: item.files.map((file, index) => ({
+        index,
+        mime: file.mime,
+        name: file.name ?? null,
+      })),
+      time: item.time,
+      reactions: saved.filter((reaction) => reaction.messageID === item.id),
+    };
+    // Show what the dot said and the open-dot actions it took, not mechanics such as shell
+    // commands, file reads or compaction.
+    if (item.role === "assistant") {
+      const actions = item.tools.filter((tool) => tool.startsWith("dot_"));
+      return item.text || actions.length > 0 ? [{ ...base, tools: actions, kind: "dot" }] : [];
+    }
+    const row = sent.get(item.id);
+    const kind = messageKind(item.role, row);
+    if (row?.fromOwner && (row.quote || row.ownerText !== null))
+      return [
+        {
+          ...base,
+          kind: "owner",
+          text: row.quote?.prompt ?? row.ownerText ?? item.text,
+          quote: row.quote?.parent,
+        },
+      ];
+    // A reply to a feed item shows the owner's prompt and the item's card, not the framing.
+    if (row?.fromOwner && row.feed)
+      return [{ ...base, kind: "owner", text: row.feed.prompt, feed: row.feed.item }];
+    if (kind === "owner" || kind === "notice") return [{ ...base, kind }];
+    const inner = framed.exec(item.text)?.[1]?.replace(/<\\\/dot-message/gi, "</dot-message");
+    return [{ ...base, kind: "peer", peer: row?.fromDot, text: inner ?? item.text }];
+  };
+  return entries.flatMap(label).slice(-shown);
+};
+
 const conversation = (db: Db, dot: Dot) =>
   Effect.gen(function* () {
     if (dot.sessionState !== "ready") return Response.json({ messages: [] });
     const entries = yield* (yield* OpenCode).recentMessages(dot.sessionID, read);
-    const ids = entries.map((item) => item.id);
-    const sent = messageSources(db, dot.sessionID, ids);
-    const saved = currentReactions(db, dot, ids);
-    const label = (item: Entry) => {
-      const base = {
-        id: item.id,
-        text: item.text,
-        tools: item.tools,
-        // Metadata only: the notch loads each image's bytes on its own.
-        attachments: item.files.map((file, index) => ({
-          index,
-          mime: file.mime,
-          name: file.name ?? null,
-        })),
-        time: item.time,
-        reactions: saved.filter((reaction) => reaction.messageID === item.id),
-      };
-      // Show what the dot said and the open-dot actions it took, not mechanics such as shell
-      // commands, file reads or compaction.
-      if (item.role === "assistant") {
-        const actions = item.tools.filter((tool) => tool.startsWith("dot_"));
-        return item.text || actions.length > 0 ? [{ ...base, tools: actions, kind: "dot" }] : [];
-      }
-      const row = sent.get(item.id);
-      const kind = messageKind(item.role, row);
-      if (row?.fromOwner && (row.quote || row.ownerText !== null))
-        return [
-          {
-            ...base,
-            kind: "owner",
-            text: row.quote?.prompt ?? row.ownerText ?? item.text,
-            quote: row.quote?.parent,
-          },
-        ];
-      // A reply to a feed item shows the owner's prompt and the item's card, not the framing.
-      if (row?.fromOwner && row.feed)
-        return [{ ...base, kind: "owner", text: row.feed.prompt, feed: row.feed.item }];
-      if (kind === "owner" || kind === "notice") return [{ ...base, kind }];
-      const inner = framed.exec(item.text)?.[1]?.replace(/<\\\/dot-message/gi, "</dot-message");
-      return [{ ...base, kind: "peer", peer: row?.fromDot, text: inner ?? item.text }];
-    };
-    return Response.json({ messages: entries.flatMap(label).slice(-shown) });
+    // A read that began before a rebinding must not pass as the new session's conversation.
+    if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+    return Response.json({ messages: visibleMessages(db, dot, entries) });
   });
 
 const react = (db: Db, dot: Dot, id: string, request: Request) =>
@@ -125,10 +163,57 @@ const react = (db: Db, dot: Dot, id: string, request: Request) =>
       !(target.text || target.tools.some((tool) => tool.startsWith("dot_")))
     )
       return error(404, "There's no such dot message in recent history.");
-    const current = findDot(db, dot.name);
-    if (current?.sessionID !== dot.sessionID || current.sessionState !== "ready")
+    if (rebound(db, dot))
       return error(409, "The dot's conversation changed. Refresh before reacting.");
     return Response.json({ reaction: saveReaction(db, dot, id, "owner", body.emoji, target.text) });
+  });
+
+/**
+ * Hides a message in the notch only, for the session the owner saw it in. A repeat keeps the first
+ * time. Nothing is sent, and OpenCode history, the dot's context and reactions are unchanged.
+ */
+const hide = (db: Db, dot: Dot, id: string, request: Request) =>
+  Effect.gen(function* () {
+    const body = yield* Effect.tryPromise(() => messageBody(request, 1024)).pipe(
+      Effect.orElseSucceed(() => undefined),
+    );
+    if (body instanceof Response) return body;
+    if (
+      typeof body !== "object" ||
+      body === null ||
+      Array.isArray(body) ||
+      Object.keys(body).length !== 2 ||
+      !("sessionID" in body) ||
+      typeof body.sessionID !== "string" ||
+      !body.sessionID ||
+      body.sessionID.length > 255 ||
+      !("hidden" in body) ||
+      body.hidden !== true
+    )
+      return error(400, "Send {sessionID, hidden: true}.");
+    if (id.length > 255) return error(404, "There's no such message in recent history.");
+    if (dot.sessionState !== "ready" || body.sessionID !== dot.sessionID)
+      return error(409, "The dot's conversation changed. Refresh before deleting.");
+    const entries = yield* (yield* OpenCode).recentMessages(dot.sessionID, read);
+    if (rebound(db, dot))
+      return error(409, "The dot's conversation changed. Refresh before deleting.");
+    if (!visibleMessages(db, dot, entries).some((message) => message.id === id))
+      return error(404, "There's no such message in recent history.");
+    if (messageSources(db, dot.sessionID, [id]).get(id)?.state === "pending")
+      return error(409, "This message is still being delivered.");
+    const key = and(
+      eq(hiddenMessages.dot, dot.name),
+      eq(hiddenMessages.sessionID, dot.sessionID),
+      eq(hiddenMessages.messageID, id),
+    );
+    const marker = db.transaction((tx) => {
+      tx.insert(hiddenMessages)
+        .values({ dot: dot.name, sessionID: dot.sessionID, messageID: id, hiddenAt: Date.now() })
+        .onConflictDoNothing()
+        .run();
+      return tx.select().from(hiddenMessages).where(key).get();
+    });
+    return Response.json({ hidden: marker });
   });
 
 // The raster types the notch may decode, by the bytes each file starts with. Undefined matches any
@@ -166,9 +251,10 @@ const matchesImage = (mime: string, bytes: Buffer) =>
   images.get(mime)?.every((byte, at) => byte === undefined || bytes[at] === byte) &&
   (mime !== "image/gif" || ((bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61));
 
-const messageBody = async (request: Request): Promise<unknown> => {
-  if (Number(request.headers.get("content-length")) > bodyLimit)
-    return error(413, "The message body is over 72 MiB.");
+const messageBody = async (request: Request, limit = bodyLimit): Promise<unknown> => {
+  const tooLarge = () =>
+    error(413, limit === bodyLimit ? "The message body is over 72 MiB." : "The body is too large.");
+  if (Number(request.headers.get("content-length")) > limit) return tooLarge();
   if (!request.body) return undefined;
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -178,9 +264,9 @@ const messageBody = async (request: Request): Promise<unknown> => {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > bodyLimit) {
+      if (size > limit) {
         await reader.cancel();
-        return error(413, "The message body is over 72 MiB.");
+        return tooLarge();
       }
       chunks.push(value);
     }
@@ -255,13 +341,22 @@ const imageBytes = (file: Attachment) => {
   });
 };
 
-/** An attachment's bytes, from a user message in the dot's own session only. */
-const attachment = (dot: Dot, id: string, index: string) =>
+/**
+ * An attachment's bytes, from a user message in the dot's own session only. An optional
+ * `?sessionID=` pins the read to that session: a different or changed binding gets 409.
+ */
+const attachment = (db: Db, dot: Dot, id: string, index: string, sessionID: string | null) =>
   Effect.gen(function* () {
     // One spelling per index, so "01" can't stand for 1.
     if (!/^(?:0|[1-9]\d{0,3})$/.test(index)) return error(400, "Bad attachment index.");
+    if (sessionID !== null && (!sessionID || sessionID.length > 255))
+      return error(400, "Bad session ID.");
+    if (sessionID !== null && (dot.sessionState !== "ready" || sessionID !== dot.sessionID))
+      return error(409, "The dot's conversation changed. Refresh.");
     if (dot.sessionState !== "ready") return error(404, "There's no such attachment.");
     const entries = yield* (yield* OpenCode).recentMessages(dot.sessionID, read);
+    if (sessionID !== null && rebound(db, dot))
+      return error(409, "The dot's conversation changed. Refresh.");
     const file = entries.find((item) => item.id === id)?.files[Number(index)];
     return file ? imageBytes(file) : error(404, "There's no such attachment.");
   });
@@ -357,8 +452,7 @@ const send = (db: Db, dot: Dot, request: Request) =>
         },
       };
     }
-    const current = findDot(db, dot.name);
-    if (current?.sessionID !== dot.sessionID || current.sessionState !== "ready")
+    if (rebound(db, dot))
       return error(409, "The dot's conversation changed. Refresh before replying.");
     const row = db.transaction((tx) => {
       const item =
@@ -460,13 +554,21 @@ const route = (
     return react(db, dot, id, request);
   if (
     rest === "messages" &&
+    part === "hidden" &&
+    id !== undefined &&
+    extra.length === 2 &&
+    request.method === "PUT"
+  )
+    return hide(db, dot, id, request);
+  if (
+    rest === "messages" &&
     part === "attachments" &&
     id !== undefined &&
     index !== undefined &&
     more.length === 0 &&
     request.method === "GET"
   )
-    return attachment(dot, id, index);
+    return attachment(db, dot, id, index, new URL(request.url).searchParams.get("sessionID"));
   return Effect.succeed(error(404, "Not found"));
 };
 

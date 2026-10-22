@@ -9,7 +9,16 @@ import { openDatabase } from "../src/db";
 import { createDot } from "../src/dots";
 import { databasePath, home } from "../src/home";
 import plugin from "../src/plugin";
-import { dots, feed, outbox, reactions, reminders, workers, type Route } from "../src/schema";
+import {
+  dots,
+  feed,
+  hiddenMessages,
+  outbox,
+  reactions,
+  reminders,
+  workers,
+  type Route,
+} from "../src/schema";
 
 interface FakeTool {
   readonly name: string;
@@ -490,6 +499,49 @@ test("reaction snapshots declare their bounded window and do not leak other bind
   expect(snapshot).not.toContain('"messageID":"msg_0"');
   expect(snapshot).not.toContain("wrong binding");
   expect(snapshot).toContain("Outside this window, current state is unknown");
+  await loaded.cleanup?.();
+  db.$client.close();
+});
+
+test("messages hidden in the notch change nothing the dot sees or can react to", async () => {
+  const db = openDatabase(databasePath());
+  db.update(dots).set({ sessionState: "ready" }).run();
+  const history = [{ id: "msg_owner", type: "user", text: "owner text", time: { created: 0 } }];
+  const loaded = await load(dot.directory, history);
+  db.insert(reactions)
+    .values({
+      dot: "jojo",
+      sessionID: dot.sessionID,
+      messageID: "msg_answer",
+      actor: "owner",
+      emoji: "👍",
+      excerpt: "answer",
+      updatedAt: 1,
+    })
+    .run();
+  // The memory's current time changes between requests; everything else must not.
+  const injected = async () =>
+    (await loaded.injected(dot.sessionID)).replace(/^Current time: .*$/m, "");
+  const before = await injected();
+  expect(before).toContain('"messageID":"msg_owner"');
+  db.insert(hiddenMessages)
+    .values(
+      ["msg_owner", "msg_answer"].map((messageID) => ({
+        dot: "jojo",
+        sessionID: dot.sessionID,
+        messageID,
+        hiddenAt: 2,
+      })),
+    )
+    .run();
+  expect(await injected()).toBe(before);
+  await loaded.call("dot_react", { message_id: "msg_owner", emoji: "❤️" });
+  expect(db.select().from(reactions).all()).toMatchObject([
+    { actor: "owner", messageID: "msg_answer", emoji: "👍" },
+    { actor: "dot", messageID: "msg_owner", emoji: "❤️" },
+  ]);
+  expect(db.select().from(outbox).all()).toEqual([]);
+  expect(loaded.turns).toEqual([]);
   await loaded.cleanup?.();
   db.$client.close();
 });
