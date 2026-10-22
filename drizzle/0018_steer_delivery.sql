@@ -1,0 +1,1 @@
+ALTER TABLE `outbox` ADD `delivery` text;

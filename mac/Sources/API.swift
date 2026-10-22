@@ -131,9 +131,12 @@ enum APIError: Error {
     try decode([Dot].self, await send("GET", "/dots"))
   }
 
-  func messages(_ dot: String) async throws -> [Message] {
-    struct Body: Decodable { let messages: [Message] }
-    return try decode(Body.self, await send("GET", "/dots/\(escape(dot))/messages")).messages
+  /// The conversation, and where each of the owner's sends that isn't in it yet stands.
+  func messages(_ dot: String) async throws -> (messages: [Message], pending: [String: String]) {
+    struct Status: Decodable { let id: String; let status: String }
+    struct Body: Decodable { let messages: [Message]; let pending: [Status]? }
+    let body = try decode(Body.self, await send("GET", "/dots/\(escape(dot))/messages"))
+    return (body.messages, Dictionary((body.pending ?? []).map { ($0.id, $0.status) }) { first, _ in first })
   }
 
   func react(_ key: MessageKey, emoji: String?) async throws -> Reaction {

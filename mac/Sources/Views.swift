@@ -399,6 +399,15 @@ struct Conversation: View {
         // Lazy, so a thumbnail loads only when its message scrolls into view.
         LazyVStack(alignment: .leading, spacing: 8) {
           ForEach(messages) { MessageRow(store: store, dot: name, message: $0) }
+          // In the conversation means OpenCode delivered it to the dot. Nothing reports whether the
+          // model has read it, so there's no "Read".
+          if pending.isEmpty, messages.last?.kind == "owner" {
+            HStack {
+              Spacer()
+              Text("Delivered").font(.caption2).foregroundStyle(.tertiary)
+            }
+            .accessibilityIdentifier("delivered-\(name)")
+          }
           ForEach(pending) { item in
             PendingRow(store: store, item: item, dot: name).onTapGesture {
               if item.error != nil { store.dismiss(name, item.id) }
@@ -912,6 +921,15 @@ struct PendingRow: View {
   let item: Pending
   let dot: String
 
+  /// "sent" once OpenCode admitted it; it leaves this row when it's delivered into the conversation.
+  private var status: String {
+    switch item.messageID.flatMap({ store.sendStatus[dot]?[$0] }) {
+    case "sent": "sent"
+    case "confirming": "confirming…"
+    default: "sending…"
+    }
+  }
+
   var body: some View {
     let anchorID = "pending-\(dot)-\(item.id)"
     HStack {
@@ -934,7 +952,7 @@ struct PendingRow: View {
           if let error = item.error {
             Text("\(error) · click to dismiss").font(.caption2).foregroundStyle(.red)
           } else {
-            Text(item.messageID == nil ? "sending…" : "queued").font(.caption2).foregroundStyle(.tertiary)
+            Text(status).font(.caption2).foregroundStyle(.tertiary)
           }
           MessageActionsButton(id: anchorID)
         }

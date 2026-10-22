@@ -2,6 +2,7 @@ import { Effect, Layer } from "effect";
 import {
   type Approval,
   type Attachment,
+  type Delivery,
   type Entry,
   OpenCode,
   OpenCodeError,
@@ -11,7 +12,11 @@ import {
 
 const broken = (message: string) => Effect.fail(new OpenCodeError({ message }));
 
-/** An in-memory OpenCode. "lost" admits the prompt but reports a failure, like a dropped response. */
+/**
+ * An in-memory OpenCode. "lost" admits the prompt but reports a failure, like a dropped response.
+ * An admitted prompt waits in `inbox` until a test delivers it by removing it, as OpenCode does at
+ * a step or turn boundary.
+ */
 export function fakeOpenCode() {
   const state = {
     sessions: new Set<string>(),
@@ -20,12 +25,16 @@ export function fakeOpenCode() {
     prompted: [] as string[],
     texts: [] as { sessionID: string; text: string }[],
     files: new Map<string, readonly Attachment[]>(),
+    deliveries: new Map<string, Delivery>(),
+    inbox: [] as { sessionID: string; id: string; delivery: Delivery }[],
     active: new Set<string>(),
     turns: new Map<string, Omit<Turn, "end"> & { end?: string }>(),
     messageTurns: new Map<string, Turn>(),
     readFailure: false,
+    lookupFailure: false,
     onMessage: () => {},
     onRecent: () => {},
+    onPrompt: (_messageID: string) => {},
     approvals: new Map<string, Approval>(),
     history: new Map<string, Entry[]>(),
     create: "ok" as "ok" | "fail",
@@ -40,13 +49,27 @@ export function fakeOpenCode() {
             state.created.push(input);
             state.sessions.add(input.id);
           }),
-    messageExists: ({ messageID }) => Effect.sync(() => state.messages.has(messageID)),
-    queuePrompt: ({ sessionID, messageID, text, files }) => {
+    messageExists: ({ messageID }) =>
+      Effect.suspend(() =>
+        state.lookupFailure
+          ? broken("inbox unavailable")
+          : Effect.succeed(state.messages.has(messageID)),
+      ),
+    inbox: (sessionID) =>
+      Effect.suspend(() =>
+        state.lookupFailure
+          ? broken("inbox unavailable")
+          : Effect.succeed(state.inbox.filter((item) => item.sessionID === sessionID)),
+      ),
+    prompt: ({ sessionID, messageID, text, files, delivery }) => {
       if (state.prompt === "fail") return broken("connection refused");
+      state.onPrompt(messageID);
       state.prompted.push(messageID);
       state.texts.push({ sessionID, text });
+      state.deliveries.set(messageID, delivery);
       if (files) state.files.set(messageID, files);
       state.messages.add(messageID);
+      state.inbox.push({ sessionID, id: messageID, delivery });
       return state.prompt === "lost" ? broken("connection reset") : Effect.void;
     },
     activeSessions: Effect.sync(() => new Set(state.active)),

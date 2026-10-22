@@ -37,6 +37,8 @@ struct Pending: Identifiable {
   var selected: String?
   var messages: [String: [Message]] = [:]
   var pending: [String: [Pending]] = [:]
+  /// Per dot, where each accepted send stands until it's in the conversation: sending, confirming or sent.
+  var sendStatus: [String: [String: String]] = [:]
   var drafts: [String: String] = [:]
   var draftImages: [String: [DraftImage]] = [:]
   var imageErrors: [String: String] = [:]
@@ -698,11 +700,13 @@ struct Pending: Identifiable {
     let epoch = writeEpoch[name, default: 0]
     messageReads[name, default: 0] += 1
     let read = messageReads[name]
-    guard let list = try? await api.messages(name) else { return }
+    guard let result = try? await api.messages(name) else { return }
+    let (list, statuses) = result
     // Discard polls begun before/during a write, and older overlapping reads.
     guard epoch == writeEpoch[name, default: 0], read == messageReads[name],
       !reacting.contains(where: { $0.dot == name }), !hiding.contains(where: { $0.dot == name }) else { return }
     messages[name] = list
+    sendStatus[name] = statuses
     // Hidden messages still count here, so a pending send matches its delivered ID.
     let ids = Set(list.map(\.id))
     let shown = Set(list.filter { $0.hidden != true }.map(\.id))
@@ -711,8 +715,11 @@ struct Pending: Identifiable {
     if thumbnails.keys.contains(where: gone) { thumbnails = thumbnails.filter { !gone($0.key) } }
     if unavailable.contains(where: gone) { unavailable = unavailable.filter { !gone($0) } }
     let oldest = list.first?.time ?? 0
-    // An accepted message older than everything shown was delivered and has scrolled out.
-    pending[name]?.removeAll { item in item.messageID.map { ids.contains($0) || oldest > item.sentAt } ?? false }
+    // An accepted message older than everything shown was delivered and has scrolled out, unless
+    // the daemon still lists it as not delivered.
+    pending[name]?.removeAll { item in
+      item.messageID.map { ids.contains($0) || (oldest > item.sentAt && statuses[$0] == nil) } ?? false
+    }
     let latest = list.filter { $0.kind != "owner" && $0.hidden != true }.map(\.time).max() ?? 0
     newest[name] = latest
     if seen[name] == nil || visible(name) { seen[name] = latest }

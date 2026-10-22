@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Effect } from "effect";
+import { Effect, Layer } from "effect";
+import { FetchHttpClient } from "effect/http";
 import { api } from "../src/api";
 import { deliver } from "../src/daemon";
 import { openDatabase } from "../src/db";
@@ -48,6 +49,8 @@ test("images survive SQLite reopen and public HTTP delivery, including lost admi
       input instanceof Request ? new Request(input, init) : new Request(input.toString(), init);
     const url = new URL(request.url);
     assert.equal(url.origin, "http://opencode.test", "No real network calls are allowed");
+    // Idle, so the owner's messages are queued rather than steered.
+    if (url.pathname === "/api/session/active") return Response.json({ data: {} });
     if (url.pathname === "/api/session/ses_images/inbox") {
       if (lookupFailure) return new Response("unavailable", { status: 503 });
       return Response.json({ data: [...admitted.values()] });
@@ -112,7 +115,17 @@ test("images survive SQLite reopen and public HTTP delivery, including lost admi
       throw new Error("Unexpected fake HTTP preconnect");
     },
   });
-  const fetched = spyOn(globalThis, "fetch").mockImplementation(transport);
+  // The fake goes to the Effect client as its Fetch service. FetchHttpClient caches its default,
+  // globalThis.fetch, on first use, so a global spy would serve only the first such test in a run.
+  const layer = Layer.merge(OpenCode.layer, Layer.succeed(FetchHttpClient.Fetch, transport));
+  const fetched = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(
+      () => {
+        throw new Error("Global fetch is not allowed: use the injected fake");
+      },
+      { preconnect: () => {} },
+    ),
+  );
   try {
     db.insert(dots)
       .values({
@@ -146,13 +159,11 @@ test("images survive SQLite reopen and public HTTP delivery, including lost admi
     expect(db.select().from(outbox).all()).toEqual(before);
     const [first, second] = before;
     assert(first && second);
-    await Effect.runPromise(deliver(db, first).pipe(Effect.provide(OpenCode.layer)));
+    await Effect.runPromise(deliver(db, first).pipe(Effect.provide(layer)));
     expect(db.select().from(outbox).all()[0]?.state).toBe("sent");
     lost = true;
     expect(
-      await Effect.runPromise(
-        deliver(db, second).pipe(Effect.provide(OpenCode.layer), Effect.isFailure),
-      ),
+      await Effect.runPromise(deliver(db, second).pipe(Effect.provide(layer), Effect.isFailure)),
     ).toBe(true);
     expect(db.select().from(outbox).all()[1]?.state).toBe("pending");
     db.$client.close();
@@ -161,14 +172,12 @@ test("images survive SQLite reopen and public HTTP delivery, including lost admi
     assert(pending);
     lookupFailure = true;
     expect(
-      await Effect.runPromise(
-        deliver(db, pending).pipe(Effect.provide(OpenCode.layer), Effect.isFailure),
-      ),
+      await Effect.runPromise(deliver(db, pending).pipe(Effect.provide(layer), Effect.isFailure)),
     ).toBe(true);
     expect(posts).toHaveLength(2);
     expect(db.select().from(outbox).all()[1]?.state).toBe("pending");
     lookupFailure = false;
-    await Effect.runPromise(deliver(db, pending).pipe(Effect.provide(OpenCode.layer)));
+    await Effect.runPromise(deliver(db, pending).pipe(Effect.provide(layer)));
     expect(posts).toHaveLength(2);
     expect(
       db
@@ -181,7 +190,7 @@ test("images survive SQLite reopen and public HTTP delivery, including lost admi
       api(
         db,
         "token",
-        OpenCode.layer,
+        layer,
       )(
         new Request(`http://local/dots/images/messages${suffix}`, {
           headers: { authorization: "Bearer token" },
@@ -204,6 +213,7 @@ test("images survive SQLite reopen and public HTTP delivery, including lost admi
       expect(response.status).toBe(200);
       expect(Buffer.from(await response.arrayBuffer()).toString("base64")).toBe(file.data);
     }
+    expect(fetched).not.toHaveBeenCalled();
   } finally {
     fetched.mockRestore();
     discover.mockRestore();

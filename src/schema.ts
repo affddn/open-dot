@@ -115,6 +115,10 @@ export const outbox = sqliteTable("outbox", {
   route: text({ mode: "json" }).$type<Route>(),
   quote: text({ mode: "json" }).$type<QuoteSnapshot>(),
   ownerText: text("owner_text"),
+  // How OpenCode gets the message. The owner's notch messages start as "auto", and the daemon saves
+  // "steer" (into a running turn) or "queue" with startedAt, before its first call. Null is "queue":
+  // Slack, notices and other dots never steer.
+  delivery: text({ enum: ["auto", "queue", "steer"] }),
   startedAt: integer("started_at"),
   turnEnd: text("turn_end"),
   createdAt: integer("created_at").notNull(),

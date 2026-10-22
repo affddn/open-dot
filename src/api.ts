@@ -1,5 +1,5 @@
 import { SessionMessage } from "@opencode/client/effect";
-import { and, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, ne, sql } from "drizzle-orm";
 import { Effect, type Layer } from "effect";
 import type { Db } from "./db";
 import { findDot, listDots } from "./dots";
@@ -137,8 +137,33 @@ const conversation = (db: Db, dot: Dot) =>
     const entries = yield* (yield* OpenCode).recentMessages(dot.sessionID, read);
     // A read that began before a rebinding must not pass as the new session's conversation.
     if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
-    return Response.json({ messages: visibleMessages(db, dot, entries) });
+    return Response.json({
+      messages: visibleMessages(db, dot, entries),
+      pending: pendingSends(db, dot, entries),
+    });
   });
+
+/**
+ * Where each of the owner's notch messages stands before it reaches the history: "sending" while
+ * open-dot holds it, "confirming" once a call began whose outcome it is still checking by ID, and
+ * "sent" once OpenCode admitted it. A message in the history has been delivered to the dot.
+ * Nothing says whether the model has read it: OpenCode reports no such thing.
+ */
+const pendingSends = (db: Db, dot: Dot, entries: readonly Entry[]) => {
+  const delivered = new Set(entries.map((item) => item.id));
+  return db
+    .select({ messageID: outbox.messageID, state: outbox.state, startedAt: outbox.startedAt })
+    .from(outbox)
+    .where(
+      and(eq(outbox.sessionID, dot.sessionID), isNotNull(outbox.delivery), isNull(outbox.turnEnd)),
+    )
+    .all()
+    .filter((row) => !delivered.has(row.messageID))
+    .map((row) => ({
+      id: row.messageID,
+      status: row.state === "sent" ? "sent" : row.startedAt === null ? "sending" : "confirming",
+    }));
+};
 
 const react = (db: Db, dot: Dot, id: string, request: Request) =>
   Effect.gen(function* () {
@@ -469,6 +494,8 @@ const send = (db: Db, dot: Dot, request: Request) =>
           quote,
           state: "pending",
           fromOwner: true,
+          // The daemon decides at delivery whether it steers into a running turn.
+          delivery: "auto",
           feed: reply,
           createdAt: Date.now(),
         })

@@ -449,9 +449,10 @@ test("0016 adds only nullable outbox files and preserves every 0015 column, row 
       const after = db.$client.query<Column, []>(`pragma table_info("${name}")`).all();
       const stored = columns.get(name);
       assert(stored, `Missing stored columns for ${name}`);
+      // Later migrations may add outbox columns after files.
       if (name === "outbox") {
-        expect(after.slice(0, -1)).toEqual(stored);
-        expect(after.at(-1)).toMatchObject({
+        expect(after.slice(0, stored.length)).toEqual(stored);
+        expect(after[stored.length]).toMatchObject({
           name: "files",
           type: "TEXT",
           notnull: 0,
@@ -510,10 +511,24 @@ test("0017 adds only hidden_messages and preserves every 0016 table, column, row
   );
   const tables = tableNames(old);
   const columns = new Map(
-    tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
+    tables.map((name) => [
+      name,
+      old.query<{ name: string }, []>(`pragma table_info("${name}")`).all(),
+    ]),
   );
+  // Only the columns 0016 had: later migrations may add more.
   const rows = (sqlite: Database) =>
-    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+    tables.map((name) => [
+      name,
+      sqlite
+        .query(
+          `select ${columns
+            .get(name)
+            ?.map((column) => `"${column.name}"`)
+            .join(",")} from "${name}"`,
+        )
+        .all(),
+    ]);
   const before = rows(old);
   const ledger = ledgerOf(old);
   old.close();
@@ -523,7 +538,9 @@ test("0017 adds only hidden_messages and preserves every 0016 table, column, row
     for (const name of tables) {
       const stored = columns.get(name);
       assert(stored, `Missing stored columns for ${name}`);
-      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(stored);
+      expect(
+        db.$client.query(`pragma table_info("${name}")`).all().slice(0, stored.length),
+      ).toEqual(stored);
     }
     const added = tableNames(db.$client).filter((name) => !tables.includes(name));
     // Later migrations may add tables; 0017 itself is one CREATE TABLE.
@@ -551,6 +568,93 @@ test("0017 adds only hidden_messages and preserves every 0016 table, column, row
     expect(db.select().from(hiddenMessages).all()).toEqual([marker]);
     expect(rows(db.$client)).toEqual(before);
     expectLedger(db.$client, ledger, "0017");
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0018 adds only nullable outbox delivery and preserves every 0017 table, column, row and ledger entry", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-delivery-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0018");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  // An owner's message saved but not yet admitted, and one whose outcome is unknown.
+  old.run(
+    "insert into outbox (session_id,message_id,text,files,state,from_owner,quote,created_at) values ('ses_jojo','waiting','Keep','[]','pending',1,'{}',1)",
+  );
+  old.run(
+    "insert into outbox (session_id,message_id,text,state,from_owner,started_at,created_at) values ('ses_jojo','unknown','Keep','pending',1,7,1)",
+  );
+  old.run(
+    "insert into hidden_messages (dot,session_id,message_id,hidden_at) values ('jojo','ses_jojo','old',1)",
+  );
+  old.run("insert into notes (dot,text,created_at) values ('jojo','Keep',1)");
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [
+      name,
+      sqlite
+        .query(`select * from "${name}"`)
+        .all()
+        .map((row) => {
+          if (name !== "outbox" || typeof row !== "object" || row === null) return row;
+          const { delivery, ...rest } = row as { delivery?: unknown };
+          expect(delivery ?? null).toBeNull();
+          return rest;
+        }),
+    ]);
+  const before = rows(old);
+  const ledger = ledgerOf(old);
+  old.close();
+  let db = openDatabase(path);
+  try {
+    expect(rows(db.$client)).toEqual(before);
+    expect(tableNames(db.$client)).toEqual(tables);
+    for (const name of tables) {
+      const stored = columns.get(name);
+      assert(stored, `Missing stored columns for ${name}`);
+      const after = db.$client.query(`pragma table_info("${name}")`).all();
+      if (name !== "outbox") expect(after).toEqual(stored);
+      else {
+        expect(after.slice(0, -1)).toEqual(stored);
+        expect(after.at(-1)).toMatchObject({
+          name: "delivery",
+          type: expect.stringMatching(/^text$/i),
+          notnull: 0,
+          dflt_value: null,
+          pk: 0,
+        });
+      }
+    }
+    expect(readFileSync(join(repoMigrations, "0018_steer_delivery.sql"), "utf8").trim()).toBe(
+      "ALTER TABLE `outbox` ADD `delivery` text;",
+    );
+    expectLedger(db.$client, ledger, "0018");
+    // Old rows stay queued: none of them ever steers.
+    expect(
+      db
+        .select()
+        .from(outbox)
+        .all()
+        .map((row) => row.delivery),
+    ).toEqual([null, null]);
+    db.$client.close();
+    db = openDatabase(path);
+    expect(rows(db.$client)).toEqual(before);
+    expectLedger(db.$client, ledger, "0018");
   } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });

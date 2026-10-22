@@ -102,6 +102,14 @@ export interface MessageRef {
   readonly messageID: string;
 }
 
+export type Delivery = "queue" | "steer";
+
+/** An admitted input still waiting in the session's inbox. */
+export interface Pending {
+  readonly id: string;
+  readonly delivery: Delivery;
+}
+
 export interface Turn {
   readonly outcome: "succeeded" | "failed" | "interrupted";
   /** The text of the turn's last assistant message, if it wrote any. */
@@ -169,11 +177,20 @@ export class OpenCode extends Context.Service<
   {
     readonly sessionExists: (sessionID: string) => Effect.Effect<boolean, OpenCodeError>;
     readonly createSession: (input: SessionInput) => Effect.Effect<void, OpenCodeError>;
-    /** True once OpenCode has admitted the message, whether it is still queued or already in the history. */
+    /** True once OpenCode has admitted the message, whether it is still in the inbox or already in the history. */
     readonly messageExists: (ref: MessageRef) => Effect.Effect<boolean, OpenCodeError>;
-    /** Queues the text as a user message with the caller's ID. */
-    readonly queuePrompt: (
-      ref: MessageRef & { readonly text: string; readonly files?: readonly Attachment[] },
+    /** Input OpenCode has admitted but not yet delivered into the history, oldest first. */
+    readonly inbox: (sessionID: string) => Effect.Effect<readonly Pending[], OpenCodeError>;
+    /**
+     * Admits the text as a user message with the caller's ID. "queue" waits for the running turn to
+     * end; "steer" joins it at its next step, after the current step's tool calls finish.
+     */
+    readonly prompt: (
+      ref: MessageRef & {
+        readonly text: string;
+        readonly files?: readonly Attachment[];
+        readonly delivery: Delivery;
+      },
     ) => Effect.Effect<void, OpenCodeError>;
     /** IDs of the sessions that are running a turn now. */
     readonly activeSessions: Effect.Effect<ReadonlySet<string>, OpenCodeError>;
@@ -234,7 +251,7 @@ export class OpenCode extends Context.Service<
               permissions: destructive,
             })
             .pipe(Effect.asVoid, Effect.mapError(failed(`Could not create session ${id}`))),
-        // Check the inbox first: a queued message moves from the inbox into the history, never back.
+        // Check the inbox first: an admitted message moves from the inbox into the history, never back.
         messageExists: (ref) => {
           const sessionID = Session.ID.make(ref.sessionID);
           const messageID = SessionMessage.ID.make(ref.messageID);
@@ -250,7 +267,12 @@ export class OpenCode extends Context.Service<
             Effect.mapError(failed(`Could not look up message ${ref.messageID}`)),
           );
         },
-        queuePrompt: ({ sessionID, messageID, text, files }) =>
+        inbox: (sessionID) =>
+          client.session.inbox.list({ sessionID: Session.ID.make(sessionID) }).pipe(
+            Effect.map((inbox) => inbox.map(({ id, delivery }) => ({ id, delivery }))),
+            Effect.mapError(failed(`Could not read the inbox of ${sessionID}`)),
+          ),
+        prompt: ({ sessionID, messageID, text, files, delivery }) =>
           client.session
             .prompt({
               sessionID: Session.ID.make(sessionID),
@@ -260,7 +282,7 @@ export class OpenCode extends Context.Service<
                 uri: `data:${mime};base64,${data}`,
                 name,
               })),
-              delivery: "queue",
+              delivery,
             })
             .pipe(Effect.asVoid, Effect.mapError(failed(`Could not send message ${messageID}`))),
         activeSessions: client.session.active().pipe(

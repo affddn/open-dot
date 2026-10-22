@@ -93,18 +93,41 @@ export const deliver = (db: Db, message: Message) =>
   Effect.gen(function* () {
     const opencode = yield* OpenCode;
     const ref = { sessionID: message.sessionID, messageID: message.messageID };
+    const delivery =
+      message.delivery === "auto"
+        ? yield* followUp(message.sessionID)
+        : (message.delivery ?? "queue");
     db.update(outbox)
-      .set({ startedAt: message.startedAt ?? Date.now() })
+      .set({
+        startedAt: message.startedAt ?? Date.now(),
+        ...(message.delivery === "auto" ? { delivery } : {}),
+      })
       .where(eq(outbox.id, message.id))
       .run();
     if (!(yield* opencode.messageExists(ref))) {
-      yield* opencode.queuePrompt({
+      yield* opencode.prompt({
         ...ref,
         text: message.text,
         ...(message.files === null ? {} : { files: message.files }),
+        delivery,
       });
     }
     db.update(outbox).set({ state: "sent" }).where(eq(outbox.id, message.id)).run();
+  });
+
+/**
+ * How an owner's notch message joins its session: steered into a running turn, or queued when the
+ * session is idle. OpenCode delivers every steer before any queued input, so a queued input still
+ * waiting in the inbox, such as a worker report, keeps the owner's message queued behind it.
+ */
+const followUp = (sessionID: string) =>
+  Effect.gen(function* () {
+    const opencode = yield* OpenCode;
+    if (!(yield* opencode.activeSessions).has(sessionID)) return "queue" as const;
+    const waiting = yield* opencode.inbox(sessionID);
+    return waiting.some((item) => item.delivery === "queue")
+      ? ("queue" as const)
+      : ("steer" as const);
   });
 
 /** True when a message is waiting to be sent or a worker is unfinished. */
