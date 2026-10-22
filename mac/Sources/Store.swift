@@ -58,6 +58,13 @@ struct Pending: Identifiable {
   var unavailable: Set<AttachmentKey> = []
   var reacting: Set<MessageKey> = []
   var reactionErrors: [MessageKey: String] = [:]
+  /// The owner's latest non-classic emoji, newest first, as the daemon last reported them.
+  var recentEmojis: [String] = []
+  /// Bumped around each reaction, so a poll that overlaps one can't bring back older recent emoji.
+  @ObservationIgnored private var recentWrites = 0
+  /// Set once reactions overlap. Their responses may then answer out of order, so none is used for
+  /// the recent emoji; one fresh read after the last ends replaces them.
+  @ObservationIgnored private var recentContended = false
   var hiding: Set<MessageKey> = []
   /// Why the last menu action on a message failed, shown under it.
   var actionErrors: [MessageKey: String] = [:]
@@ -363,19 +370,28 @@ struct Pending: Identifiable {
     let selected = message.reactions?.first(where: { $0.actor == "owner" })?.emoji
     let next = selected == emoji ? nil : emoji
     writeEpoch[key.dot, default: 0] += 1
+    recentWrites += 1
+    if reacting.count > 1 { recentContended = true }
     reactionErrors[key] = nil
     Task {
       defer {
         reacting.remove(key)
         writeEpoch[key.dot, default: 0] += 1
+        recentWrites += 1
+        if reacting.isEmpty && recentContended {
+          recentContended = false
+          Task { await refreshMessages(key.dot) }
+        }
       }
       do {
-        let confirmed = try await api.react(key, emoji: next)
+        let (confirmed, recent) = try await api.react(key, emoji: next)
         guard confirmed.dot == key.dot, confirmed.messageID == key.message,
           confirmed.actor == "owner", confirmed.emoji == next else {
           reactionErrors[key] = "Reaction outcome unknown: unexpected response. Refreshing saved state."
           return
         }
+        // Only a reaction that overlapped no other knows the latest order.
+        if let recent, !recentContended, recent != recentEmojis { recentEmojis = recent }
         if let index = messages[key.dot]?.firstIndex(where: { $0.id == key.message }) {
           var saved = messages[key.dot]![index].reactions ?? []
           saved.removeAll { $0.actor == "owner" }
@@ -698,15 +714,18 @@ struct Pending: Identifiable {
 
   private func refreshMessages(_ name: String) async {
     let epoch = writeEpoch[name, default: 0]
+    let recentEpoch = recentWrites
     messageReads[name, default: 0] += 1
     let read = messageReads[name]
     guard let result = try? await api.messages(name) else { return }
-    let (list, statuses) = result
+    let (list, statuses, recent) = result
     // Discard polls begun before/during a write, and older overlapping reads.
     guard epoch == writeEpoch[name, default: 0], read == messageReads[name],
       !reacting.contains(where: { $0.dot == name }), !hiding.contains(where: { $0.dot == name }) else { return }
     messages[name] = list
     sendStatus[name] = statuses
+    // Recent emoji are the owner's across dots, so a reaction to any dot's message makes this read stale.
+    if let recent, recentEpoch == recentWrites, reacting.isEmpty, recent != recentEmojis { recentEmojis = recent }
     // Hidden messages still count here, so a pending send matches its delivered ID.
     let ids = Set(list.map(\.id))
     let shown = Set(list.filter { $0.hidden != true }.map(\.id))

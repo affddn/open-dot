@@ -10,6 +10,7 @@ import {
   isReactionEmoji,
   messageKind,
   messageSources,
+  recentEmojis,
   saveReaction,
 } from "./reactions";
 import { quoted, quoteText, replyPrompt } from "./replies";
@@ -140,6 +141,8 @@ const conversation = (db: Db, dot: Dot) =>
     return Response.json({
       messages: visibleMessages(db, dot, entries),
       pending: pendingSends(db, dot, entries),
+      // The owner's, across every dot: the menu's second row.
+      recentEmojis: recentEmojis(db),
     });
   });
 
@@ -178,7 +181,7 @@ const react = (db: Db, dot: Dot, id: string, request: Request) =>
       Object.keys(body).length !== 1 ||
       !isReactionEmoji(body.emoji)
     )
-      return error(400, "Send {emoji: ❤️, 👍, 👎, 😂, ‼️, ❓ or null}.");
+      return error(400, "Send {emoji: exactly one emoji, or null to remove}.");
     if (dot.sessionState !== "ready") return error(404, "There's no such dot message.");
     const entries = yield* (yield* OpenCode).recentMessages(dot.sessionID, read);
     const target = entries.find((item) => item.id === id);
@@ -190,7 +193,8 @@ const react = (db: Db, dot: Dot, id: string, request: Request) =>
       return error(404, "There's no such dot message in recent history.");
     if (rebound(db, dot))
       return error(409, "The dot's conversation changed. Refresh before reacting.");
-    return Response.json({ reaction: saveReaction(db, dot, id, "owner", body.emoji, target.text) });
+    const reaction = saveReaction(db, dot, id, "owner", body.emoji, target.text);
+    return Response.json({ reaction, recentEmojis: recentEmojis(db) });
   });
 
 /**

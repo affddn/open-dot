@@ -131,19 +131,22 @@ enum APIError: Error {
     try decode([Dot].self, await send("GET", "/dots"))
   }
 
-  /// The conversation, and where each of the owner's sends that isn't in it yet stands.
-  func messages(_ dot: String) async throws -> (messages: [Message], pending: [String: String]) {
+  /// The conversation, where each of the owner's sends that isn't in it yet stands, and the owner's
+  /// recent emoji for the menu's second row, which a daemon older than any-emoji Tapbacks omits.
+  func messages(_ dot: String) async throws -> (messages: [Message], pending: [String: String], recent: [String]?) {
     struct Status: Decodable { let id: String; let status: String }
-    struct Body: Decodable { let messages: [Message]; let pending: [Status]? }
+    struct Body: Decodable { let messages: [Message]; let pending: [Status]?; let recentEmojis: [String]? }
     let body = try decode(Body.self, await send("GET", "/dots/\(escape(dot))/messages"))
-    return (body.messages, Dictionary((body.pending ?? []).map { ($0.id, $0.status) }) { first, _ in first })
+    return (body.messages, Dictionary((body.pending ?? []).map { ($0.id, $0.status) }) { first, _ in first }, body.recentEmojis)
   }
 
-  func react(_ key: MessageKey, emoji: String?) async throws -> Reaction {
-    struct Body: Decodable { let reaction: Reaction }
+  /// Saves the owner's reaction, any single emoji or nil to remove it, and returns the second row as it now stands.
+  func react(_ key: MessageKey, emoji: String?) async throws -> (reaction: Reaction, recent: [String]?) {
+    struct Body: Decodable { let reaction: Reaction; let recentEmojis: [String]? }
     // JSONEncoder omits nil optional fields; removal needs an explicit JSON null.
     let body = try JSONSerialization.data(withJSONObject: ["emoji": emoji as Any? ?? NSNull()])
-    return try decode(Body.self, await send("PUT", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/reaction", body: body)).reaction
+    let saved = try decode(Body.self, await send("PUT", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/reaction", body: body))
+    return (saved.reaction, saved.recentEmojis)
   }
 
   /// Hides the message in the notch only, for the session it was read from. Never retried on its own.

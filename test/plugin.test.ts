@@ -6,15 +6,17 @@ import type { Plugin } from "@opencode/plugin";
 import { eq } from "drizzle-orm";
 import { Effect } from "effect";
 import { openDatabase } from "../src/db";
-import { createDot } from "../src/dots";
+import { createDot, findDot } from "../src/dots";
 import { databasePath, home } from "../src/home";
 import plugin from "../src/plugin";
+import { saveReaction } from "../src/reactions";
 import {
   dots,
   feed,
   hiddenMessages,
   outbox,
   reactions,
+  recentReactions,
   reminders,
   workers,
   type Route,
@@ -388,8 +390,8 @@ test("dot_react uses exact session authority and real owner history without star
   expect(loaded.reads).toEqual([]);
   for (const target of ["notice", "peer", "assistant", "synthetic", "missing", "pending"])
     expect(await fails(react(`msg_${target}`, "👍"))).toBe(true);
-  expect(await fails(react("msg_owner", "🔥"))).toBe(true);
-  expect(await fails(react("msg_owner", undefined))).toBe(true);
+  for (const invalid of ["fire", "👍👍", "❤", "🇦", "🧐\u200d🧐", "🔥\n", "", 1, undefined])
+    expect(await fails(react("msg_owner", invalid))).toBe(true);
   expect(db.select().from(reactions).all()).toEqual([]);
 
   await react("msg_owner", "👍");
@@ -407,6 +409,36 @@ test("dot_react uses exact session authority and real owner history without star
   db.update(dots).set({ sessionID: "ses_rebound" }).run();
   expect(await fails(react("msg_owner", "😂"))).toBe(true);
   expect(db.select().from(outbox).all()).toEqual(originalOutbox);
+  expect(loaded.turns).toEqual([]);
+  await loaded.cleanup?.();
+  db.$client.close();
+});
+
+test("dot_react takes any single emoji with the same authority, and its choices never become the owner's recents", async () => {
+  const db = openDatabase(databasePath());
+  db.update(dots).set({ sessionState: "ready" }).run();
+  const history = [{ id: "msg_owner", type: "user", text: "owner text", time: { created: 0 } }];
+  const loaded = await load(dot.directory, history);
+  for (const session of ["ses_worker", "ses_foreign"])
+    expect(
+      await fails(loaded.call("dot_react", { message_id: "msg_owner", emoji: "🔥" }, session)),
+    ).toBe(true);
+  for (const emoji of ["🔥", "🇯🇵", "👍🏽", "👩🏽‍💻", "🏳️‍🌈", "#️⃣"]) {
+    await loaded.call("dot_react", { message_id: "msg_owner", emoji });
+    expect(db.select().from(reactions).all()).toMatchObject([
+      { actor: "dot", messageID: "msg_owner", emoji },
+    ]);
+  }
+  expect(db.select().from(recentReactions).all()).toEqual([]);
+  // The owner's own choice on the dot's message, which the next request reports with the dot's.
+  const current = findDot(db, "jojo");
+  if (!current) throw new Error("missing dot");
+  saveReaction(db, current, "msg_answer", "owner", "🫶🏽", "answer");
+  expect(db.select().from(recentReactions).all()).toMatchObject([{ emoji: "🫶🏽" }]);
+  const snapshot = await loaded.injected(dot.sessionID);
+  expect(snapshot).toContain('"messageID":"msg_answer","actor":"owner","emoji":"🫶🏽"');
+  expect(snapshot).toContain('"messageID":"msg_owner","actor":"dot","emoji":"#️⃣"');
+  expect(db.select().from(outbox).all()).toEqual([]);
   expect(loaded.turns).toEqual([]);
   await loaded.cleanup?.();
   db.$client.close();

@@ -13,7 +13,6 @@ import {
   type FeedItem,
   notes,
   outbox,
-  reactionEmojis,
   reactions,
   reminders,
   responsibilities,
@@ -183,13 +182,18 @@ export default Plugin.define({
           "Explicitly react to a real owner message in your own conversation. Use a message_id from fresh reaction context. One reaction per message: another emoji replaces it, null removes it. This is local feedback only; it sends no message and starts no turn.",
         input: Schema.Struct({
           message_id: text("The owner's message ID from this conversation"),
-          emoji: Schema.NullOr(Schema.Literals(reactionEmojis)),
+          emoji: Schema.NullOr(
+            text(
+              "Exactly one emoji, e.g. ❤️ 👍 👎 😂 ‼️ ❓ 🔥 🇯🇵 👍🏽 👩🏽‍💻; null removes your reaction",
+            ),
+          ),
         }),
         options: { codemode: false },
         execute: async (input, call) => {
           const current = bound(call.sessionID);
           if (!current) throw new Error(`Only ${name}'s exact bound conversation can react.`);
-          if (!isReactionEmoji(input.emoji)) throw new Error("Unsupported reaction emoji.");
+          if (!isReactionEmoji(input.emoji))
+            throw new Error("A reaction is exactly one emoji, or null to remove it.");
           const history = await context.session.context({ sessionID: current.sessionID });
           const target = history.find((item) => item.id === input.message_id);
           if (!target) throw new Error("No such owner message in the current session context.");

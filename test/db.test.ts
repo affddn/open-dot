@@ -13,6 +13,7 @@ import {
   hiddenMessages,
   outbox,
   reactions,
+  recentReactions,
   slack,
   slackApps,
   slackEvents,
@@ -622,7 +623,8 @@ test("0018 adds only nullable outbox delivery and preserves every 0017 table, co
   let db = openDatabase(path);
   try {
     expect(rows(db.$client)).toEqual(before);
-    expect(tableNames(db.$client)).toEqual(tables);
+    // Later migrations may add tables; 0018 itself adds none.
+    expect(tableNames(db.$client).filter((name) => tables.includes(name))).toEqual(tables);
     for (const name of tables) {
       const stored = columns.get(name);
       assert(stored, `Missing stored columns for ${name}`);
@@ -655,6 +657,81 @@ test("0018 adds only nullable outbox delivery and preserves every 0017 table, co
     db = openDatabase(path);
     expect(rows(db.$client)).toEqual(before);
     expectLedger(db.$client, ledger, "0018");
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0019 adds only recent_reactions and preserves every 0018 table, column, row and ledger entry", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-recent-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0019");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run(
+    "insert into outbox (session_id,message_id,text,state,from_owner,delivery,created_at) values ('ses_jojo','old','Keep','sent',1,'auto',1)",
+  );
+  // Stored classic reactions and a removal tombstone, from both actors.
+  old.run(
+    "insert into reactions (dot,session_id,message_id,actor,emoji,excerpt,updated_at) values ('jojo','ses_jojo','answer','owner','‼️','Keep',1),('jojo','ses_jojo','old','dot',null,'Keep',2)",
+  );
+  old.run(
+    "insert into hidden_messages (dot,session_id,message_id,hidden_at) values ('jojo','ses_jojo','old',1)",
+  );
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+  const before = rows(old);
+  const ledger = ledgerOf(old);
+  old.close();
+  let db = openDatabase(path);
+  try {
+    expect(rows(db.$client)).toEqual(before);
+    // Later migrations may add tables; 0019 itself is one CREATE TABLE.
+    const added = tableNames(db.$client).filter((name) => !tables.includes(name));
+    expect(added).toContain("recent_reactions");
+    for (const name of tables) {
+      const stored = columns.get(name);
+      assert(stored, `Missing stored columns for ${name}`);
+      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(stored);
+    }
+    const statements = readFileSync(join(repoMigrations, "0019_recent_reactions.sql"), "utf8")
+      .split("--> statement-breakpoint")
+      .map((statement) => statement.trim())
+      .filter(Boolean);
+    expect(statements).toHaveLength(1);
+    expect(statements[0]).toStartWith("CREATE TABLE `recent_reactions` (");
+    expect(db.$client.query('pragma table_info("recent_reactions")').all()).toMatchObject([
+      { name: "emoji", type: expect.stringMatching(/^text$/i), notnull: 1, pk: 1 },
+      { name: "seq", type: expect.stringMatching(/^integer$/i), notnull: 1, pk: 0 },
+    ]);
+    expectLedger(db.$client, ledger, "0019");
+    // Old classic rows read back unchanged through the widened column type.
+    expect(
+      db
+        .select()
+        .from(reactions)
+        .all()
+        .map((row) => row.emoji),
+    ).toEqual(["‼️", null]);
+    db.insert(recentReactions).values({ emoji: "🇯🇵", seq: 1 }).run();
+    db.$client.close();
+    db = openDatabase(path);
+    expect(db.select().from(recentReactions).all()).toEqual([{ emoji: "🇯🇵", seq: 1 }]);
+    expect(rows(db.$client)).toEqual(before);
+    expectLedger(db.$client, ledger, "0019");
   } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });

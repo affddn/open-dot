@@ -9,7 +9,15 @@ import { api } from "../src/api";
 import { step } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
 import { type Attachment, OpenCode, OpenCodeError } from "../src/opencode";
-import { dots, feed, hiddenMessages, outbox, reactions, workers } from "../src/schema";
+import {
+  dots,
+  feed,
+  hiddenMessages,
+  outbox,
+  reactions,
+  recentReactions,
+  workers,
+} from "../src/schema";
 import { fakeOpenCode } from "./fake-opencode";
 
 let db: Db;
@@ -118,7 +126,7 @@ test("reaction API rejects auth, body, target, binding and service failures with
     "null",
     "[]",
     "{}",
-    '{"emoji":"🔥"}',
+    '{"emoji":"fire"}',
     '{"emoji":1}',
     '{"emoji":"👍","text":"fake"}',
   ])
@@ -138,6 +146,130 @@ test("reaction API rejects auth, body, target, binding and service failures with
   expect((await call(path, { method: "PUT", body: '{"emoji":null}' })).status).toBe(404);
   expect(db.select().from(reactions).all()).toEqual([]);
   expect(fake.state.prompted).toEqual([]);
+});
+
+test("any single RGI emoji is a reaction; text, unqualified, partial and multiple emoji are not", async () => {
+  fake.state.history.set("ses_jojo", [entry("msg_answer", "assistant", "answer")]);
+  const valid = [
+    "❤️",
+    "‼️",
+    "🔥",
+    "🧐",
+    "🇯🇵",
+    "🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}",
+    "👍🏽",
+    "👩🏽‍💻",
+    "👨‍👩‍👧‍👦",
+    "🏳️‍🌈",
+    "1️⃣",
+  ];
+  for (const emoji of valid) {
+    const response = await putReaction(emoji);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ reaction: { actor: "owner", emoji } });
+  }
+  const saved = db.select().from(reactions).all();
+  const recent = db.select().from(recentReactions).all();
+  for (const emoji of [
+    "",
+    "ok",
+    "👍👍",
+    "🔥 ",
+    " 🔥",
+    "🔥\n",
+    "🔥\r\n",
+    "\n🔥",
+    "🔥\u2028",
+    "❤",
+    "‼",
+    "1",
+    "🇦",
+    "🇦🇦",
+    "👍x",
+    "🧐\u200d🧐",
+    "\u200d",
+    "\uFE0F",
+    "\uD83D",
+    "🔥".repeat(40),
+    ["🔥"],
+    { emoji: "🔥" },
+  ])
+    expect((await putReaction(emoji)).status).toBe(400);
+  expect(db.select().from(reactions).all()).toEqual(saved);
+  expect(db.select().from(recentReactions).all()).toEqual(recent);
+  expect(fake.state.prompted).toEqual([]);
+});
+
+const recentRow = async (name = "jojo") => {
+  const response = await call(`/dots/${name}/messages`);
+  return ((await response.json()) as { recentEmojis: string[] }).recentEmojis;
+};
+const putRecent = async (emoji: string | null, id = "msg_answer") => {
+  const response = await call(`/dots/jojo/messages/${id}/reaction`, {
+    method: "PUT",
+    body: JSON.stringify({ emoji }),
+  });
+  return ((await response.json()) as { recentEmojis: string[] }).recentEmojis;
+};
+test("the second row is the owner's five latest non-classic choices, deduplicated, then fallbacks", async () => {
+  fake.state.history.set("ses_jojo", [
+    entry("msg_answer", "assistant", "answer"),
+    entry("msg_other", "assistant", "other"),
+  ]);
+  const row = recentRow;
+  const put = putRecent;
+  expect(await row()).toEqual(["🧐", "✋", "👀", "🧠", "🔥"]);
+  // A used fallback moves to the front and isn't shown twice.
+  expect(await put("🔥")).toEqual(["🔥", "🧐", "✋", "👀", "🧠"]);
+  // Replacing and removing keep the earlier choice; classic Tapbacks never enter the row.
+  expect(await put("🇯🇵")).toEqual(["🇯🇵", "🔥", "🧐", "✋", "👀"]);
+  expect(await put(null)).toEqual(["🇯🇵", "🔥", "🧐", "✋", "👀"]);
+  expect(await put("👍")).toEqual(["🇯🇵", "🔥", "🧐", "✋", "👀"]);
+  // Repeating the saved value is idempotent and records nothing new.
+  await put("🦀", "msg_other");
+  expect(await put("🦀", "msg_other")).toEqual(["🦀", "🇯🇵", "🔥", "🧐", "✋"]);
+  for (const emoji of ["🐙", "👩🏽‍💻", "🌵"]) await put(emoji, "msg_other");
+  expect(await row()).toEqual(["🌵", "👩🏽‍💻", "🐙", "🦀", "🇯🇵"]);
+  // Choosing an older one again moves it to the front without a duplicate.
+  expect(await put("🇯🇵")).toEqual(["🇯🇵", "🌵", "👩🏽‍💻", "🐙", "🦀"]);
+  expect(db.select().from(recentReactions).all()).toHaveLength(5);
+  // The row is the owner's, across dots.
+  fake.state.history.set("ses_polnareff", [entry("msg_p", "assistant", "p")]);
+  expect(await row("polnareff")).toEqual(["🇯🇵", "🌵", "👩🏽‍💻", "🐙", "🦀"]);
+  expect(db.select().from(outbox).all()).toEqual([]);
+  expect(fake.state.prompted).toEqual([]);
+});
+
+test("recent choices survive a restart, including one no bubble shows any more", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-recent-"));
+  const path = join(directory, "open-dot.db");
+  const memory = db;
+  try {
+    db = openDatabase(path);
+    db.insert(dots)
+      .values({
+        name: "jojo",
+        directory: "/dots/jojo",
+        sessionID: "ses_jojo",
+        sessionState: "ready",
+        createdAt: 0,
+      })
+      .run();
+    fake.state.history.set("ses_jojo", [entry("msg_answer", "assistant", "answer")]);
+    for (const emoji of ["🧠", "🫶🏽", null]) expect((await putReaction(emoji)).status).toBe(200);
+    db.$client.close();
+    db = openDatabase(path);
+    const body = (await (await call("/dots/jojo/messages")).json()) as {
+      messages: { reactions: { emoji: string | null }[] }[];
+      recentEmojis: string[];
+    };
+    expect(body.messages[0]?.reactions).toMatchObject([{ emoji: null }]);
+    expect(body.recentEmojis).toEqual(["🫶🏽", "🧠", "🧐", "✋", "👀"]);
+  } finally {
+    db.$client.close();
+    db = memory;
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("message reactions are actor-labelled and isolated by dot and bound session", async () => {

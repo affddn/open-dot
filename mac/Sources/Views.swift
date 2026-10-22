@@ -1088,6 +1088,202 @@ final class MenuAnchorView: NSView {
   }
 }
 
+/// The emoji picker's capture, apart from AppKit. Capturing ends at the first choice, cancel or
+/// timeout. The notch's hold is separate: once the picker has been shown, it lasts until focus
+/// really leaves the hidden view, which then guards against a late pick from a picker AppKit can't
+/// close. Before the picker shows there's nothing to guard, so ending capture releases it too.
+struct EmojiCapture: Equatable {
+  enum Event: Equatable {
+    /// The system picker was opened for this capture.
+    case shown
+    /// An insertion arrived that counts as the choice.
+    case choice
+    /// Escape, another editing command, input that isn't an emoji, or the time limit.
+    case ended
+    /// Focus left the view, the view left its window, the app deactivated or opening failed.
+    case focusLost
+  }
+
+  struct Effect: Equatable {
+    var apply = false
+    var release = false
+  }
+
+  private(set) var capturing = true
+  private(set) var holding = true
+  private(set) var shown = false
+
+  mutating func handle(_ event: Event) -> Effect {
+    switch event {
+    case .shown:
+      if capturing { shown = true }
+      return Effect()
+    case .choice:
+      guard capturing else { return Effect() }
+      capturing = false
+      return Effect(apply: true, release: shown ? false : releaseHold())
+    case .ended:
+      guard capturing else { return Effect() }
+      capturing = false
+      return Effect(release: shown ? false : releaseHold())
+    case .focusLost:
+      capturing = false
+      return Effect(release: releaseHold())
+    }
+  }
+
+  private mutating func releaseHold() -> Bool {
+    defer { holding = false }
+    return holding
+  }
+}
+
+/// Takes one choice from the system emoji picker for the message whose menu opened it. It's an
+/// ordinary, invisible text view inside that message: it becomes the panel's first responder, and
+/// AppKit's `orderFrontCharacterPalette(_:)` opens the picker beside it, which types the chosen emoji
+/// through the text input system. The first insertion is the choice and never shows as text.
+///
+/// AppKit has no public way to close that picker or learn that it closed. So after a choice,
+/// Escape, a non-emoji or the time limit, the view keeps the panel's focus and keeps the notch
+/// open, dropping any later insertion, and nothing moves focus or folds the notch on its own. That
+/// ends only when the owner clicks or tabs elsewhere, switches apps, or the message leaves the
+/// panel, or another picker replaces it. A picker still open after that types wherever the owner
+/// put focus, such as the message box's draft, never into a reaction.
+@MainActor final class EmojiCatcher: NSTextView {
+  private static weak var current: EmojiCatcher?
+  private static let limit = Duration.seconds(60)
+  private var capture = EmojiCapture()
+  private var choose: (String) -> Void = { _ in }
+  private var report: (String) -> Void = { _ in }
+  private weak var store: Store?
+  private var waiting: NSObjectProtocol?
+  private var leaving: NSObjectProtocol?
+  private var timeout: Task<Void, Never>?
+
+  /// The picker's choice goes to `choose`, which keeps the message, dot and session it was opened for.
+  static func open(at anchor: NSView, store: Store, choose: @escaping (String) -> Void, report: @escaping (String) -> Void) {
+    guard let window = anchor.window else {
+      return report("The message scrolled away, so the emoji picker didn't open.")
+    }
+    let earlier = current
+    let catcher = EmojiCatcher(frame: NSRect(x: 0, y: anchor.isFlipped ? 0 : max(0, anchor.bounds.height - 16), width: 2, height: 16))
+    catcher.isRichText = false
+    catcher.drawsBackground = false
+    catcher.insertionPointColor = .clear
+    catcher.setAccessibilityLabel("Emoji Tapback")
+    catcher.choose = choose
+    catcher.report = report
+    catcher.store = store
+    current = catcher
+    // Taken before an earlier picker's hold ends, so the notch doesn't fold in between.
+    store.hold()
+    anchor.addSubview(catcher)
+    catcher.timeout = Task { [weak catcher] in
+      try? await Task.sleep(for: limit)
+      guard !Task.isCancelled, let catcher else { return }
+      catcher.timedOut()
+    }
+    // The picker types into the active app's focused text, so it opens only once open-dot is active
+    // and this view has the panel's focus; otherwise it could type into another app.
+    NSApp.activate()
+    window.makeKeyAndOrderFront(nil)
+    guard window.makeFirstResponder(catcher) else {
+      report("The emoji picker couldn't open.")
+      catcher.handle(.focusLost)
+      return catcher.removeFromSuperview()
+    }
+    // The earlier view has just lost focus to this one, which released its hold.
+    if let earlier, earlier !== catcher { earlier.removeFromSuperview() }
+    if NSApp.isActive { return catcher.show() }
+    catcher.waiting = NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak catcher] _ in
+      MainActor.assumeIsolated { catcher?.show() }
+    }
+  }
+
+  private func show() {
+    stopWaiting()
+    guard capture.capturing else { return }
+    guard window?.firstResponder === self, NSApp.isActive else { return handle(.ended) }
+    // Switching apps is the owner moving focus away, so it ends the guard and lets the notch fold.
+    leaving = NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+      MainActor.assumeIsolated { self?.handle(.focusLost) }
+    }
+    handle(.shown)
+    NSApp.orderFrontCharacterPalette(self)
+  }
+
+  private func timedOut() {
+    guard capture.capturing else { return }
+    report(capture.shown
+      ? "No emoji was chosen within a minute, so nothing will be applied. The notch stays open so a late pick can't go astray; click or Tab elsewhere to go on."
+      : "The emoji picker didn't open, so nothing was done.")
+    handle(.ended)
+  }
+
+  /// Applies one lifecycle step. It never moves focus or removes a view, so it's safe from inside
+  /// AppKit's own focus changes.
+  private func handle(_ event: EmojiCapture.Event, text: String = "") {
+    let effect = capture.handle(event)
+    if !capture.capturing {
+      timeout?.cancel()
+      stopWaiting()
+    }
+    if effect.release {
+      if let leaving { NotificationCenter.default.removeObserver(leaving) }
+      leaving = nil
+      store?.release()
+    }
+    if effect.apply { choose(text) }
+  }
+
+  private func stopWaiting() {
+    if let waiting { NotificationCenter.default.removeObserver(waiting) }
+    waiting = nil
+  }
+
+  /// The picker's choice, or a key typed while it's up. The daemon decides what counts as one emoji;
+  /// this only keeps typed letters and digits from being sent at all. Once capture has ended, every
+  /// insertion is dropped.
+  override func insertText(_ string: Any, replacementRange: NSRange) {
+    let text = (string as? NSAttributedString)?.string ?? (string as? String) ?? ""
+    guard capture.capturing else {
+      if !text.isEmpty { report("The emoji picker had already closed for this message, so nothing was done.") }
+      return
+    }
+    guard looksLikeEmoji(text) else {
+      report("Only an emoji can be a Tapback, so nothing was done. Click or Tab elsewhere to go on.")
+      return handle(.ended)
+    }
+    handle(.choice, text: text)
+  }
+
+  override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {}
+
+  /// Escape, Return, arrows and every other editing command end capture with nothing chosen. Tab
+  /// and Shift-Tab then move focus on, which ends the guard.
+  override func doCommand(by selector: Selector) {
+    handle(.ended)
+    if selector == #selector(insertTab(_:)) { window?.selectKeyView(following: self) }
+    if selector == #selector(insertBacktab(_:)) { window?.selectKeyView(preceding: self) }
+  }
+
+  // Nothing is ever pasted or dropped into it.
+  override func readSelection(from pboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool { false }
+
+  override func resignFirstResponder() -> Bool {
+    let resigned = super.resignFirstResponder()
+    if resigned { handle(.focusLost) }
+    return resigned
+  }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    if window == nil { handle(.focusLost) }
+  }
+
+  override func draw(_ dirtyRect: NSRect) {}
+}
+
 /// A menu item's action, run after menu tracking ends so an alert or the share picker never opens
 /// inside it. Its item keeps it alive.
 @MainActor final class MenuAction: NSObject {
@@ -1122,19 +1318,44 @@ final class MenuAnchorView: NSView {
   return item
 }
 
-/// In the order the daemon accepts them.
+/// The classic Tapbacks, in the order of the menu's first row.
 private let tapbackNames = [
   ("❤️", "Heart"), ("👍", "Thumbs Up"), ("👎", "Thumbs Down"), ("😂", "Ha Ha"), ("‼️", "Exclamation Marks"), ("❓", "Question Mark"),
 ]
 
-/// The six Tapbacks as AppKit's inline palette: a row of standard menu items shown in place of the
-/// item that holds them, so arrow keys, Return, VoiceOver and the selected state all work, which a
+/// The second row until the owner has chosen five non-classic emoji, as the daemon fills it.
+let fallbackTapbacks = ["🧐", "✋", "👀", "🧠", "🔥"]
+
+/// The menu's second row, always five: the daemon's latest non-classic choices, newest first, then
+/// fallbacks not already shown, as the daemon fills it. An older daemon sends none.
+func recentTapbacks(_ recent: [String]) -> [String] {
+  let used = Array(recent.prefix(5))
+  return Array((used + fallbackTapbacks.filter { !used.contains($0) }).prefix(5))
+}
+
+/// The owner's current reaction when neither row shows it, such as an older choice that has left
+/// the recent five. The menu lists it on its own, checked, so it can still be seen and removed.
+func unlistedTapback(_ selected: String?, row: [String]) -> String? {
+  guard let selected, !tapbackNames.contains(where: { $0.0 == selected }), !row.contains(selected) else { return nil }
+  return selected
+}
+
+/// A quick local check that text is one character drawn as an emoji, before the daemon's exact
+/// one. It turns away typed letters, digits and symbols shown as text, such as a bare ❤ or 1.
+func looksLikeEmoji(_ text: String) -> Bool {
+  text.count == 1 && text.unicodeScalars.contains {
+    $0.properties.isEmojiPresentation || $0.properties.isEmojiModifier || $0 == "\u{FE0F}"
+  }
+}
+
+/// A row of Tapbacks as AppKit's inline palette: standard menu items shown in place of the item
+/// that holds them, so arrow keys, Return, VoiceOver and the selected state all work, which a
 /// custom view in a menu can't offer. The selected one is drawn on the accent color.
-@MainActor private func tapbacks(selected: String?, enabled: Bool, id: String, choose: @escaping (String) -> Void) -> NSMenuItem {
+@MainActor private func tapbackRow(_ emojis: [(String, String)], selected: String?, enabled: Bool, id: String, choose: @escaping (String) -> Void) -> NSMenu {
   let palette = NSMenu(title: "Tapback")
   palette.presentationStyle = .palette
   palette.autoenablesItems = false
-  for (emoji, name) in tapbackNames {
+  for (emoji, name) in emojis {
     let item = action(name, symbol: nil, id: "tapback-\(id)-\(emoji)", enabled: enabled) { choose(emoji) }
     item.image = tapbackImage(emoji, selected: selected == emoji)
     item.state = selected == emoji ? .on : .off
@@ -1142,11 +1363,34 @@ private let tapbackNames = [
     item.setAccessibilityLabel(selected == emoji ? "\(name), selected. Remove your Tapback" : "\(name) Tapback")
     palette.addItem(item)
   }
-  let row = NSMenuItem(title: "Tapback", action: nil, keyEquivalent: "")
+  return palette
+}
+
+@MainActor private func paletteItem(_ palette: NSMenu, id: String) -> NSMenuItem {
+  let row = NSMenuItem(title: palette.title, action: nil, keyEquivalent: "")
   row.submenu = palette
-  row.identifier = NSUserInterfaceItemIdentifier("message-menu-tapbacks")
-  row.setAccessibilityIdentifier("message-menu-tapbacks")
+  row.identifier = NSUserInterfaceItemIdentifier(id)
+  row.setAccessibilityIdentifier(id)
   return row
+}
+
+/// The six classic Tapbacks.
+@MainActor private func tapbacks(selected: String?, enabled: Bool, id: String, choose: @escaping (String) -> Void) -> NSMenuItem {
+  paletteItem(tapbackRow(tapbackNames, selected: selected, enabled: enabled, id: id, choose: choose), id: "message-menu-tapbacks")
+}
+
+/// The owner's five recent emoji, then a smiley that opens the system emoji picker. VoiceOver
+/// reads each emoji's own name.
+@MainActor private func moreTapbacks(_ row: [String], selected: String?, enabled: Bool, id: String, choose: @escaping (String) -> Void, pick: @escaping () -> Void) -> NSMenuItem {
+  let palette = tapbackRow(row.map { ($0, $0) }, selected: selected, enabled: enabled, id: id, choose: choose)
+  palette.title = "More Tapbacks"
+  let picker = action("Choose Emoji…", symbol: nil, id: "tapback-\(id)-picker", enabled: enabled, pick)
+  picker.image = NSImage(systemSymbolName: "face.smiling", accessibilityDescription: nil)?
+    .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 20, weight: .regular))
+  picker.toolTip = "Choose any emoji"
+  picker.setAccessibilityLabel("Choose any emoji as a Tapback")
+  palette.addItem(picker)
+  return paletteItem(palette, id: "message-menu-recent-tapbacks")
 }
 
 private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
@@ -1172,9 +1416,31 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
   menu.autoenablesItems = false
   let selected = message.reactions?.first { $0.actor == "owner" }?.emoji
   let reactable = message.kind == "dot" && !store.reacting.contains(key)
-  menu.addItem(tapbacks(selected: selected, enabled: reactable, id: "\(dot)-\(message.id)") { emoji in
-    if store.stillShown(key, session: session) != nil { store.react(key, emoji: emoji) }
+  // Every choice, including one from the emoji picker long after, goes to this message in this session.
+  let choose = { (emoji: String) -> Void in
+    guard store.stillShown(key, session: session) != nil else { return }
+    if store.reacting.contains(key) {
+      return store.report("A reaction to this message is still saving, so nothing was done.", dot: dot, key: key)
+    }
+    store.react(key, emoji: emoji)
+  }
+  menu.addItem(tapbacks(selected: selected, enabled: reactable, id: "\(dot)-\(message.id)", choose: choose))
+  let row = recentTapbacks(store.recentEmojis)
+  menu.addItem(moreTapbacks(row, selected: selected, enabled: reactable, id: "\(dot)-\(message.id)", choose: choose) { [weak anchor] in
+    guard store.stillShown(key, session: session) != nil else { return }
+    guard let anchor else {
+      return store.report("The message scrolled away, so the emoji picker didn't open.", dot: dot, key: key)
+    }
+    EmojiCatcher.open(at: anchor, store: store, choose: choose) { store.report($0, dot: dot, key: key) }
   })
+  if let current = unlistedTapback(selected, row: row) {
+    // Choosing the selected emoji removes it, as in the rows.
+    let item = action("Your Tapback: \(current)", symbol: nil, id: "tapback-\(dot)-\(message.id)-current", enabled: reactable) { choose(current) }
+    item.state = .on
+    item.toolTip = "Remove your \(current)"
+    item.setAccessibilityLabel("\(current), selected. Remove your Tapback")
+    menu.addItem(item)
+  }
   menu.addItem(.separator())
   let reacted = message.reactions?.contains { $0.emoji != nil } ?? false
   menu.addItem(action("Tapback Details…", symbol: "info.circle", id: "message-menu-details", enabled: reacted) {

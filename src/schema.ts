@@ -138,13 +138,14 @@ export interface FeedSnapshot {
   };
 }
 
-/** The reactions a message in the notch chat can get, in the order the picker shows them. */
+/** The classic Tapbacks, in the order of the notch's first row. Any single emoji is allowed. */
 export const reactionEmojis = ["❤️", "👍", "👎", "😂", "‼️", "❓"] as const;
 
 /**
  * Each actor's current reaction to a message in a dot's conversation: the owner's to the dot's
- * messages, and the dot's to the owner's. A removal keeps its row with no emoji, so the dot's
- * memory can say it's gone. Nothing here is ever sent to a session.
+ * messages, and the dot's to the owner's. The emoji is one RGI emoji, checked before saving.
+ * A removal keeps its row with no emoji, so the dot's memory can say it's gone. Nothing here is
+ * ever sent to a session.
  */
 export const reactions = sqliteTable(
   "reactions",
@@ -155,7 +156,7 @@ export const reactions = sqliteTable(
     sessionID: text("session_id").notNull(),
     messageID: text("message_id").notNull(),
     actor: text({ enum: ["owner", "dot"] }).notNull(),
-    emoji: text({ enum: reactionEmojis }),
+    emoji: text(),
     // A short excerpt of the message, read from the session's history when the reaction was set.
     excerpt: text().notNull(),
     updatedAt: integer("updated_at").notNull(),
@@ -164,6 +165,17 @@ export const reactions = sqliteTable(
 );
 
 export type Reaction = typeof reactions.$inferSelect;
+
+/**
+ * The non-classic emoji the owner last chose in the notch, newest with the highest `seq`, for the
+ * menu's second row. Only the owner's choices are kept, never a dot's, and a choice stays here
+ * after its reaction is replaced or removed. Only the latest five are kept.
+ */
+export const recentReactions = sqliteTable("recent_reactions", {
+  emoji: text().primaryKey(),
+  // One more than the largest when chosen, so same-millisecond choices keep their order.
+  seq: integer().notNull(),
+});
 
 /**
  * Messages the owner deleted from the notch chat, in the session they were seen in. Only the notch
