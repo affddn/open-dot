@@ -52,6 +52,7 @@ const sharedRoute = (thread: string): Route => ({
 });
 
 test("one gate serializes shared, per-dot and native destinations without same-route overtaking", async () => {
+  const files = [{ mime: "image/png", name: "native.png", data: "iVBORw0KGgo=" }];
   const a = sharedRoute("1.1");
   const b: Route = { ...a, kind: "agent", app: "A2", bot: "B2", channel: "D2" };
   for (const [id, route] of [
@@ -66,6 +67,7 @@ test("one gate serializes shared, per-dot and native destinations without same-r
         sessionID: "ses_jojo",
         messageID: id,
         text: id,
+        files: id === "native" ? files : null,
         route,
         state: "pending",
         createdAt: 0,
@@ -73,6 +75,7 @@ test("one gate serializes shared, per-dot and native destinations without same-r
       .run();
   await tick(0);
   expect(fake.state.prompted).toEqual(["a", "a2"]);
+  expect(fake.state.files.size).toBe(0);
   fake.state.active.add("ses_jojo");
   await tick(0);
   expect(fake.state.prompted).toEqual(["a", "a2"]);
@@ -91,6 +94,7 @@ test("one gate serializes shared, per-dot and native destinations without same-r
   fake.state.messageTurns.set("a3", { end: "idle_A3", outcome: "succeeded", text: undefined });
   await tick(0);
   expect(fake.state.prompted).toEqual(["a", "a2", "b", "a3", "native"]);
+  expect([...fake.state.files]).toEqual([["native", files]]);
   expect(fake.state.created).toEqual([]);
 });
 

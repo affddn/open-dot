@@ -1,6 +1,22 @@
 import AppKit
+import Darwin
 import ImageIO
 import Observation
+import UniformTypeIdentifiers
+
+struct ImagePreview: Identifiable {
+  let id: UUID
+  let name: String
+  let image: NSImage
+}
+
+struct DraftImage: Identifiable {
+  let id = UUID()
+  let file: ImageUpload
+  let thumbnail: NSImage
+
+  var preview: ImagePreview { ImagePreview(id: id, name: file.name, image: thumbnail) }
+}
 
 struct Pending: Identifiable {
   let id = UUID()
@@ -9,6 +25,7 @@ struct Pending: Identifiable {
   /// The feed item it replies to.
   var feed: FeedItem?
   var quote: MessageQuote?
+  var images: [ImagePreview] = []
   var messageID: String?
   var error: String?
 }
@@ -21,6 +38,8 @@ struct Pending: Identifiable {
   var messages: [String: [Message]] = [:]
   var pending: [String: [Pending]] = [:]
   var drafts: [String: String] = [:]
+  var draftImages: [String: [DraftImage]] = [:]
+  var imageErrors: [String: String] = [:]
   var replyTargets: [String: MessageQuote] = [:]
   var sending: Set<String> = []
   var expanded = false
@@ -99,28 +118,171 @@ struct Pending: Identifiable {
     Task { await refreshMessages(name) }
   }
 
-  func send() {
-    guard let name = selected, !sending.contains(name) else { return }
+  func send(_ name: String) {
+    guard !sending.contains(name) else { return }
     let draft = drafts[name] ?? ""
     let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !text.isEmpty else { return }
+    let files = draftImages[name] ?? []
+    guard !text.isEmpty || !files.isEmpty else { return }
     let quote = replyTargets[name]
-    let item = Pending(text: text, quote: quote)
+    let item = Pending(text: text, quote: quote, images: files.map(\.preview))
     pending[name, default: []].append(item)
     sending.insert(name)
     Task {
       defer { sending.remove(name) }
       do {
-        let id = try await api.post(name, text: text, replyTo: quote?.id)
+        let id = try await api.post(name, text: text, replyTo: quote?.id, files: files.map(\.file))
         update(name, item.id) { $0.messageID = id }
-        if drafts[name] == draft && replyTargets[name] == quote {
-          drafts[name] = nil
-          replyTargets[name] = nil
-        }
+        if (drafts[name] ?? "") == draft { drafts[name] = nil }
+        if replyTargets[name] == quote { replyTargets[name] = nil }
+        let sent = Set(files.map(\.id))
+        draftImages[name]?.removeAll { sent.contains($0.id) }
       } catch {
         update(name, item.id) { $0.error = Self.describe(error) }
       }
     }
+  }
+
+  func pickImages(_ name: String) {
+    let panel = NSOpenPanel()
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = true
+    panel.allowedContentTypes = [.image]
+    panel.begin { [weak self] response in
+      guard response == .OK else { return }
+      Task { @MainActor in self?.addImageFiles(panel.urls, to: name) }
+    }
+  }
+
+  func removeImage(_ id: UUID, from name: String) {
+    draftImages[name]?.removeAll { $0.id == id }
+    imageErrors[name] = nil
+  }
+
+  static let imagePasteboardTypes: [NSPasteboard.PasteboardType] = [
+    .png, .tiff, NSPasteboard.PasteboardType("public.jpeg"),
+    NSPasteboard.PasteboardType("com.compuserve.gif"),
+    NSPasteboard.PasteboardType("org.webmproject.webp"),
+  ]
+
+  /// Paste and native file drops are consumed synchronously by their originating editor.
+  func pasteImages(_ board: NSPasteboard, to name: String) -> Bool {
+    for type in Self.imagePasteboardTypes {
+      if board.availableType(from: [type]) != nil {
+        imageErrors[name] = nil
+        guard let data = board.data(forType: type) else {
+          imageErrors[name] = "Couldn't read the pasted image."
+          return true
+        }
+        addImage(data, filename: "Pasted image", to: name, allowTIFF: type == .tiff)
+        return true
+      }
+    }
+    if let urls = board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+      addImageFiles(urls, to: name)
+      return true
+    }
+    return false
+  }
+
+  func addImageFiles(_ urls: [URL], to name: String) {
+    imageErrors[name] = nil
+    for url in urls {
+      guard (draftImages[name]?.count ?? 0) < 5 else {
+        imageErrors[name] = "Attach at most five images."
+        break
+      }
+      guard url.isFileURL, url.host == nil || url.host == "" || url.host == "localhost" else {
+        imageErrors[name] = "Choose a local image file."
+        continue
+      }
+      let access = url.startAccessingSecurityScopedResource()
+      defer { if access { url.stopAccessingSecurityScopedResource() } }
+      let descriptor = open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
+      guard descriptor >= 0 else {
+        imageErrors[name] = "Couldn't read the image file."
+        continue
+      }
+      let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+      defer { try? handle.close() }
+      var info = stat()
+      guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
+        imageErrors[name] = "Choose a regular image file."
+        continue
+      }
+      guard info.st_size >= 0, info.st_size <= Int64(Self.imageLimit) else {
+        imageErrors[name] = "Each image must be at most 10 MiB."
+        continue
+      }
+      do {
+        var data = Data()
+        while data.count <= Self.imageLimit {
+          let chunk = try handle.read(upToCount: min(64 * 1024, Self.imageLimit + 1 - data.count)) ?? Data()
+          if chunk.isEmpty { break }
+          data.append(chunk)
+        }
+        addImage(data, filename: url.lastPathComponent, to: name)
+      } catch {
+        imageErrors[name] = "Couldn't read the image file."
+      }
+    }
+  }
+
+  private static let imageLimit = 10 * 1024 * 1024
+
+  private func addImage(_ input: Data, filename: String, to name: String, allowTIFF: Bool = false) {
+    guard (draftImages[name]?.count ?? 0) < 5 else {
+      imageErrors[name] = "Attach at most five images."
+      return
+    }
+    guard input.count <= Self.imageLimit else {
+      imageErrors[name] = "Each image must be at most 10 MiB."
+      return
+    }
+    var data = input
+    var displayName = filename
+    if allowTIFF, let source = CGImageSourceCreateWithData(data as CFData, nil),
+      CGImageSourceGetType(source) as String? == UTType.tiff.identifier {
+      guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+        let width = properties[kCGImagePropertyPixelWidth] as? Int,
+        let height = properties[kCGImagePropertyPixelHeight] as? Int,
+        width > 0, height > 0, width <= 40_000_000 / height,
+        let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+        imageErrors[name] = "Image is unreadable or exceeds 40 million pixels."
+        return
+      }
+      let converted = NSMutableData()
+      guard let destination = CGImageDestinationCreateWithData(converted, UTType.png.identifier as CFString, 1, nil) else {
+        imageErrors[name] = "Couldn't convert the pasted image."
+        return
+      }
+      CGImageDestinationAddImage(destination, image, nil)
+      guard CGImageDestinationFinalize(destination), converted.length <= Self.imageLimit else {
+        imageErrors[name] = "Converted image exceeds 10 MiB."
+        return
+      }
+      data = converted as Data
+      displayName = "Pasted image.png"
+    }
+    let bytes = [UInt8](data.prefix(12))
+    let mime: String
+    if bytes.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]) { mime = "image/png" }
+    else if bytes.starts(with: [255, 216, 255]) { mime = "image/jpeg" }
+    else if bytes.starts(with: Array("GIF87a".utf8)) || bytes.starts(with: Array("GIF89a".utf8)) { mime = "image/gif" }
+    else if bytes.count >= 12, bytes.starts(with: Array("RIFF".utf8)), Array(bytes[8..<12]) == Array("WEBP".utf8) { mime = "image/webp" }
+    else {
+      imageErrors[name] = "Only PNG, JPEG, GIF and WebP images are supported."
+      return
+    }
+    guard let thumbnail = Self.decode(data, maxPixels: 160) else {
+      imageErrors[name] = "Image is unreadable or exceeds 40 million pixels."
+      return
+    }
+    let safeName = String(displayName.unicodeScalars.filter {
+      !CharacterSet.controlCharacters.contains($0) && $0 != "/" && $0 != "\\"
+    }.prefix(120).map(String.init).joined())
+    let file = ImageUpload(mime: mime, name: safeName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Image" : safeName, data: data)
+    draftImages[name, default: []].append(DraftImage(file: file, thumbnail: thumbnail))
   }
 
   func reply(_ name: String, to message: Message) {

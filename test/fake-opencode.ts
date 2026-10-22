@@ -1,6 +1,7 @@
 import { Effect, Layer } from "effect";
 import {
   type Approval,
+  type Attachment,
   type Entry,
   OpenCode,
   OpenCodeError,
@@ -18,6 +19,7 @@ export function fakeOpenCode() {
     created: [] as SessionInput[],
     prompted: [] as string[],
     texts: [] as { sessionID: string; text: string }[],
+    files: new Map<string, readonly Attachment[]>(),
     active: new Set<string>(),
     turns: new Map<string, Omit<Turn, "end"> & { end?: string }>(),
     messageTurns: new Map<string, Turn>(),
@@ -38,10 +40,11 @@ export function fakeOpenCode() {
             state.sessions.add(input.id);
           }),
     messageExists: ({ messageID }) => Effect.sync(() => state.messages.has(messageID)),
-    queuePrompt: ({ sessionID, messageID, text }) => {
+    queuePrompt: ({ sessionID, messageID, text, files }) => {
       if (state.prompt === "fail") return broken("connection refused");
       state.prompted.push(messageID);
       state.texts.push({ sessionID, text });
+      if (files) state.files.set(messageID, files);
       state.messages.add(messageID);
       return state.prompt === "lost" ? broken("connection reset") : Effect.void;
     },

@@ -170,8 +170,30 @@ struct ExpandedView: View {
             .accessibilityIdentifier("chat-reply-cancel")
         }
       }
-      Composer(placeholder: "Message \(name)", text: Binding { store.drafts[name] ?? "" } set: { store.drafts[name] = $0 }, canSend: !store.sending.contains(name)) {
-        store.send()
+      if let images = store.draftImages[name], !images.isEmpty {
+        ScrollView(.horizontal) {
+          HStack(spacing: 6) {
+            ForEach(images) { image in
+              Image(nsImage: image.thumbnail).resizable().scaledToFill()
+                .frame(width: 64, height: 48).clipped()
+                .overlay(alignment: .topTrailing) {
+                  Button { store.removeImage(image.id, from: name) } label: {
+                    Image(systemName: "xmark.circle.fill").background(.black, in: Circle())
+                  }
+                  .buttonStyle(.plain)
+                  .accessibilityLabel("Remove \(image.file.name)")
+                }
+                .help(image.file.name)
+            }
+          }
+        }.frame(height: 48).scrollIndicators(.never)
+      }
+      if let error = store.imageErrors[name] {
+        Text(error).font(.caption2).foregroundStyle(.red)
+      }
+      Composer(placeholder: "Message \(name)", text: Binding { store.drafts[name] ?? "" } set: { store.drafts[name] = $0 }, canSend: !store.sending.contains(name), hasImages: !(store.draftImages[name] ?? []).isEmpty,
+        pasteImages: { store.pasteImages($0, to: name) }, pickImages: { store.pickImages(name) }) {
+        store.send(name)
       }
       .id(name)
     }
@@ -182,13 +204,21 @@ struct Composer: View {
   let placeholder: String
   @Binding var text: String
   var canSend = true
+  var hasImages = false
+  var pasteImages: ((NSPasteboard) -> Bool)? = nil
+  var pickImages: (() -> Void)? = nil
   let send: () -> Void
   @State private var height: CGFloat = 22
 
   var body: some View {
-    let blocked = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !canSend
+    let blocked = (text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !hasImages) || !canSend
     HStack(alignment: .bottom) {
-      DraftEditor(text: $text, height: $height, placeholder: placeholder, send: send)
+      if let pickImages {
+        Button(action: pickImages) { Image(systemName: "paperclip") }
+          .buttonStyle(.plain)
+          .accessibilityLabel("Attach images")
+      }
+      DraftEditor(text: $text, height: $height, placeholder: placeholder, hasImages: hasImages, pasteImages: pasteImages, send: { if canSend { send() } })
         .frame(height: height)
         .overlay(alignment: .topLeading) {
           // The editor's own label is for VoiceOver only, so the placeholder is drawn over it.
@@ -222,6 +252,8 @@ struct DraftEditor: NSViewRepresentable {
   @Binding var text: String
   @Binding var height: CGFloat
   let placeholder: String
+  let hasImages: Bool
+  let pasteImages: ((NSPasteboard) -> Bool)?
   let send: () -> Void
 
   func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -241,6 +273,7 @@ struct DraftEditor: NSViewRepresentable {
     editor.autoresizingMask = [.width]
     editor.textContainer?.widthTracksTextView = true
     editor.delegate = context.coordinator
+    if pasteImages != nil { editor.registerForDraggedTypes([.fileURL, .png, .tiff]) }
     editor.setAccessibilityIdentifier("composer")
     scroll.documentView = editor
     return scroll
@@ -250,6 +283,8 @@ struct DraftEditor: NSViewRepresentable {
     context.coordinator.parent = self
     guard let editor = scroll.documentView as? DraftTextView else { return }
     editor.send = send
+    editor.hasImages = hasImages
+    editor.pasteImages = pasteImages
     editor.setAccessibilityLabel(placeholder)
     if editor.string != text {
       // The text changed outside the editor, as after a send or a quick prompt, so earlier undo
@@ -286,6 +321,32 @@ struct DraftEditor: NSViewRepresentable {
 
 class DraftTextView: NSTextView {
   var send: () -> Void = {}
+  var hasImages = false
+  var pasteImages: ((NSPasteboard) -> Bool)?
+
+  override func paste(_ sender: Any?) {
+    if pasteImages?(NSPasteboard.general) == true { return }
+    super.paste(sender)
+  }
+
+  override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+    if pasteImages != nil, sender.draggingPasteboard.availableType(from: [.fileURL, .png, .tiff]) != nil { return .copy }
+    return super.draggingEntered(sender)
+  }
+
+  override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+    draggingEntered(sender)
+  }
+
+  override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+    if pasteImages?(sender.draggingPasteboard) == true { return true }
+    return super.performDragOperation(sender)
+  }
+
+  override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+    if pasteImages != nil, sender.draggingPasteboard.availableType(from: [.fileURL, .png, .tiff]) != nil { return true }
+    return super.prepareForDragOperation(sender)
+  }
   /// Each editor keeps its own undo history, which ends with it. The panel's shared one would let
   /// Command-Z in one dot's draft undo typing in another's.
   let history = UndoManager()
@@ -296,7 +357,11 @@ class DraftTextView: NSTextView {
   @objc func redo(_ sender: Any?) { history.redo() }
 
   override func validateMenuItem(_ item: NSMenuItem) -> Bool {
-    switch item.action {
+    if item.action == #selector(paste(_:)), isEditable, pasteImages != nil,
+      NSPasteboard.general.availableType(from: Store.imagePasteboardTypes + [.fileURL]) != nil {
+      return true
+    }
+    return switch item.action {
     case #selector(undo(_:)): history.canUndo
     case #selector(redo(_:)): history.canRedo
     default: super.validateMenuItem(item)
@@ -307,7 +372,7 @@ class DraftTextView: NSTextView {
     if (event.keyCode == 36 || event.keyCode == 76) && !hasMarkedText() {
       if !event.modifierFlags.intersection([.shift, .option]).isEmpty {
         insertNewline(nil)
-      } else if !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      } else if hasImages || !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
         send()
       }
       return
@@ -830,7 +895,17 @@ struct PendingRow: View {
       VStack(alignment: .trailing, spacing: 3) {
         if let quote = item.quote { MessageQuoteView(quote: quote, dot: dot).opacity(0.6) }
         if let feed = item.feed { QuoteCard(item: feed).frame(maxWidth: 300).opacity(0.6) }
-        Bubble(text: item.text, fill: messageBlue).opacity(0.6)
+        if !item.text.isEmpty { Bubble(text: item.text, fill: messageBlue).opacity(0.6) }
+        if !item.images.isEmpty {
+          ScrollView(.horizontal) {
+            HStack(spacing: 6) {
+              ForEach(item.images) { image in
+                Image(nsImage: image.image).resizable().scaledToFill()
+                  .frame(width: 64, height: 48).clipped().help(image.name)
+              }
+            }
+          }.frame(maxWidth: 300).frame(height: 48).scrollIndicators(.never).opacity(0.6)
+        }
         if let error = item.error {
           Text("\(error) · click to dismiss").font(.caption2).foregroundStyle(.red)
         } else {

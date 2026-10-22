@@ -173,7 +173,7 @@ export class OpenCode extends Context.Service<
     readonly messageExists: (ref: MessageRef) => Effect.Effect<boolean, OpenCodeError>;
     /** Queues the text as a user message with the caller's ID. */
     readonly queuePrompt: (
-      ref: MessageRef & { readonly text: string },
+      ref: MessageRef & { readonly text: string; readonly files?: readonly Attachment[] },
     ) => Effect.Effect<void, OpenCodeError>;
     /** IDs of the sessions that are running a turn now. */
     readonly activeSessions: Effect.Effect<ReadonlySet<string>, OpenCodeError>;
@@ -250,12 +250,16 @@ export class OpenCode extends Context.Service<
             Effect.mapError(failed(`Could not look up message ${ref.messageID}`)),
           );
         },
-        queuePrompt: ({ sessionID, messageID, text }) =>
+        queuePrompt: ({ sessionID, messageID, text, files }) =>
           client.session
             .prompt({
               sessionID: Session.ID.make(sessionID),
               id: SessionMessage.ID.make(messageID),
               text,
+              files: files?.map(({ mime, name, data }) => ({
+                uri: `data:${mime};base64,${data}`,
+                name,
+              })),
               delivery: "queue",
             })
             .pipe(Effect.asVoid, Effect.mapError(failed(`Could not send message ${messageID}`))),

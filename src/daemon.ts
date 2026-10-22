@@ -98,7 +98,11 @@ export const deliver = (db: Db, message: Message) =>
       .where(eq(outbox.id, message.id))
       .run();
     if (!(yield* opencode.messageExists(ref))) {
-      yield* opencode.queuePrompt({ ...ref, text: message.text });
+      yield* opencode.queuePrompt({
+        ...ref,
+        text: message.text,
+        ...(message.files === null ? {} : { files: message.files }),
+      });
     }
     db.update(outbox).set({ state: "sent" }).where(eq(outbox.id, message.id)).run();
   });

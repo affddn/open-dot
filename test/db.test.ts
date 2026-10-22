@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { cpSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import assert from "node:assert/strict";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
@@ -334,4 +335,110 @@ test("reactions migrate additively and both actors and removal tombstones surviv
   expect(reopened.select().from(reactions).all()).toEqual(saved);
   expect(rows(reopened.$client)).toEqual(before);
   reopened.$client.close();
+});
+
+test("0016 adds only nullable outbox files and preserves every 0015 column, row and migration ledger entry", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-image-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0016");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run(
+    "insert into outbox (session_id,message_id,text,state,from_owner,started_at,turn_end,owner_text,quote,created_at) values ('ses_jojo','old','Keep','sent',1,7,'idle_old','Keep','{}',1)",
+  );
+  old.run(
+    "insert into feed (source,source_id,reason,title,context,updated_at,state,handed_to,created_at) values ('github','PR_1','Mentioned','Keep','repo',1,'handed-off','[\"jojo\"]',1)",
+  );
+  old.run("insert into notes (dot,text,created_at) values ('jojo','Keep',1)");
+  old.run(
+    "insert into reactions (dot,session_id,message_id,actor,emoji,excerpt,updated_at) values ('jojo','ses_jojo','old','dot',null,'Keep',1)",
+  );
+  old.run(
+    "insert into slack_threads (key,route,oldest,newest,cursor,rescan,active_at,polled_at) values ('thread','{}','1','2','',1,1,4)",
+  );
+  old.run("insert into slack_polls (key,oldest,newest,cursor) values ('poll','1','2','saved')");
+  const tables = old
+    .query<{ name: string }, []>(
+      "select name from sqlite_master where type='table' and name not like 'sqlite_%' and name != '__drizzle_migrations' order by name",
+    )
+    .all();
+  type Column = {
+    cid: number;
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: unknown;
+    pk: number;
+  };
+  const columns = new Map(
+    tables.map(({ name }) => [name, old.query<Column, []>(`pragma table_info("${name}")`).all()]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map(({ name }) => [
+      name,
+      sqlite
+        .query(
+          `select ${columns
+            .get(name)
+            ?.map((column) => `"${column.name}"`)
+            .join(",")} from "${name}"`,
+        )
+        .all(),
+    ]);
+  const before = rows(old);
+  const ledger = old.query("select * from __drizzle_migrations order by id").all();
+  old.close();
+  let db = openDatabase(path);
+  try {
+    expect(rows(db.$client)).toEqual(before);
+    expect(
+      db.$client.query("select * from __drizzle_migrations order by id").all().slice(0, -1),
+    ).toEqual(ledger);
+    for (const { name } of tables) {
+      const after = db.$client.query<Column, []>(`pragma table_info("${name}")`).all();
+      const stored = columns.get(name);
+      assert(stored, `Missing stored columns for ${name}`);
+      if (name === "outbox") {
+        expect(after.slice(0, -1)).toEqual(stored);
+        expect(after.at(-1)).toMatchObject({
+          name: "files",
+          type: "TEXT",
+          notnull: 0,
+          dflt_value: null,
+          pk: 0,
+        });
+      } else expect(after).toEqual(stored);
+    }
+    expect(db.select().from(outbox).get()?.files).toBeNull();
+    const files = [{ mime: "image/png", name: "kept.png", data: "iVBORw0KGgo=" }];
+    db.insert(outbox)
+      .values({
+        sessionID: "ses_jojo",
+        messageID: "image",
+        text: "",
+        files,
+        state: "pending",
+        fromOwner: true,
+        createdAt: 2,
+      })
+      .run();
+    db.$client.close();
+    db = openDatabase(path);
+    expect(db.select().from(outbox).all().at(-1)?.files).toEqual(files);
+    expect(db.select().from(slackThreads).get()?.rescan).toBe(true);
+    expect(db.$client.query("select * from __drizzle_migrations order by id").all()).toHaveLength(
+      ledger.length + 1,
+    );
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

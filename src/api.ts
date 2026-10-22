@@ -157,9 +157,80 @@ const images = new Map<string, readonly (number | undefined)[]>(
 );
 // The largest image served; a larger one gets 413.
 const attachmentLimit = 10 * 1024 * 1024;
+const bodyLimit = 72 * 1024 * 1024;
 // Plain base64, as OpenCode stores it, or the same as an image data URL. Never a path or a URL
 // to fetch.
 const inline = /^(?:data:image\/[\w.+-]+;base64,)?([A-Za-z0-9+/]*={0,2})$/;
+
+const matchesImage = (mime: string, bytes: Buffer) =>
+  images.get(mime)?.every((byte, at) => byte === undefined || bytes[at] === byte) &&
+  (mime !== "image/gif" || ((bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61));
+
+const messageBody = async (request: Request): Promise<unknown> => {
+  if (Number(request.headers.get("content-length")) > bodyLimit)
+    return error(413, "The message body is over 72 MiB.");
+  if (!request.body) return undefined;
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > bodyLimit) {
+        await reader.cancel();
+        return error(413, "The message body is over 72 MiB.");
+      }
+      chunks.push(value);
+    }
+    return JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
+  } finally {
+    reader.releaseLock();
+  }
+};
+
+const messageFiles = (input: unknown): Attachment[] | Response => {
+  if (input === undefined) return [];
+  if (!Array.isArray(input)) return error(400, "files must be an array.");
+  if (input.length > 5) return error(413, "Attach at most five images.");
+  const files: Attachment[] = [];
+  for (const file of input) {
+    if (
+      typeof file !== "object" ||
+      file === null ||
+      Array.isArray(file) ||
+      typeof file.mime !== "string" ||
+      typeof file.name !== "string" ||
+      typeof file.data !== "string"
+    )
+      return error(400, "Each file needs mime, name and base64 data.");
+    const name: string = file.name;
+    if (
+      !name.trim() ||
+      name.length > 255 ||
+      Array.from(name).some((character) => {
+        const code = character.charCodeAt(0);
+        return code <= 31 || code === 127 || code === 47 || code === 92;
+      })
+    )
+      return error(400, "Use a display filename of 1–255 characters, without paths or controls.");
+    if (!images.has(file.mime))
+      return error(415, "Only PNG, JPEG, GIF and WebP images are accepted.");
+    if (file.data.length > Math.ceil(attachmentLimit / 3) * 4)
+      return error(413, "Each image must be at most 10 MiB.");
+    if (!file.data || file.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(file.data))
+      return error(422, "Image data must be plain canonical base64.");
+    const bytes = Buffer.from(file.data, "base64");
+    if (bytes.length > attachmentLimit) return error(413, "Each image must be at most 10 MiB.");
+    if (bytes.toString("base64") !== file.data)
+      return error(422, "Image data must be plain canonical base64.");
+    if (!matchesImage(file.mime, bytes))
+      return error(415, "Image bytes do not match the MIME type.");
+    files.push({ mime: file.mime, name, data: file.data });
+  }
+  return files;
+};
 
 /** The attachment's bytes if it's an allowed image whose bytes match its type, else why not. */
 const imageBytes = (file: Attachment) => {
@@ -173,7 +244,7 @@ const imageBytes = (file: Attachment) => {
     return error(422, "The attachment isn't inline base64 data.");
   const bytes = Buffer.from(encoded, "base64");
   if (bytes.length > attachmentLimit) return error(413, "The attachment is over 10 MB.");
-  if (!signature.every((byte, at) => byte === undefined || bytes[at] === byte))
+  if (!matchesImage(mime, bytes))
     return error(415, "The attachment's bytes aren't the image type it claims.");
   return new Response(bytes, {
     headers: {
@@ -233,12 +304,19 @@ const snapshot = (prompt: string, item: FeedItem): FeedSnapshot => ({
  */
 const send = (db: Db, dot: Dot, request: Request) =>
   Effect.gen(function* () {
-    const body = yield* Effect.tryPromise(() => request.json()).pipe(
+    const body = yield* Effect.tryPromise(() => messageBody(request)).pipe(
       Effect.orElseSucceed(() => undefined),
     );
-    const fields = typeof body === "object" && body !== null ? body : {};
+    if (body instanceof Response) return body;
+    if (typeof body !== "object" || body === null || Array.isArray(body))
+      return error(400, "Send a JSON message object.");
+    const fields = body;
+    if ("text" in fields && typeof fields.text !== "string")
+      return error(400, "text must be a string.");
     const text = "text" in fields && typeof fields.text === "string" ? fields.text.trim() : "";
-    if (!text) return error(400, "Send a JSON body with a non-empty text.");
+    const files = messageFiles("files" in fields ? fields.files : undefined);
+    if (files instanceof Response) return files;
+    if (!text && !files.length) return error(400, "Send text or at least one image.");
     const feedID = "feed" in fields ? fields.feed : undefined;
     const replyTo = "replyTo" in fields ? fields.replyTo : undefined;
     if (replyTo !== undefined && (typeof replyTo !== "string" || !replyTo || feedID !== undefined))
@@ -293,6 +371,7 @@ const send = (db: Db, dot: Dot, request: Request) =>
           sessionID: dot.sessionID,
           messageID: SessionMessage.ID.create(),
           text: reply ? feedMessage(reply) : quote ? replyPrompt(quote) : text,
+          files: files.length ? files : null,
           quote,
           state: "pending",
           fromOwner: true,

@@ -67,6 +67,12 @@ struct AttachmentKey: Hashable {
   let index: Int
 }
 
+struct ImageUpload: Encodable {
+  let mime: String
+  let name: String
+  let data: Data
+}
+
 struct FeedItem: Decodable, Equatable, Identifiable {
   let id: Int
   let source: String
@@ -128,10 +134,12 @@ enum APIError: Error {
   }
 
   /// Queues the text, as a reply to a feed item when `feed` is its ID. Never retried on its own.
-  func post(_ dot: String, text: String, feed: Int? = nil, replyTo: String? = nil) async throws -> String {
-    struct Request: Encodable { let text: String; let feed: Int?; let replyTo: String? }
+  func post(_ dot: String, text: String, feed: Int? = nil, replyTo: String? = nil, files: [ImageUpload] = []) async throws -> String {
+    struct Request: Encodable { let text: String; let feed: Int?; let replyTo: String?; let files: [ImageUpload] }
     struct Body: Decodable { let id: String }
-    let body = try JSONEncoder().encode(Request(text: text, feed: feed, replyTo: replyTo))
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = .withoutEscapingSlashes
+    let body = try encoder.encode(Request(text: text, feed: feed, replyTo: replyTo, files: files))
     return try decode(Body.self, await send("POST", "/dots/\(escape(dot))/messages", body: body)).id
   }
 

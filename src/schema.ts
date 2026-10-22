@@ -1,4 +1,5 @@
 import { integer, primaryKey, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
+import type { Attachment } from "./opencode";
 
 export const dots = sqliteTable("dots", {
   name: text().primaryKey(),
@@ -102,6 +103,7 @@ export const outbox = sqliteTable("outbox", {
   sessionID: text("session_id").notNull(),
   messageID: text("message_id").notNull().unique(),
   text: text().notNull(),
+  files: text({ mode: "json" }).$type<readonly Attachment[]>(),
   state: text({ enum: ["pending", "sent"] }).notNull(),
   // The dot that wrote a dot_message. Null for reminders and worker reports.
   fromDot: text("from_dot"),
