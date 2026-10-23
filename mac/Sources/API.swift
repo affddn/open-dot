@@ -3,14 +3,60 @@ import Foundation
 struct Dot: Decodable, Equatable {
   struct Worker: Decodable, Equatable {
     let id: Int
+    /// "creating", "running", "stopping", or "done" once stopped.
     let state: String
+    var outcome: String? = nil
     let task: String
+    /// What it waits on its owner for now: "permission", "question" or both. Older daemons send none.
+    var needs: [String]? = nil
+
+    var needsYou: Bool { state == "running" && !(needs ?? []).isEmpty }
+
+    /// The row's status: what it needs from you first, else its state.
+    var status: String {
+      if needsYou {
+        let kinds = needs ?? []
+        if kinds.contains("permission") && kinds.contains("question") { return "needs you: permission, question" }
+        return "needs you: \(kinds.contains("question") ? "question" : "permission")"
+      }
+      switch state {
+      case "stopping": return "stopping, not confirmed"
+      case "done": return outcome ?? "done"
+      default: return state
+      }
+    }
+
+    /// Its session exists once it's past creating.
+    var canOpen: Bool { state != "creating" }
+    /// A stop that OpenCode hasn't confirmed can be tried again.
+    var canStop: Bool { state != "done" }
   }
 
   let name: String
   let purpose: String?
   let busy: Bool
   let workers: [Worker]
+
+  /// How many of its workers wait on you.
+  var needsYouCount: Int { workers.filter(\.needsYou).count }
+}
+
+/// What opening a worker did: a terminal window, or the command on the clipboard instead.
+struct WorkerOpened: Decodable, Equatable {
+  let opened: Bool
+  var terminal: String? = nil
+  var copied: Bool? = nil
+  let command: String
+  var error: String? = nil
+
+  /// What the notch says about it, or nil when the window opened.
+  var notice: String? {
+    if opened { return nil }
+    let reason = error ?? "The terminal didn't open."
+    return copied == true
+      ? "\(reason) — the command is on your clipboard: \(command)"
+      : "\(reason) — copy and run: \(command)"
+  }
 }
 
 struct Message: Decodable, Equatable, Identifiable {
@@ -311,6 +357,17 @@ enum APIError: Error {
 
   func memory(_ dot: String) async throws -> Memory {
     try decode(Memory.self, await send("GET", "/dots/\(escape(dot))/memory"))
+  }
+
+  /// Opens a worker's session in a new terminal window, or copies its command. Never retried on its own.
+  func openWorker(_ id: Int) async throws -> WorkerOpened {
+    try decode(WorkerOpened.self, await send("POST", "/workers/\(id)/open"))
+  }
+
+  /// Stops a worker the owner confirmed. Never retried on its own.
+  func stopWorker(_ id: Int) async throws -> Dot.Worker {
+    struct Body: Decodable { let worker: Dot.Worker }
+    return try decode(Body.self, await send("POST", "/workers/\(id)/stop")).worker
   }
 
   /// Approves a dot's request to supervise a session, or ends a binding. Never retried on its own.

@@ -135,7 +135,9 @@ export const outbox = sqliteTable("outbox", {
   messageID: text("message_id").notNull().unique(),
   text: text().notNull(),
   files: text({ mode: "json" }).$type<readonly Attachment[]>(),
-  state: text({ enum: ["pending", "sent", "cancelled"] }).notNull(),
+  // "held": queued for a worker the owner stopped, so it's never sent on its own. It stays held until
+  // OpenCode confirms it, sent only while a later pending dot_send its owner still allows waits.
+  state: text({ enum: ["pending", "sent", "cancelled", "held"] }).notNull(),
   // The dot that wrote a dot_message or dot_send. Null for reminders and worker reports.
   fromDot: text("from_dot"),
   // Typed by the owner in the notch app, as opposed to a notice from open-dot.
@@ -324,17 +326,45 @@ export const workers = sqliteTable("workers", {
   branch: text(),
   sessionID: text("session_id").notNull(),
   // "creating" means the session ID is saved but OpenCode has not confirmed the session yet.
-  state: text({ enum: ["creating", "running", "done"] }).notNull(),
+  // "stopping" means the owner asked to stop it and its queued messages are held, but OpenCode
+  // hasn't confirmed the interrupt. A stopped worker is "done" with the outcome "stopped".
+  state: text({ enum: ["creating", "running", "stopping", "done"] }).notNull(),
   promptID: text("prompt_id"),
   route: text({ mode: "json" }).$type<Route>(),
   outcome: text(),
-  // The permission request the dot was last told about, so it is told only once.
+  // JSON {current, seen}: the "permission:<id>" and "question:<id>" keys it waits on now, and every
+  // one its dot was told about, kept after an answer so none is told twice. Older daemons saved
+  // the bare ID of the last permission told. Read it with `readWaiting`.
   waitingOn: text("waiting_on"),
   createdAt: integer("created_at").notNull(),
   finishedAt: integer("finished_at"),
 });
 
 export type Worker = typeof workers.$inferSelect;
+
+export interface WorkerWaiting {
+  readonly current: readonly string[];
+  readonly seen: readonly string[];
+}
+
+const keys = (list: unknown) =>
+  Array.isArray(list) ? list.filter((key): key is string => typeof key === "string") : [];
+
+/** Reads `workers.waiting_on`, including a legacy bare permission ID or key array. */
+export const readWaiting = (value: string | null): WorkerWaiting => {
+  if (value === null) return { current: [], seen: [] };
+  if (!value.startsWith("[") && !value.startsWith("{")) {
+    const key = `permission:${value}`;
+    return { current: [key], seen: [key] };
+  }
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (Array.isArray(parsed)) return { current: keys(parsed), seen: keys(parsed) };
+    if (typeof parsed === "object" && parsed !== null && "seen" in parsed)
+      return { current: "current" in parsed ? keys(parsed.current) : [], seen: keys(parsed.seen) };
+  } catch {}
+  return { current: [], seen: [] };
+};
 
 /** Recent GitHub, Linear and Slack notifications that need the owner's attention. */
 export const feed = sqliteTable(

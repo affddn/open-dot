@@ -135,6 +135,9 @@ struct FeedState {
   var memories: [String: MemoryState] = [:]
   var thumbnails: [AttachmentKey: NSImage] = [:]
   var unavailable: Set<AttachmentKey> = []
+  /// Workers being opened or stopped, and what the last attempt for each said.
+  var workerBusy: Set<Int> = []
+  var workerNotices: [Int: String] = [:]
   var reacting: Set<MessageKey> = []
   var reactionErrors: [MessageKey: String] = [:]
   /// The owner's latest non-classic emoji, newest first, as the daemon last reported them.
@@ -742,6 +745,37 @@ struct FeedState {
         let message = Self.describeMemory(error, "Not added", unknown: "It may have been added; it shows on the next refresh.")
         memories[name, default: MemoryState()].finishAdd(.failure(MemoryInvalid(message)))
       }
+    }
+  }
+
+  /// Opens the worker's session in a new terminal window. If none opens, the daemon copies the
+  /// command and the notice says so. Never retried on its own.
+  func openWorker(_ worker: Dot.Worker) {
+    guard workerBusy.insert(worker.id).inserted else { return }
+    workerNotices[worker.id] = nil
+    Task {
+      do {
+        workerNotices[worker.id] = try await api.openWorker(worker.id).notice
+      } catch {
+        workerNotices[worker.id] = Self.describeMemory(error, "Not opened", unknown: "A window may have opened anyway.")
+      }
+      workerBusy.remove(worker.id)
+    }
+  }
+
+  /// Stops a worker the owner confirmed, then reads the dots again. A stop OpenCode didn't confirm
+  /// says so; the owner may stop it again, but it's never retried on its own.
+  func stopWorker(_ worker: Dot.Worker) {
+    guard workerBusy.insert(worker.id).inserted else { return }
+    workerNotices[worker.id] = nil
+    Task {
+      do {
+        _ = try await api.stopWorker(worker.id)
+      } catch {
+        workerNotices[worker.id] = Self.describeMemory(error, "Not stopped", unknown: "It may have stopped; the list shows what the daemon has.")
+      }
+      workerBusy.remove(worker.id)
+      await refreshDots()
     }
   }
 

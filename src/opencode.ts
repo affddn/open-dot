@@ -118,12 +118,6 @@ export interface Turn {
   readonly end: string;
 }
 
-export interface Approval {
-  readonly id: string;
-  readonly action: string;
-  readonly resources: readonly string[];
-}
-
 /** A turn that ended in a supervised session, with the last text its assistant wrote. */
 export interface TurnEnd {
   readonly id: string;
@@ -212,10 +206,12 @@ export class OpenCode extends Context.Service<
     readonly activeSessions: Effect.Effect<ReadonlySet<string>, OpenCodeError>;
     /** The first turn that ended after the message, or undefined while none has. */
     readonly turnAfter: (ref: MessageRef) => Effect.Effect<Turn | undefined, OpenCodeError>;
-    /** The oldest permission request the session is waiting on. */
-    readonly pendingApproval: (
-      sessionID: string,
-    ) => Effect.Effect<Approval | undefined, OpenCodeError>;
+    /**
+     * Stops the session's running turn without resuming anything. Queued input stays parked in its
+     * inbox until something wakes the session again. False when nothing was running, or the
+     * session doesn't exist.
+     */
+    readonly interrupt: (sessionID: string) => Effect.Effect<boolean, OpenCodeError>;
     /** User and assistant messages among the session's last `limit` history items, oldest first. */
     readonly recentMessages: (
       sessionID: string,
@@ -376,14 +372,11 @@ export class OpenCode extends Context.Service<
               cursor = page.cursor.next;
             }
           }).pipe(Effect.mapError(failed(`Could not read session ${sessionID}`))),
-        pendingApproval: (sessionID) =>
-          client.permission.list({ sessionID: Session.ID.make(sessionID) }).pipe(
-            Effect.map(([request]) =>
-              request
-                ? { id: request.id, action: request.action, resources: request.resources }
-                : undefined,
-            ),
-            Effect.mapError(failed(`Could not list permission requests for ${sessionID}`)),
+        interrupt: (sessionID) =>
+          client.session.interrupt({ sessionID: Session.ID.make(sessionID), resume: false }).pipe(
+            Effect.map((result) => result.interrupted),
+            Effect.catchTag("SessionNotFoundError", () => Effect.succeed(false)),
+            Effect.mapError(failed(`Could not interrupt session ${sessionID}`)),
           ),
         recentMessages: (sessionID, limit) =>
           client.message.list({ sessionID: Session.ID.make(sessionID), order: "desc", limit }).pipe(

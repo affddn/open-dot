@@ -341,8 +341,9 @@ test("/dots lists each dot with whether it's busy and its unfinished workers", a
       purpose: "Second brain.",
       busy: true,
       workers: [
-        { id: 1, state: "running", task: "Fix the build" },
-        { id: 2, state: "waiting", task: "Deploy" },
+        { id: 1, state: "running", outcome: null, task: "Fix the build", needs: [] },
+        // A bare ID was the permission the dot was last told about, before questions counted.
+        { id: 2, state: "running", outcome: null, task: "Deploy", needs: ["permission"] },
       ],
     },
     { name: "polnareff", purpose: null, busy: false, workers: [] },

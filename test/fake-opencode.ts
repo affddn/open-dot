@@ -1,6 +1,5 @@
 import { Effect, Layer } from "effect";
 import {
-  type Approval,
   type Attachment,
   type Delivery,
   type Entry,
@@ -37,7 +36,12 @@ export function fakeOpenCode() {
     onMessage: () => {},
     onRecent: () => {},
     onPrompt: (_messageID: string) => {},
-    approvals: new Map<string, Approval>(),
+    // Runs as a by-ID lookup begins, before its answer.
+    onLookup: (_messageID: string) => {},
+    // Each interrupt, in order. "lost" stops the run but reports a failure, like a dropped response.
+    interrupted: [] as string[],
+    interrupt: "ok" as "ok" | "fail" | "lost",
+    onInterrupt: (_sessionID: string) => {},
     // Supervised sessions: each one's directory, turn ends and what it waits on.
     directories: new Map<string, string>(),
     ends: new Map<string, TurnEnd[]>(),
@@ -57,11 +61,12 @@ export function fakeOpenCode() {
             state.sessions.add(input.id);
           }),
     messageExists: ({ messageID }) =>
-      Effect.suspend(() =>
-        state.lookupFailure
+      Effect.suspend(() => {
+        state.onLookup(messageID);
+        return state.lookupFailure
           ? broken("inbox unavailable")
-          : Effect.succeed(state.messages.has(messageID)),
-      ),
+          : Effect.succeed(state.messages.has(messageID));
+      }),
     inbox: (sessionID) =>
       Effect.suspend(() =>
         state.lookupFailure
@@ -91,7 +96,14 @@ export function fakeOpenCode() {
               return turn && { end: `idle_${messageID}`, ...turn };
             }),
       ),
-    pendingApproval: (sessionID) => Effect.sync(() => state.approvals.get(sessionID)),
+    interrupt: (sessionID) =>
+      Effect.suspend(() => {
+        if (state.interrupt === "fail") return broken("connection refused");
+        state.onInterrupt(sessionID);
+        state.interrupted.push(sessionID);
+        const running = state.active.delete(sessionID);
+        return state.interrupt === "lost" ? broken("connection reset") : Effect.succeed(running);
+      }),
     recentMessages: (sessionID, limit) =>
       Effect.sync(() => {
         const items = (state.history.get(sessionID) ?? []).slice(-limit);

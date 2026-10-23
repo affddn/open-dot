@@ -1,6 +1,8 @@
+import { existsSync } from "node:fs";
 import { SessionMessage } from "@opencode/client/effect";
 import { and, eq, inArray, isNotNull, isNull, ne, sql } from "drizzle-orm";
 import { Effect, type Layer } from "effect";
+import { stopWorker } from "./daemon";
 import type { Db } from "./db";
 import { findDot, listDots } from "./dots";
 import { dismiss, dismissAll, handedOffFeed, unreadFeed } from "./feed";
@@ -37,6 +39,8 @@ import {
   hiddenMessages,
   type QuoteSnapshot,
   outbox,
+  readWaiting,
+  type Worker,
   workers,
 } from "./schema";
 
@@ -50,6 +54,24 @@ const read = 100;
 
 const framed = /<dot-message from="[^"]*">\n([\s\S]*)\n<\/dot-message>$/;
 
+/**
+ * A worker as the notch shows it. `needs` lists what it waits on its owner for now, a permission
+ * or a question, as the daemon last saw it; a stopping or finished worker waits on nothing.
+ */
+const workerView = (worker: Worker) => ({
+  id: worker.id,
+  state: worker.state,
+  outcome: worker.outcome,
+  task: worker.task.split("\n")[0],
+  needs: [
+    ...new Set(
+      worker.state === "running"
+        ? readWaiting(worker.waitingOn).current.map((key) => key.split(":")[0] ?? "")
+        : [],
+    ),
+  ],
+});
+
 const listAll = (db: Db) =>
   Effect.gen(function* () {
     const active = yield* (yield* OpenCode).activeSessions;
@@ -59,13 +81,7 @@ const listAll = (db: Db) =>
         name: dot.name,
         purpose: dot.purpose,
         busy: active.has(dot.sessionID),
-        workers: unfinished
-          .filter((worker) => worker.dot === dot.name)
-          .map((worker) => ({
-            id: worker.id,
-            state: worker.waitingOn ? "waiting" : worker.state,
-            task: worker.task.split("\n")[0],
-          })),
+        workers: unfinished.filter((worker) => worker.dot === dot.name).map(workerView),
       })),
     );
   });
@@ -779,18 +795,180 @@ const route = (
   return Effect.succeed(error(404, "Not found"));
 };
 
+/** Runs a program to its end. Undefined when it exited 0, else why not. */
+export type Run = (argv: readonly string[], input?: string) => Promise<string | undefined>;
+
+export const spawnRun: Run = async (argv, input) => {
+  try {
+    const child = Bun.spawn([...argv], {
+      stdin: input === undefined ? "ignore" : Buffer.from(input),
+      stdout: "ignore",
+      stderr: "pipe",
+      // A macOS Automation prompt waits for the owner. Give up before the notch's 10 s request does,
+      // so it hears the clipboard fallback rather than nothing.
+      timeout: 8_000,
+    });
+    const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+    if (code === 0) return undefined;
+    return stderr.trim() || (child.signalCode ? `stopped by ${child.signalCode}` : `exit ${code}`);
+  } catch (cause) {
+    return cause instanceof Error ? cause.message : String(cause);
+  }
+};
+
+export const shellQuote = (word: string) => `'${word.replaceAll("'", `'\\''`)}'`;
+
+export const openCommand = (binary: string, directory: string, sessionID: string) =>
+  `cd ${shellQuote(directory)} && ${shellQuote(binary)} -s ${shellQuote(sessionID)}`;
+
+export type Terminal = "ghostty" | "terminal";
+
+export const pickTerminal = (
+  env: Record<string, string | undefined>,
+  installed: (app: string) => boolean = existsSync,
+): Terminal => {
+  const named = env.OPEN_DOT_TERMINAL?.trim().toLowerCase();
+  if (named === "ghostty" || named === "terminal") return named;
+  return installed("/Applications/Ghostty.app") ? "ghostty" : "terminal";
+};
+
+const terminalNames = { ghostty: "Ghostty", terminal: "Terminal" } as const;
+
+/**
+ * Opens a new window that runs the command in the owner's own shell, so their PATH finds the
+ * binary. The command and directory reach AppleScript as arguments, never as script text.
+ */
+export const terminalLaunch = (terminal: Terminal, command: string, directory: string) =>
+  terminal === "ghostty"
+    ? [
+        "osascript",
+        "-e",
+        "on run argv",
+        "-e",
+        'tell application "Ghostty"',
+        "-e",
+        "activate",
+        "-e",
+        "new window with configuration {initial working directory:(item 1 of argv), initial input:(item 2 of argv) & linefeed}",
+        "-e",
+        "end tell",
+        "-e",
+        "end run",
+        directory,
+        command,
+      ]
+    : [
+        "osascript",
+        "-e",
+        "on run argv",
+        "-e",
+        'tell application "Terminal"',
+        "-e",
+        "activate",
+        "-e",
+        "do script (item 1 of argv)",
+        "-e",
+        "end tell",
+        "-e",
+        "end run",
+        command,
+      ];
+
+const opencodeBinary = (env: Record<string, string | undefined>) => {
+  const named = env.OPEN_DOT_OPENCODE?.trim();
+  const plain = named && Array.from(named).every((c) => c.charCodeAt(0) > 31 && c !== "\x7f");
+  return plain ? named : "opencode2";
+};
+
+/** Falls back to copying the command, and says so, when no terminal window opens. */
+const openWorker = async (worker: Worker, run: Run, env: Record<string, string | undefined>) => {
+  const command = openCommand(opencodeBinary(env), worker.directory, worker.sessionID);
+  const terminal = pickTerminal(env);
+  const failed = await run(terminalLaunch(terminal, command, worker.directory));
+  if (failed === undefined)
+    return Response.json({ opened: true, terminal: terminalNames[terminal], command });
+  console.error(`Opening worker #${worker.id} in ${terminalNames[terminal]}: ${failed}`);
+  const uncopied = await run(["pbcopy"], command);
+  return Response.json({
+    opened: false,
+    copied: uncopied === undefined,
+    command,
+    error: `${terminalNames[terminal]} didn't open: ${failed.slice(0, 240)}`,
+  });
+};
+
+/** `POST /workers/<id>/open` and `POST /workers/<id>/stop`. */
+const workerRoute = (
+  db: Db,
+  request: Request,
+  path: string[],
+  layer: Layer.Layer<OpenCode, OpenCodeError>,
+  run: Run,
+): Promise<Response> => {
+  const [rawID, action, ...extra] = path;
+  if (
+    request.method !== "POST" ||
+    extra.length ||
+    (action !== "open" && action !== "stop") ||
+    rawID === undefined ||
+    !positive.test(rawID) ||
+    !Number.isSafeInteger(Number(rawID))
+  )
+    return Promise.resolve(error(404, "Not found"));
+  const id = Number(rawID);
+  const worker = db.select().from(workers).where(eq(workers.id, id)).get();
+  if (!worker) return Promise.resolve(error(404, "There's no such worker."));
+  if (action === "open") {
+    if (worker.state === "creating")
+      return Promise.resolve(error(409, "Its session isn't ready yet. Try again in a moment."));
+    return openWorker(worker, run, process.env);
+  }
+  return Effect.runPromise(
+    stopWorker(db, id).pipe(
+      Effect.provide(layer),
+      Effect.map((stopped) =>
+        !stopped
+          ? error(404, "There's no such worker.")
+          : stopped.state === "done" && stopped.outcome !== "stopped"
+            ? Response.json(
+                { error: "It already finished.", worker: workerView(stopped) },
+                { status: 409 },
+              )
+            : Response.json({ worker: workerView(stopped) }),
+      ),
+      Effect.catch((failure) => {
+        const current = db.select().from(workers).where(eq(workers.id, id)).get();
+        // OpenCode may be down before anything was saved, so say only what is true now.
+        const held = current?.state === "stopping";
+        return Effect.succeed(
+          Response.json(
+            {
+              error: held
+                ? `Couldn't confirm the stop: ${failure.message}. Nothing queued for it will be sent. Stop it again to retry.`
+                : `Not stopped: ${failure.message}`,
+              worker: current && workerView(current),
+            },
+            { status: 502 },
+          ),
+        );
+      }),
+    ),
+  );
+};
+
 /**
  * The daemon's local API for the notch app. Every request needs the token, which only the owner's
  * account can read from api.json, so other local users and web pages can't call it.
  * The feed doesn't need OpenCode, so it works while OpenCode is down.
  */
 export const api =
-  (db: Db, token: string, layer: Layer.Layer<OpenCode, OpenCodeError>) =>
+  (db: Db, token: string, layer: Layer.Layer<OpenCode, OpenCodeError>, run: Run = spawnRun) =>
   (request: Request): Promise<Response> => {
     if (request.headers.get("authorization") !== `Bearer ${token}`)
       return Promise.resolve(error(401, "Unauthorized"));
     const path = new URL(request.url).pathname.split("/").filter(Boolean);
     if (path[0] === "feed") return Promise.resolve(feedRoute(db, request, path.slice(1)));
+    if (path[0] === "workers") return workerRoute(db, request, path.slice(1), layer, run);
     if (path[0] === "dots" && path[2] === "memory")
       return memoryRoute(db, request, path).catch((cause) => {
         console.error(`Memory: ${cause instanceof Error ? cause.message : String(cause)}`);

@@ -252,13 +252,15 @@ test("a worker gets one session and task, and its dot hears once per approval an
   expect(sentTo("ses_worker")).toEqual([expect.stringContaining("Count the files.")]);
 
   fake.state.active.add("ses_worker");
-  fake.state.approvals.set("ses_worker", { id: "per_1", action: "shell", resources: ["rm -r x"] });
+  fake.state.waiting.set("ses_worker", [
+    { id: "per_1", kind: "permission", summary: "shell: rm -r x" },
+  ]);
   await tick(3);
   await tick(4);
   expect(sentTo("ses_jojo")).toEqual([expect.stringContaining("rm -r x")]);
 
   fake.state.active.delete("ses_worker");
-  fake.state.approvals.clear();
+  fake.state.waiting.clear();
   fake.state.turns.set("ses_worker", { outcome: "succeeded", text: "There are 3 files." });
   await tick(5);
   await tick(6);

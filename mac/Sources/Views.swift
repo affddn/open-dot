@@ -88,7 +88,7 @@ struct ExpandedView: View {
           } else {
             Conversation(store: store, name: name)
               .id(name)
-            if !dot.workers.isEmpty { workers(dot.workers) }
+            if !dot.workers.isEmpty { workers(name, dot.workers) }
             composer(name)
           }
         } else {
@@ -132,6 +132,15 @@ struct ExpandedView: View {
             HStack(spacing: 5) {
               if dot.busy { BusyDot() }
               Text(dot.name).font(.callout.weight(.medium))
+              if dot.needsYouCount > 0 {
+                Text("\(dot.needsYouCount)")
+                  .font(.caption2.weight(.semibold).monospacedDigit())
+                  .padding(.horizontal, 5)
+                  .background(Capsule().fill(.orange.opacity(0.7)))
+                  .help("Workers waiting on you")
+                  .accessibilityLabel("\(dot.needsYouCount) waiting on you")
+                  .accessibilityIdentifier("dot-needs-you-\(dot.name)")
+              }
               if store.unread(dot.name) { UnreadDot() }
             }
             .padding(.horizontal, 10)
@@ -160,24 +169,53 @@ struct ExpandedView: View {
     .accessibilityIdentifier("dot-mode")
   }
 
-  private func workers(_ workers: [Dot.Worker]) -> some View {
-    ScrollView(.horizontal) {
-      HStack(spacing: 6) {
-        ForEach(workers, id: \.id) { worker in
-          Text("#\(worker.id) \(worker.state) · \(worker.task)")
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-            .frame(maxWidth: 220)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(Capsule().fill(.white.opacity(0.08)))
+  private func workers(_ name: String, _ workers: [Dot.Worker]) -> some View {
+    VStack(alignment: .leading, spacing: 3) {
+      ScrollView(.horizontal) {
+        HStack(spacing: 6) {
+          ForEach(workers, id: \.id) { worker in workerRow(name, worker) }
+        }
+      }
+      .scrollIndicators(.hidden)
+      ForEach(workers.filter { store.workerNotices[$0.id] != nil }, id: \.id) { worker in
+        Text(verbatim: "#\(worker.id): \(store.workerNotices[worker.id] ?? "")")
+          .font(.caption2)
+          .foregroundStyle(.orange)
+          .textSelection(.enabled)
+          .accessibilityIdentifier("worker-notice-\(worker.id)")
+      }
+    }
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("workers")
+  }
+
+  private func workerRow(_ name: String, _ worker: Dot.Worker) -> some View {
+    HStack(spacing: 6) {
+      Text(verbatim: "#\(worker.id) \(worker.status) · \(worker.task)")
+        .foregroundStyle(worker.needsYou ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+        .lineLimit(1)
+        .frame(maxWidth: 220, alignment: .leading)
+      if store.workerBusy.contains(worker.id) {
+        Text("…").foregroundStyle(.secondary)
+      } else {
+        if worker.canOpen {
+          Button("Open") { store.openWorker(worker) }
+            .help("Open its session in a new terminal window")
+            .accessibilityIdentifier("worker-open-\(worker.id)")
+        }
+        if worker.canStop {
+          Button("Stop…") { confirmStop(worker, dot: name, store: store) }
+            .accessibilityIdentifier("worker-stop-\(worker.id)")
         }
       }
     }
-    .scrollIndicators(.hidden)
+    .buttonStyle(.plain)
+    .font(.caption2)
+    .padding(.horizontal, 8)
+    .padding(.vertical, 3)
+    .background(Capsule().fill(worker.needsYou ? .orange.opacity(0.18) : .white.opacity(0.08)))
     .accessibilityElement(children: .contain)
-    .accessibilityIdentifier("workers")
+    .accessibilityIdentifier("worker-\(worker.id)")
   }
 
   private func composer(_ name: String) -> some View {
@@ -1559,6 +1597,25 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
   alert.informativeText = lines.isEmpty ? "No Tapbacks." : lines.joined(separator: "\n")
   alert.addButton(withTitle: "OK")
   _ = runAlert(alert, store)
+}
+
+/// The one confirmation before a stop: what happens, with Cancel first for Return and Escape.
+func stopConfirmation(_ worker: Dot.Worker, dot: String) -> (title: String, detail: String) {
+  (
+    "Stop worker #\(worker.id)?",
+    "\(worker.task)\n\nIts current run is interrupted, and nothing already queued for it is sent. \(dot) hears once that you stopped it. A message you type in its session later can resume it."
+  )
+}
+
+@MainActor private func confirmStop(_ worker: Dot.Worker, dot: String, store: Store) {
+  let text = stopConfirmation(worker, dot: dot)
+  let alert = NSAlert()
+  alert.messageText = text.title
+  alert.informativeText = text.detail
+  alert.addButton(withTitle: "Cancel")
+  alert.addButton(withTitle: "Stop").hasDestructiveAction = true
+  guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
+  store.stopWorker(worker)
 }
 
 @MainActor private func confirmHide(_ key: MessageKey, session: String, store: Store) {
