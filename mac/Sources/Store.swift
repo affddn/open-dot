@@ -411,17 +411,6 @@ struct MessageWindow: Equatable {
     }
   }
 
-  func pickImages(_ name: String) {
-    let panel = NSOpenPanel()
-    panel.canChooseDirectories = false
-    panel.allowsMultipleSelection = true
-    panel.allowedContentTypes = [.image]
-    panel.begin { [weak self] response in
-      guard response == .OK else { return }
-      Task { @MainActor in self?.addImageFiles(panel.urls, to: name) }
-    }
-  }
-
   func removeImage(_ id: UUID, from name: String) {
     draftImages[name]?.removeAll { $0.id == id }
     imageErrors[name] = nil

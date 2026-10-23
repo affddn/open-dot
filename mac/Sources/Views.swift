@@ -304,7 +304,7 @@ struct ExpandedView: View {
           .accessibilityIdentifier("chat-action-error")
       }
       Composer(placeholder: "Message \(name)", text: Binding { store.drafts[name] ?? "" } set: { store.drafts[name] = $0 }, canSend: !store.sending.contains(name), hasImages: !(store.draftImages[name] ?? []).isEmpty,
-        pasteImages: { store.pasteImages($0, to: name) }, pickImages: { store.pickImages(name) }) {
+        pasteImages: { store.pasteImages($0, to: name) }) {
         store.send(name)
       }
       .id(name)
@@ -318,19 +318,13 @@ struct Composer: View {
   var canSend = true
   var hasImages = false
   var pasteImages: ((NSPasteboard) -> Bool)? = nil
-  var pickImages: (() -> Void)? = nil
   let send: () -> Void
   @State private var height = DraftHeight.minimum
   @State private var focusRequest = 0
 
   var body: some View {
     let blocked = (text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !hasImages) || !canSend
-    HStack(alignment: .bottom) {
-      if let pickImages {
-        Button(action: pickImages) { Image(systemName: "paperclip") }
-          .buttonStyle(.plain)
-          .accessibilityLabel("Attach images")
-      }
+    HStack(alignment: .center) {
       DraftEditor(text: $text, height: $height, focusRequest: focusRequest, placeholder: placeholder, hasImages: hasImages, pasteImages: pasteImages, send: { if canSend { send() } })
         .frame(height: height)
         .overlay(alignment: .topLeading) {
@@ -347,6 +341,8 @@ struct Composer: View {
         }
       Button(action: send) {
         Image(systemName: "arrow.up.circle.fill").font(.title2)
+          .frame(width: 32, height: 32)
+          .contentShape(Rectangle())
       }
       .buttonStyle(.plain)
       .disabled(blocked)
@@ -408,7 +404,10 @@ struct DraftEditor: NSViewRepresentable {
     editor.autoresizingMask = [.width]
     editor.textContainer?.widthTracksTextView = true
     editor.delegate = context.coordinator
-    if pasteImages != nil { editor.registerForDraggedTypes([.fileURL, .png, .tiff]) }
+    if pasteImages != nil {
+      editor.registerForDraggedTypes([.fileURL, .png, .tiff])
+      editor.toolTip = "Paste or drop images to attach them."
+    }
     editor.setAccessibilityIdentifier("composer")
     scroll.documentView = editor
     return scroll
