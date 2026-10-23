@@ -441,6 +441,34 @@ struct MessageWindow: Equatable {
     }
   }
 
+  /// A click on a dot's tab shows its chat, and its menu's Memory or Instructions shows that view,
+  /// selecting the dot first either way. An unsaved instructions draft stays.
+  func openDot(_ name: String, _ pane: Pane) {
+    showingFeed = false
+    selected = name
+    show(pane)
+    Task { await refreshMessages(name) }
+  }
+
+  /// Escape goes back to the chat from Memory or Instructions, keeping any draft, and Command-1, 2
+  /// and 3 show the chat, Memory and Instructions. The panel gets keys only while it has keyboard
+  /// focus, and a dot must be shown. Nothing is taken while an input method is composing text.
+  /// True when the key was used.
+  func navigate(_ event: NSEvent, composing: Bool) -> Bool {
+    guard event.type == .keyDown, !composing, expanded, loaded, !showingFeed, status == nil,
+      let name = selected, dots.contains(where: { $0.name == name }) else { return false }
+    let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+    if event.keyCode == 53 {
+      guard modifiers.isEmpty, pane != .chat else { return false }
+      show(.chat)
+      return true
+    }
+    let panes: [String: Pane] = ["1": .chat, "2": .memory, "3": .instructions]
+    guard modifiers == .command, let target = event.charactersIgnoringModifiers.flatMap({ panes[$0] }) else { return false }
+    if target != pane { show(target) }
+    return true
+  }
+
   /// The dots whose instructions have unsaved edits.
   var unsavedInstructions: [String] { instructions.filter { $0.value.dirty }.map(\.key).sorted() }
 

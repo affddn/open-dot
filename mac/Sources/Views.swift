@@ -86,15 +86,13 @@ struct ExpandedView: View {
       if !store.loaded {
         centered("Connecting…")
       } else {
-        HStack(spacing: 8) {
-          tabs
-          if !store.showingFeed, store.status == nil, store.selected != nil { modes }
-        }
+        tabs
         if store.showingFeed {
           FeedList(store: store)
         } else if let status = store.status {
           centered(status)
         } else if let name = store.selected, let dot = store.dots.first(where: { $0.name == name }) {
+          if store.pane != .chat { paneHeader(name) }
           if store.showingInstructions {
             InstructionsView(store: store, name: name)
               .id("instructions-\(name)")
@@ -144,7 +142,8 @@ struct ExpandedView: View {
         .buttonStyle(.plain)
         .accessibilityIdentifier("feed-tab")
         ForEach(store.dots, id: \.name) { dot in
-          Button { store.select(dot.name) } label: {
+          let unsaved = store.instructions[dot.name]?.dirty == true
+          Button { store.openDot(dot.name, .chat) } label: {
             HStack(spacing: 5) {
               if dot.busy { BusyDot() }
               if let image = store.avatars.images[dot.name] { AvatarView(image: image, size: 16) }
@@ -158,6 +157,14 @@ struct ExpandedView: View {
                   .accessibilityLabel("\(dot.needsYouCount) waiting on you")
                   .accessibilityIdentifier("dot-needs-you-\(dot.name)")
               }
+              if unsaved {
+                Image(systemName: "pencil.circle.fill")
+                  .font(.system(size: 9))
+                  .foregroundStyle(.secondary)
+                  .help("Unsaved instructions")
+                  .accessibilityLabel("unsaved instructions")
+                  .accessibilityIdentifier("dot-unsaved-\(dot.name)")
+              }
               if store.unread(dot.name) { UnreadDot() }
             }
             .padding(.horizontal, 10)
@@ -166,28 +173,37 @@ struct ExpandedView: View {
             .contentShape(Capsule())
           }
           .buttonStyle(.plain)
+          // A secondary click or Control-click opens its Memory and Instructions menu.
+          .background(MenuAnchor(id: "dot-menu-\(dot.name)", store: store) { _ in dotMenu(store, dot: dot.name) })
           .help(dot.purpose ?? "")
           .accessibilityIdentifier("dot-tab-\(dot.name)")
+          .accessibilityAction(named: "Memory") { store.openDot(dot.name, .memory) }
+          .accessibilityAction(named: unsaved ? "Instructions, unsaved changes" : "Instructions") { store.openDot(dot.name, .instructions) }
         }
       }
     }
     .scrollIndicators(.hidden)
   }
 
-  /// The selected dot's chat, its notes, responsibilities and reminders, or its AGENTS.md.
-  private var modes: some View {
-    let unsaved = store.selected.map { store.instructions[$0]?.dirty == true } ?? false
-    return Picker("View", selection: Binding { store.pane } set: { store.show($0) }) {
-      Text("Chat").tag(Store.Pane.chat)
-      Text("Memory").tag(Store.Pane.memory)
-      Text(unsaved ? "Instructions •" : "Instructions")
-        .accessibilityLabel(unsaved ? "Instructions, unsaved changes" : "Instructions")
-        .tag(Store.Pane.instructions)
+  /// Above Memory or Instructions: the dot, the view, and the way back to its chat, which Escape
+  /// also takes. Going back keeps an unsaved instructions draft.
+  private func paneHeader(_ name: String) -> some View {
+    HStack(spacing: 8) {
+      Button { store.show(.chat) } label: {
+        Label("Chat", systemImage: "chevron.left")
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .help("Back to \(name)'s chat (Escape)")
+      .accessibilityLabel("Back to chat")
+      .accessibilityIdentifier("pane-back")
+      Text(verbatim: "\(name) · \(store.pane == .memory ? "Memory" : "Instructions")")
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .accessibilityIdentifier("pane-title")
+      Spacer()
     }
-    .pickerStyle(.segmented)
-    .labelsHidden()
-    .fixedSize()
-    .accessibilityIdentifier("dot-mode")
+    .font(.caption.weight(.semibold))
   }
 
   private func workers(_ name: String, _ dot: Dot) -> some View {
@@ -1787,6 +1803,24 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
   menu.addItem(.separator())
   menu.addItem(note("Tapbacks, Reply and Delete wait until it's delivered."))
   if !item.images.isEmpty { menu.addItem(note("Its images copy and share once delivered.")) }
+  return menu
+}
+
+/// A dot tab's menu. Memory and Instructions each select the dot first, and Instructions is
+/// marked while the dot has unsaved instructions.
+@MainActor func dotMenu(_ store: Store, dot: String) -> NSMenu {
+  let menu = NSMenu()
+  menu.autoenablesItems = false
+  menu.addItem(action("Memory", symbol: "brain", id: "dot-menu-memory") { store.openDot(dot, .memory) })
+  let unsaved = store.instructions[dot]?.dirty == true
+  let instructions = action(unsaved ? "Instructions •" : "Instructions", symbol: "doc.text", id: "dot-menu-instructions") {
+    store.openDot(dot, .instructions)
+  }
+  if unsaved {
+    instructions.toolTip = "Unsaved changes"
+    instructions.setAccessibilityLabel("Instructions, unsaved changes")
+  }
+  menu.addItem(instructions)
   return menu
 }
 

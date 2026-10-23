@@ -4,11 +4,15 @@ import SwiftUI
 final class Panel: NSPanel {
   override var canBecomeKey: Bool { true }
   override var canBecomeMain: Bool { false }
+  weak var store: Store?
 
-  /// A secondary click or Control-click on a chat message opens its menu before anything else
-  /// sees the event. Every other event, including ordinary clicks, goes on as before.
+  /// A secondary click or Control-click on a chat message or a dot's tab opens its menu before
+  /// anything else sees the event. Escape and Command-1, 2 and 3 switch the dot's view before a
+  /// text view takes them, unless it's composing text. Every other event goes on as before.
   override func sendEvent(_ event: NSEvent) {
     if MenuAnchorView.handle(event) { return }
+    if event.type == .keyDown, let store,
+      store.navigate(event, composing: (firstResponder as? NSTextInputClient)?.hasMarkedText() == true) { return }
     super.sendEvent(event)
   }
 }
@@ -106,6 +110,7 @@ struct Notch {
     panel.isMovable = false
     panel.hidesOnDeactivate = false
     panel.becomesKeyOnlyIfNeeded = true
+    panel.store = store
 
     let hover = HoverView(frame: .zero)
     hover.onHover = { [weak self] inside in self?.hover(inside) }
