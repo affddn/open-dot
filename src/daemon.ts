@@ -166,13 +166,18 @@ export const deliverAll = (db: Db) =>
             activeRoute = key;
           }
         }
-        // An independently started native turn must finish before a Slack route can enter it.
-        if (activeRoute === undefined && (yield* opencode.activeSessions).has(sessionID)) return;
         for (const row of messages) {
           const current = db.select().from(outbox).where(eq(outbox.id, row.id)).get();
           if (!current || current.state !== "pending") continue;
           const key = routeKey(current.route);
           if (activeRoute !== undefined && key !== activeRoute) break;
+          // An independently started native turn must finish before a Slack route can enter it.
+          if (
+            activeRoute === undefined &&
+            current.route &&
+            (yield* opencode.activeSessions).has(sessionID)
+          )
+            break;
           yield* deliver(db, current);
           activeRoute = key;
         }

@@ -179,6 +179,55 @@ test("notices and Slack never steer, a waiting notice holds the owner's message 
   expect(fake.state.prompted).toEqual(["slack_a", "slack_a2", native, "report", behind, next]);
 });
 
+test("a turn started outside open-dot takes the owner's first message as a steer", async () => {
+  fake.state.active.add("ses_jojo");
+  const id = await post({ text: "Also check the logs." });
+  await tick();
+  expect(fake.state.prompted).toEqual([id]);
+  expect(row(id)).toMatchObject({ delivery: "steer", state: "sent" });
+});
+
+test("during a turn started outside open-dot Slack waits, and neither route overtakes the other", async () => {
+  const end = (id: string) => {
+    fake.state.messageTurns.set(id, { end: `idle_${id}`, outcome: "succeeded", text: undefined });
+    fake.state.inbox = [];
+  };
+  fake.state.active.add("ses_jojo");
+  unrouted("slack_a", thread);
+  const behind = await post({ text: "Behind Slack." });
+  await tick();
+  await tick();
+  expect(fake.state.prompted).toEqual([]);
+
+  // Once the turn ends, Slack goes first and the owner's message waits for Slack's own turn.
+  fake.state.active.clear();
+  await tick();
+  expect(fake.state.prompted).toEqual(["slack_a"]);
+  end("slack_a");
+  await tick();
+  expect(fake.state.prompted).toEqual(["slack_a", behind]);
+  expect(fake.state.deliveries.get(behind)).toBe("queue");
+  end(behind);
+
+  // Another outside turn: the owner's message steers in, then Slack and the next one wait in order.
+  fake.state.active.add("ses_jojo");
+  const owner = await post({ text: "Steer this." });
+  unrouted("slack_b", thread);
+  const after = await post({ text: "After Slack." });
+  await tick();
+  await tick();
+  expect(fake.state.prompted).toEqual(["slack_a", behind, owner]);
+  expect(fake.state.deliveries.get(owner)).toBe("steer");
+  fake.state.active.clear();
+  end(owner);
+  await tick();
+  expect(fake.state.prompted).toEqual(["slack_a", behind, owner, "slack_b"]);
+  expect(fake.state.deliveries.get("slack_b")).toBe("queue");
+  end("slack_b");
+  await tick();
+  expect(fake.state.prompted).toEqual(["slack_a", behind, owner, "slack_b", after]);
+});
+
 test("a lost steer survives reopening and a failed lookup, and is never sent twice or re-decided", async () => {
   const directory = mkdtempSync(join(tmpdir(), "open-dot-steer-"));
   const path = join(directory, "open-dot.db");
@@ -353,22 +402,36 @@ test("over the public client, the saved mode reaches OpenCode, and only the hist
       )
     ).json()) as { messages: { id: string }[]; pending: { id: string; status: string }[] };
   try {
+    // A turn started in the TUI is running before the owner sends anything from the notch.
+    busy = true;
+    const opening = await post({ text: "While the TUI works." });
+    await poll();
+    expect(posts.map((body) => [body.id, body.delivery])).toEqual([[opening, "steer"]]);
+    handOver(opening);
+    history.push({
+      type: "idle",
+      id: SessionMessage.ID.create(),
+      time: { created: 1 },
+      outcome: "succeeded",
+    });
+    busy = false;
+
     const first = await post({ text: "First." });
     await poll();
-    expect(posts.map((body) => body.delivery)).toEqual(["queue"]);
+    expect(posts.map((body) => body.delivery)).toEqual(["steer", "queue"]);
     handOver(first);
     busy = true;
 
     // Mid-tool: admitted as a steer, it stays in the inbox, so it's sent but not delivered.
     const second = await post({ text: "Steer this.", files });
     await poll();
-    expect(posts[1]).toMatchObject({
+    expect(posts[2]).toMatchObject({
       id: second,
       delivery: "steer",
       files: [{ uri: "data:image/png;base64,iVBORw0KGgo=", name: "ci.png" }],
     });
     let view = await shown();
-    expect(view.messages.map((message) => message.id)).toEqual([first]);
+    expect(view.messages.map((message) => message.id)).toEqual([opening, first]);
     expect(view.pending).toEqual([{ id: second, status: "sent" }]);
 
     // A worker report waits queued for the turn to end, and keeps the next owner message behind it.
@@ -386,6 +449,7 @@ test("over the public client, the saved mode reaches OpenCode, and only the hist
     const third = await post({ text: "Behind the report." });
     await poll();
     expect(posts.map((body) => [body.id, body.delivery])).toEqual([
+      [opening, "steer"],
       [first, "queue"],
       [second, "steer"],
       [report, "queue"],
@@ -395,7 +459,7 @@ test("over the public client, the saved mode reaches OpenCode, and only the hist
     // The tool finishes: the steer is delivered first, and leaves the pending list.
     handOver(second);
     view = await shown();
-    expect(view.messages.map((message) => message.id)).toEqual([first, second]);
+    expect(view.messages.map((message) => message.id)).toEqual([opening, first, second]);
     expect(view.pending).toEqual([{ id: third, status: "sent" }]);
 
     // A lost answer is confirmed by ID after reopening and a failed lookup, never posted again.
@@ -416,7 +480,7 @@ test("over the public client, the saved mode reaches OpenCode, and only the hist
     busy = false;
     await poll();
     expect(row(fourth)).toMatchObject({ state: "sent", delivery: "steer" });
-    expect(posts).toHaveLength(5);
+    expect(posts).toHaveLength(6);
     expect(fetched).not.toHaveBeenCalled();
   } finally {
     fetched.mockRestore();
