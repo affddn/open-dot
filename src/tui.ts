@@ -16,7 +16,10 @@ interface WorkerEntry {
   readonly task: string;
   readonly sessionID: string;
   readonly status: string;
+  readonly state: string;
 }
+
+const WORKERS_PER_DOT = 10;
 
 /** Reads straight from open-dot's DB. The TUI must not import backend code. */
 function read<Row>(sql: string, ...params: number[]): Row[] {
@@ -40,8 +43,10 @@ const readDots = () =>
 /** Running workers, and those that finished in the last day. */
 const readWorkers = () =>
   read<WorkerEntry>(
-    `SELECT id, dot, task, session_id AS sessionID, coalesce(outcome, state) AS status FROM workers
-     WHERE state = 'running' OR (state = 'done' AND finished_at > ?) ORDER BY id`,
+    `SELECT id, dot, task, session_id AS sessionID, coalesce(outcome, state) AS status, state FROM workers
+     WHERE state = 'running' OR (state = 'done' AND finished_at > ?)
+     ORDER BY CASE WHEN state = 'running' THEN 0 ELSE 1 END,
+       CASE WHEN state = 'running' THEN created_at ELSE finished_at END DESC, id DESC`,
     Date.now() - 24 * 60 * 60 * 1000,
   );
 
@@ -57,18 +62,26 @@ const marks: Record<string, string> = { running: "●", succeeded: "✓", failed
 interface Line {
   readonly dot: DotEntry;
   readonly worker?: WorkerEntry;
+  readonly more?: number;
 }
 
 /** Each dot, followed by its workers. */
-function readSidebar(): Line[] {
+export function readSidebar(): Line[] {
   const workers = readWorkers();
-  return readDots().flatMap((dot) => [
-    { dot },
-    ...workers.filter((worker) => worker.dot === dot.name).map((worker) => ({ dot, worker })),
-  ]);
+  return readDots().flatMap((dot) => {
+    const recent = workers.filter((worker) => worker.dot === dot.name);
+    const running = recent.filter((worker) => worker.state === "running").length;
+    const visible = recent.slice(0, Math.max(WORKERS_PER_DOT, running));
+    const more = recent.length - visible.length;
+    return [
+      { dot },
+      ...visible.map((worker) => ({ dot, worker })),
+      ...(more ? [{ dot, more }] : []),
+    ];
+  });
 }
 
-const same = (a: Line[], b: Line[]) => JSON.stringify(a) === JSON.stringify(b);
+export const same = (a: Line[], b: Line[]) => JSON.stringify(a) === JSON.stringify(b);
 
 export default Plugin.define({
   id: "open-dot.tui",
@@ -187,6 +200,20 @@ export default Plugin.define({
       context.ui.dialog.set({ size: "large" });
     }
 
+    async function chooseWorker(dot: DotEntry) {
+      const picked = await context.ui.dialog.select({
+        title: `${dot.name} workers`,
+        options: readWorkers()
+          .filter((worker) => worker.dot === dot.name)
+          .map((worker) => ({
+            title: `#${worker.id} ${title(worker.task)}`,
+            description: worker.status,
+            value: worker,
+          })),
+      });
+      if (picked) showWorker(picked);
+    }
+
     context.keymap.layer(() => ({
       mode: "global",
       commands: [
@@ -211,7 +238,7 @@ export default Plugin.define({
         jsx("box", {
           flexDirection: "column",
           children: () =>
-            rows().map(({ dot, worker }) =>
+            rows().map(({ dot, worker, more }) =>
               worker
                 ? jsx("text", {
                     fg: context.theme.text.muted,
@@ -221,14 +248,23 @@ export default Plugin.define({
                     },
                     children: ["  ", mark(worker), ` #${worker.id} ${short(worker.task)}`],
                   })
-                : jsx("text", {
-                    content: `● ${dot.name}`,
-                    fg: context.theme.text.base,
-                    selectable: false,
-                    onMouseUp(event: MouseEvent) {
-                      if (event.button === 0) void open(dot);
-                    },
-                  }),
+                : more
+                  ? jsx("text", {
+                      content: `  … ${more} more`,
+                      fg: context.theme.text.muted,
+                      selectable: false,
+                      onMouseUp(event: MouseEvent) {
+                        if (event.button === 0) void chooseWorker(dot);
+                      },
+                    })
+                  : jsx("text", {
+                      content: `● ${dot.name}`,
+                      fg: context.theme.text.base,
+                      selectable: false,
+                      onMouseUp(event: MouseEvent) {
+                        if (event.button === 0) void open(dot);
+                      },
+                    }),
             ),
         }),
     });

@@ -118,6 +118,8 @@ Dot and worker sessions are created with `ask` rules for destructive shell comma
 
 The TUI plugin imports no backend code: no `@opencode/client` and no Drizzle. open-bot found that these imports break plugin loading.
 
+Its sidebar shows up to 10 workers per dot: all running workers first, newest by creation time, then the most recently finished within 24 hours. More than 10 running workers all remain visible, with no finished rows. A muted `… N more` row opens a selector for all of that dot's recent workers; a selection opens the same details as a worker row. The sidebar still refreshes every two seconds and skips unchanged snapshots.
+
 ## Verified OpenCode behavior
 
 These were checked live against OpenCode 2.1.1 and shape the code:
