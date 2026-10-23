@@ -320,7 +320,8 @@ struct Composer: View {
   var pasteImages: ((NSPasteboard) -> Bool)? = nil
   var pickImages: (() -> Void)? = nil
   let send: () -> Void
-  @State private var height: CGFloat = 22
+  @State private var height = DraftHeight.minimum
+  @State private var focusRequest = 0
 
   var body: some View {
     let blocked = (text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !hasImages) || !canSend
@@ -330,7 +331,7 @@ struct Composer: View {
           .buttonStyle(.plain)
           .accessibilityLabel("Attach images")
       }
-      DraftEditor(text: $text, height: $height, placeholder: placeholder, hasImages: hasImages, pasteImages: pasteImages, send: { if canSend { send() } })
+      DraftEditor(text: $text, height: $height, focusRequest: focusRequest, placeholder: placeholder, hasImages: hasImages, pasteImages: pasteImages, send: { if canSend { send() } })
         .frame(height: height)
         .overlay(alignment: .topLeading) {
           // The editor's own label is for VoiceOver only, so the placeholder is drawn over it.
@@ -352,17 +353,38 @@ struct Composer: View {
       .opacity(blocked ? 0.4 : 1)
       .accessibilityLabel("Send")
       .accessibilityIdentifier("send")
+      // Outside the disabled scope, so a click on a disabled Send never reaches the box behind it.
+      .background(Color.clear.contentShape(Rectangle()).onTapGesture {}.accessibilityHidden(true))
     }
     .padding(.leading, 12)
     .padding(.trailing, 6)
     .padding(.vertical, 6)
-    .background(RoundedRectangle(cornerRadius: 14).fill(.white.opacity(0.08)))
+    .background(
+      // Only clicks on the box's padding and gaps reach it, since the editor and buttons sit above it.
+      RoundedRectangle(cornerRadius: 14).fill(.white.opacity(0.08))
+        .onTapGesture { focusRequest += 1 }
+        .accessibilityHidden(true)
+    )
+  }
+}
+
+struct DraftHeight: Equatable {
+  static let minimum: CGFloat = 38
+  let visible: CGFloat
+  let document: CGFloat
+
+  init(used: CGFloat, line: CGFloat, trailingNewline: Bool) {
+    // Layout leaves out the empty line after a trailing newline. The 6 is the editor's top and bottom inset.
+    let content = max(line, used + (trailingNewline ? line : 0)) + 6
+    document = max(content, Self.minimum)
+    visible = min(document, max(line * 6 + 6, Self.minimum))
   }
 }
 
 struct DraftEditor: NSViewRepresentable {
   @Binding var text: String
   @Binding var height: CGFloat
+  let focusRequest: Int
   let placeholder: String
   let hasImages: Bool
   let pasteImages: ((NSPasteboard) -> Bool)?
@@ -382,6 +404,7 @@ struct DraftEditor: NSViewRepresentable {
     editor.font = .systemFont(ofSize: 13)
     editor.textContainerInset = NSSize(width: 0, height: 3)
     editor.isVerticallyResizable = true
+    editor.minSize = NSSize(width: 0, height: DraftHeight.minimum)
     editor.autoresizingMask = [.width]
     editor.textContainer?.widthTracksTextView = true
     editor.delegate = context.coordinator
@@ -404,26 +427,43 @@ struct DraftEditor: NSViewRepresentable {
       editor.history.removeAllActions()
       editor.string = text
     }
+    let focus = context.coordinator.focusRequest != focusRequest
+    context.coordinator.focusRequest = focusRequest
     DispatchQueue.main.async {
-      let size = measuredSize(scroll, width: max(scroll.contentSize.width, 1))
-      if height != size.height { height = size.height }
+      let visible = measuredHeight(scroll, width: max(scroll.contentSize.width, 1))
+      if height != visible { height = visible }
+      if focus { focusAtEnd(editor) }
     }
   }
 
-  private func measuredSize(_ scroll: NSScrollView, width: CGFloat) -> CGSize {
+  private func measuredHeight(_ scroll: NSScrollView, width: CGFloat) -> CGFloat {
     guard let editor = scroll.documentView as? NSTextView,
-      let container = editor.textContainer, let layout = editor.layoutManager else { return CGSize(width: width, height: 22) }
+      let container = editor.textContainer, let layout = editor.layoutManager else { return DraftHeight.minimum }
     container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
     layout.ensureLayout(for: container)
     let line = layout.defaultLineHeight(for: editor.font ?? .systemFont(ofSize: 13))
-    let height = max(line, layout.usedRect(for: container).height + (editor.string.hasSuffix("\n") ? line : 0)) + 6
-    editor.setFrameSize(NSSize(width: width, height: height))
-    return CGSize(width: width, height: min(height, line * 6 + 6))
+    let size = DraftHeight(used: layout.usedRect(for: container).height, line: line, trailingNewline: editor.string.hasSuffix("\n"))
+    editor.setFrameSize(NSSize(width: width, height: size.document))
+    return size.visible
+  }
+
+  private func focusAtEnd(_ editor: NSTextView) {
+    guard let window = editor.window else { return }
+    // The panel takes focus only for a view that asks for it, as the editor does and the box doesn't.
+    window.makeKey()
+    guard window.makeFirstResponder(editor) else { return }
+    let end = NSRange(location: (editor.string as NSString).length, length: 0)
+    editor.setSelectedRange(end)
+    editor.scrollRangeToVisible(end)
   }
 
   class Coordinator: NSObject, NSTextViewDelegate {
     var parent: DraftEditor
-    init(_ parent: DraftEditor) { self.parent = parent }
+    var focusRequest: Int
+    init(_ parent: DraftEditor) {
+      self.parent = parent
+      focusRequest = parent.focusRequest
+    }
     func textDidChange(_ notification: Notification) {
       guard let editor = notification.object as? NSTextView else { return }
       parent.text = editor.string
