@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Model } from "@opencode/client/effect";
 import { eq } from "drizzle-orm";
 import { Effect } from "effect";
 import { claimDue, step } from "../src/daemon";
@@ -269,6 +270,31 @@ test("a worker gets one session and task, and its dot hears once per approval an
     expect.stringContaining("There are 3 files."),
   ]);
   expect(db.select().from(workers).get()?.state).toBe("done");
+});
+
+const creating = (id: number) => ({
+  id,
+  dot: "jojo",
+  task: `Task ${id}.`,
+  directory: "/work/jojo",
+  sessionID: `ses_w${id}`,
+  state: "creating" as const,
+  createdAt: 0,
+});
+
+test("a worker's session uses its dot's model, or OpenCode's default when the dot has none", async () => {
+  const sol = Model.Ref.parse("openai/gpt-6.1-sol");
+  fake.state.models.set("ses_jojo", sol);
+  db.insert(workers).values(creating(1)).run();
+  await tick(1);
+  fake.state.models.clear();
+  db.insert(workers).values(creating(2)).run();
+  await tick(2);
+
+  expect(fake.state.created.map(({ id, model }) => ({ id, model }))).toEqual([
+    { id: "ses_w1", model: sol },
+    { id: "ses_w2", model: undefined },
+  ]);
 });
 
 test("a worker in a git repo gets its own worktree, and one that can't get a whole one fails once", async () => {

@@ -2,6 +2,7 @@ import {
   AbsolutePath,
   OpenCode as Client,
   Form,
+  type Model,
   Permission,
   Session,
   SessionMessage,
@@ -103,6 +104,8 @@ export interface SessionInput {
   readonly id: string;
   readonly directory: string;
   readonly title: string;
+  /** Absent, the session uses OpenCode's default model. */
+  readonly model?: Model.Ref | undefined;
 }
 
 export interface MessageRef {
@@ -360,6 +363,10 @@ export class OpenCode extends Context.Service<
     readonly sessionDirectory: (
       sessionID: string,
     ) => Effect.Effect<string | undefined, OpenCodeError>;
+    /** The model the session has chosen, or undefined while it uses OpenCode's default. */
+    readonly sessionModel: (
+      sessionID: string,
+    ) => Effect.Effect<Model.Ref | undefined, OpenCodeError>;
     /**
      * Every turn that ended at or after `since`, in milliseconds, oldest first, read page by page
      * down to that time, however many there are.
@@ -484,11 +491,12 @@ export class OpenCode extends Context.Service<
             Effect.catchTag("SessionNotFoundError", () => Effect.succeed(false)),
             Effect.mapError(failed(`Could not look up session ${sessionID}`)),
           ),
-        createSession: ({ id, directory, title }) =>
+        createSession: ({ id, directory, title, model }) =>
           client.session
             .create({
               id: Session.ID.make(id),
               title,
+              model,
               location: { directory: AbsolutePath.make(directory) },
               permissions: destructive,
             })
@@ -616,6 +624,11 @@ export class OpenCode extends Context.Service<
           client.session.get({ sessionID: Session.ID.make(sessionID) }).pipe(
             Effect.map((session): string | undefined => session.location.directory),
             Effect.catchTag("SessionNotFoundError", () => Effect.succeed(undefined)),
+            Effect.mapError(failed(`Could not look up session ${sessionID}`)),
+          ),
+        sessionModel: (sessionID) =>
+          client.session.get({ sessionID: Session.ID.make(sessionID) }).pipe(
+            Effect.map((session) => session.model),
             Effect.mapError(failed(`Could not look up session ${sessionID}`)),
           ),
         turnsSince: (sessionID, since) =>

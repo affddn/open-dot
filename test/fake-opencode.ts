@@ -1,3 +1,4 @@
+import type { Model } from "@opencode/client/effect";
 import { Cause, Effect, Layer, Queue, Stream } from "effect";
 import {
   type Attachment,
@@ -75,6 +76,8 @@ export function fakeOpenCode() {
     onInterrupt: (_sessionID: string) => {},
     // Supervised sessions: each one's directory, turn ends and what it waits on.
     directories: new Map<string, string>(),
+    // Each session's chosen model; absent, it uses OpenCode's default.
+    models: new Map<string, Model.Ref>(),
     ends: new Map<string, TurnEnd[]>(),
     waiting: new Map<string, FakeWaiting[]>(),
     onWaiting: (_sessionID: string) => {},
@@ -191,6 +194,7 @@ export function fakeOpenCode() {
           ? broken("session lookup failed")
           : Effect.succeed(state.directories.get(sessionID)),
       ),
+    sessionModel: (sessionID) => Effect.sync(() => state.models.get(sessionID)),
     turnsSince: (sessionID, since) =>
       Effect.suspend(() =>
         state.superviseFailure

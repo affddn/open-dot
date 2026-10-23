@@ -520,6 +520,7 @@ const start = (db: Db, worker: Worker, dotSessionID: string) =>
         id: worker.sessionID,
         directory: worker.directory,
         title: `${worker.dot} worker #${worker.id}: ${headline(worker.task)}`,
+        model: yield* opencode.sessionModel(dotSessionID),
       });
     }
     db.transaction((tx) => {
