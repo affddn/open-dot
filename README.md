@@ -188,3 +188,46 @@ To start the app at login, save a second launch agent as `~/Library/LaunchAgents
 Load it the same way. It restarts the app if it crashes, but not after you quit it. After rebuilding, restart it with `launchctl kickstart -k gui/$(id -u)/com.opzero1.open-dot.notch`.
 
 open-dot keeps its data in `~/.opendot`. Set `OPEN_DOT_HOME` to use another directory.
+
+## Back up and restore
+
+Before applying pending migrations, every database opener (plugin, daemon or CLI) makes a
+`VACUUM INTO` snapshot in `~/.opendot/backups/`, checks the copy with `PRAGMA integrity_check`,
+then migrates. A failed backup or integrity check blocks migration and names the backup path.
+Files are named `open-dot-<UTC timestamp>-before-<first pending migration>.db`. Ordinary opens
+with no pending migrations do not back up or acquire the migration lock. Concurrent migrators
+wait for the same SQLite lock, then recheck the ledger; the lock is released even if a process
+crashes. Waiting is bounded to 60 seconds; a timeout fails the open instead of migrating unlocked.
+In-memory test databases have no backups.
+
+Make a backup without running migrations:
+
+```sh
+open-dot backup
+# Or from the checkout: bun src/cli.ts backup
+```
+
+The command prints the verified backup's path. Backups are private files (0600); the ten newest
+generated backups are kept, across automatic, manual and pre-restore copies. Copy a backup
+elsewhere if you want to keep it indefinitely. `OPEN_DOT_HOME` also relocates the backups.
+
+Restore only during a quiet period: stop the daemon and pause other open-dot activity, including
+tools in existing OpenCode dot sessions. Do not reload OpenCode to do this. Restore changes only
+open-dot's database, not OpenCode history, Keychain items or worktrees. It refuses while a daemon
+holds the database's daemon lock, including during startup. On macOS, unload the launch agent
+rather than just killing its process, since KeepAlive would restart it:
+
+```sh
+launchctl bootout gui/$(id -u)/com.opzero1.open-dot.daemon
+open-dot restore /path/to/backup.db
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.opzero1.open-dot.daemon.plist
+```
+
+For a foreground daemon, stop it with Control-C instead. Restore requires `sqlite3` on `PATH`
+(included with macOS). It checks the source, stages a verified SQLite snapshot, backs up the
+current database, then uses SQLite's backup API to restore **in place**. It never renames the
+database or removes its WAL under existing plugin connections. Busy SQLite transactions may
+block restore; a failure is reported, never retried automatically. A successful restore prints
+the pre-restore backup path. It does not migrate the restored file: the next normal open backs
+up and applies any pending migrations. The `.migration-lock` and `.daemon-lock` files beside
+the database are persistent SQLite lock files, not PID files; do not delete them.

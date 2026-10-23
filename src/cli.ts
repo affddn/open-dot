@@ -4,7 +4,7 @@ import { renameSync, rmSync, writeFileSync } from "node:fs";
 import { Effect, Schedule } from "effect";
 import { api } from "./api";
 import { claimDue, hasWork, step } from "./daemon";
-import { openDatabase } from "./db";
+import { backupDatabase, claimDaemon, openDatabase, restoreDatabase } from "./db";
 import { createDot, ensureSession, findDot, listDots, pickDot } from "./dots";
 import { collect, github, linear } from "./feed";
 import { apiPath, databasePath } from "./home";
@@ -30,6 +30,8 @@ const usage = `Usage:
   open-dot list                      List dots
   open-dot open [name]               Open a dot in OpenCode
   open-dot daemon                    Deliver reminders and run workers until stopped
+  open-dot backup                    Back up the database without migrating it
+  open-dot restore <file>            Restore a backup while the daemon is stopped
   open-dot slack config              Save your Slack app configuration tokens, typed without echo
   open-dot slack connect <name> [--retry]
                                      Ask the daemon to create the dot's own Slack app
@@ -40,6 +42,23 @@ const usage = `Usage:
                                      Turn on or off the shared app's one note to others who DM it`;
 
 const [command, ...args] = process.argv.slice(2);
+if (command === "backup" || command === "restore") {
+  try {
+    if (command === "backup" && args.length === 0) console.log(backupDatabase(databasePath()));
+    else if (command === "restore" && args.length === 1 && args[0]) {
+      const backup = restoreDatabase(databasePath(), args[0]);
+      console.log(`Restored ${args[0]}. Previous database backed up at ${backup}`);
+    } else throw new Error(usage);
+    process.exit(0);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
+}
+if (command === "daemon") {
+  const release = claimDaemon(databasePath());
+  process.on("exit", release);
+}
 const db = openDatabase(databasePath());
 
 const create = (name: string, purpose: string) =>
