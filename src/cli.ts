@@ -10,6 +10,7 @@ import { backupDatabase, claimDaemon, openDatabase, restoreDatabase } from "./db
 import { createDot, ensureSession, findDot, listDots, pickDot } from "./dots";
 import { collect, github, linear } from "./feed";
 import { apiPath, databasePath } from "./home";
+import { instructionsPath } from "./instructions";
 import { OpenCode } from "./opencode";
 import { slackApps, type Supervision, supervisions } from "./schema";
 import { sharedNotices, slackChat, slackClient, slackFeed } from "./slack";
@@ -45,6 +46,7 @@ const usage = `Usage:
   open-dot list                      List dots
   open-dot open [name]               Open a dot in OpenCode
   open-dot avatar <name> <file>      Set a dot's avatar from a square PNG or JPEG
+  open-dot instructions <name>       Print the path of a dot's AGENTS.md, to edit it in an editor
   open-dot daemon                    Deliver reminders and run workers until stopped
   open-dot backup                    Back up the database without migrating it
   open-dot restore <file>            Restore a backup while the daemon is stopped
@@ -336,6 +338,14 @@ const avatar = (name: string, file: string) =>
     );
   });
 
+/** Only the path, so `$EDITOR "$(open-dot instructions jojo)"` works. */
+const instructions = (name: string) =>
+  Effect.suspend(() =>
+    findDot(db, name)
+      ? Effect.sync(() => console.log(instructionsPath(name)))
+      : fail(`No dot named "${name}".`),
+  );
+
 const list = Effect.sync(() => {
   const all = listDots(db);
   if (all.length === 0) return console.log("No dots yet. Run: open-dot create <name>");
@@ -431,7 +441,9 @@ const program =
               ? slackCommand(args[0], args[1], args.slice(2))
               : command === "watch"
                 ? watchCommand(args[0], args.slice(1))
-                : Effect.sync(() => console.log(usage));
+                : command === "instructions" && args.length === 1 && args[0]
+                  ? instructions(args[0])
+                  : Effect.sync(() => console.log(usage));
 
 await Effect.runPromise(
   program.pipe(

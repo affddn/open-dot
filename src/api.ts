@@ -9,6 +9,15 @@ import type { Db } from "./db";
 import { findDot, listDots } from "./dots";
 import { dismiss, dismissAll, handedOffFeed, unreadFeed } from "./feed";
 import {
+  type InstructionsOutcome,
+  instructionsLimit,
+  isInstructionsText,
+  isRevision,
+  readInstructions,
+  revertInstructions,
+  saveInstructions,
+} from "./instructions";
+import {
   addNote,
   cancelReminder,
   deleteNote,
@@ -250,6 +259,69 @@ const avatarRoute = (db: Db, request: Request, path: string[]) => {
       "cache-control": "no-store",
     },
   });
+};
+
+// Every character of the text may arrive JSON-escaped as six bytes, such as \u0001.
+const instructionsBodyLimit = instructionsLimit * 6 + 1024;
+
+const instructionsAnswer = (outcome: InstructionsOutcome) => {
+  if ("saved" in outcome) return Response.json(outcome.saved);
+  if ("conflict" in outcome)
+    return Response.json(
+      {
+        error:
+          "AGENTS.md changed since you loaded it, so nothing was saved. This is its current text.",
+        current: outcome.conflict,
+      },
+      { status: 409 },
+    );
+  return error(outcome.status, outcome.error);
+};
+
+/**
+ * `GET` and `PUT /dots/<name>/instructions` and `POST /dots/<name>/instructions/revert`: exactly
+ * `dots/<name>/AGENTS.md` of a known dot, never the directory the database names. Each change
+ * needs the revision the owner saw. Nothing here starts a turn or needs OpenCode.
+ */
+const instructionsRoute = async (db: Db, request: Request, path: string[]) => {
+  const [, rawName = "", , action, ...extra] = path;
+  const name = (() => {
+    try {
+      return decodeURIComponent(rawName);
+    } catch {
+      return undefined;
+    }
+  })();
+  const dot = name === undefined ? undefined : findDot(db, name);
+  if (!dot) return error(404, "There's no such dot.");
+  if (extra.length) return error(404, "Not found");
+  if (new URL(request.url).search) return error(400, "This route takes no query.");
+  const { method } = request;
+  const revert = action === "revert" && method === "POST";
+  if (action === undefined && method === "GET") {
+    const read = readInstructions(dot.name);
+    return "status" in read ? error(read.status, read.error) : Response.json(read);
+  }
+  if (!revert && !(action === undefined && method === "PUT")) return error(404, "Not found");
+  const body = await messageBody(request, instructionsBodyLimit).catch(() => undefined);
+  if (body instanceof Response) return body;
+  if (typeof body !== "object" || body === null || Array.isArray(body))
+    return error(400, revert ? "Send {revision}." : "Send {content, revision}.");
+  const keys = Object.keys(body).toSorted().join(",");
+  const revision = "revision" in body ? body.revision : undefined;
+  if (revert) {
+    if (keys !== "revision" || !isRevision(revision))
+      return error(400, "Send {revision}, the revision you loaded.");
+    return instructionsAnswer(revertInstructions(dot.name, revision));
+  }
+  const content = "content" in body ? body.content : undefined;
+  if (keys !== "content,revision" || !isRevision(revision) || typeof content !== "string")
+    return error(400, "Send {content, revision}, with the revision you loaded.");
+  if (Buffer.byteLength(content, "utf8") > instructionsLimit)
+    return error(413, "Instructions must be at most 64 KiB of UTF-8 text.");
+  if (!isInstructionsText(content))
+    return error(400, "Instructions must be well-formed text without NUL characters.");
+  return instructionsAnswer(saveInstructions(dot.name, content, revision));
 };
 
 /** True once the dot's binding no longer matches the one a request began with. */
@@ -1250,11 +1322,17 @@ export const api =
       return Promise.resolve(requestAudit(db, request, path));
     if (path[0] === "dots" && path[2] === "avatar")
       return Promise.resolve(avatarRoute(db, request, path));
+    if (path[0] === "dots" && path[2] === "instructions")
+      return instructionsRoute(db, request, path).catch((cause) => {
+        console.error(`Instructions: ${cause instanceof Error ? cause.message : String(cause)}`);
+        return error(500, "Couldn't read or save the dot's instructions. Nothing was changed.");
+      });
     if (path[0] === "dots" && path[2] === "memory")
       return memoryRoute(db, request, path).catch((cause) => {
         console.error(`Memory: ${cause instanceof Error ? cause.message : String(cause)}`);
         return error(500, "Couldn't read or save the dot's memory.");
       });
+    if (path[0] !== "dots") return Promise.resolve(error(404, "Not found"));
     return Effect.runPromise(
       route(db, request, path, token).pipe(
         Effect.provide(layer),

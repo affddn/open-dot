@@ -95,7 +95,10 @@ struct ExpandedView: View {
         } else if let status = store.status {
           centered(status)
         } else if let name = store.selected, let dot = store.dots.first(where: { $0.name == name }) {
-          if store.showingMemory {
+          if store.showingInstructions {
+            InstructionsView(store: store, name: name)
+              .id("instructions-\(name)")
+          } else if store.showingMemory {
             MemoryView(store: store, name: name)
               .id("memory-\(name)")
           } else {
@@ -171,11 +174,15 @@ struct ExpandedView: View {
     .scrollIndicators(.hidden)
   }
 
-  /// The selected dot's chat, or its notes, responsibilities and reminders.
+  /// The selected dot's chat, its notes, responsibilities and reminders, or its AGENTS.md.
   private var modes: some View {
-    Picker("View", selection: Binding { store.showingMemory } set: { store.showMemory($0) }) {
-      Text("Chat").tag(false)
-      Text("Memory").tag(true)
+    let unsaved = store.selected.map { store.instructions[$0]?.dirty == true } ?? false
+    return Picker("View", selection: Binding { store.pane } set: { store.show($0) }) {
+      Text("Chat").tag(Store.Pane.chat)
+      Text("Memory").tag(Store.Pane.memory)
+      Text(unsaved ? "Instructions •" : "Instructions")
+        .accessibilityLabel(unsaved ? "Instructions, unsaved changes" : "Instructions")
+        .tag(Store.Pane.instructions)
     }
     .pickerStyle(.segmented)
     .labelsHidden()

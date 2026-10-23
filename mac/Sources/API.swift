@@ -430,6 +430,42 @@ enum MemoryOutcome: Equatable {
   case gone(String)
 }
 
+/// A dot's AGENTS.md as the daemon read or saved it. `revision`, the SHA-256 of its bytes, goes
+/// with every change, so a file changed since is never overwritten unseen.
+struct Instructions: Decodable, Equatable {
+  let content: String
+  let revision: String
+  let canRevert: Bool
+}
+
+/// How the daemon answered a save or revert: the file as it now is, or, on a conflict, nothing
+/// changed and this is the file as it is on disk.
+enum InstructionsOutcome: Equatable {
+  case saved(Instructions)
+  case conflict(Instructions, String)
+}
+
+/// Reads a save's or revert's answer. A 200 that can't be read leaves the outcome unknown; any
+/// other refusal throws its message, since nothing was changed.
+func instructionsOutcome(status: Int, data: Data) throws -> InstructionsOutcome {
+  struct Conflict: Decodable { let error: String?; let current: Instructions }
+  struct Failure: Decodable { let error: String }
+  let decoder = JSONDecoder()
+  switch status {
+  case 200:
+    guard let saved = try? decoder.decode(Instructions.self, from: data) else { throw APIError.lost }
+    return .saved(saved)
+  case 409:
+    guard let body = try? decoder.decode(Conflict.self, from: data) else {
+      throw APIError.server("Unexpected response from the open-dot daemon")
+    }
+    return .conflict(body.current, body.error ?? "AGENTS.md changed since you loaded it, so nothing was saved.")
+  default:
+    let message = (try? decoder.decode(Failure.self, from: data))?.error ?? HTTPURLResponse.localizedString(forStatusCode: status)
+    throw APIError.server(message)
+  }
+}
+
 enum APIError: Error {
   case unreachable
   case lost
@@ -540,6 +576,25 @@ enum APIError: Error {
 
   func memory(_ dot: String) async throws -> Memory {
     try decode(Memory.self, await send("GET", "/dots/\(escape(dot))/memory"))
+  }
+
+  /// The dot's AGENTS.md, which the daemon reads only from that dot's own directory.
+  func instructions(_ dot: String) async throws -> Instructions {
+    try decode(Instructions.self, await send("GET", "/dots/\(escape(dot))/instructions"))
+  }
+
+  /// Replaces the dot's AGENTS.md if it's still at `revision`. Never retried on its own.
+  func saveInstructions(_ dot: String, content: String, revision: String) async throws -> InstructionsOutcome {
+    let body = try JSONSerialization.data(withJSONObject: ["content": content, "revision": revision])
+    let (status, data) = try await exchange("PUT", "/dots/\(escape(dot))/instructions", body: body)
+    return try instructionsOutcome(status: status, data: data)
+  }
+
+  /// Puts back the previous version if AGENTS.md is still at `revision`. Never retried on its own.
+  func revertInstructions(_ dot: String, revision: String) async throws -> InstructionsOutcome {
+    let body = try JSONSerialization.data(withJSONObject: ["revision": revision])
+    let (status, data) = try await exchange("POST", "/dots/\(escape(dot))/instructions/revert", body: body)
+    return try instructionsOutcome(status: status, data: data)
   }
 
   /// Opens a worker's session in a new terminal window, or copies its command. Never retried on its own.

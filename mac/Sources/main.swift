@@ -126,6 +126,18 @@ struct Notch {
     }
   }
 
+  /// Quitting is the one way an unsaved instructions draft would be lost, so it asks first.
+  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    let unsaved = store.unsavedInstructions
+    guard !unsaved.isEmpty else { return .terminateNow }
+    let alert = NSAlert()
+    alert.messageText = "Quit with unsaved instructions?"
+    alert.informativeText = "Your changes to \(unsaved.joined(separator: ", "))'s instructions aren't saved and are lost if you quit."
+    alert.addButton(withTitle: "Keep Editing")
+    alert.addButton(withTitle: "Quit").hasDestructiveAction = true
+    return runAlert(alert, store) == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
+  }
+
   private func screenChanged() {
     guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main, let hover = panel.contentView else { return }
     let notch = Notch(screen)

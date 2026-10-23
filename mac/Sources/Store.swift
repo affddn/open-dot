@@ -282,9 +282,12 @@ struct MessageWindow: Equatable {
   }
   var feedStatus: String?
   var showingFeed = false
-  /// The selected dot's Memory tab is open instead of its chat.
+  /// The selected dot's Memory or Instructions tab is open instead of its chat. At most one is.
   var showingMemory = false
+  var showingInstructions = false
   var memories: [String: MemoryState] = [:]
+  /// Each dot's AGENTS.md editor, kept while the notch folds or another dot or view is shown.
+  var instructions: [String: InstructionsState] = [:]
   var thumbnails: [AttachmentKey: NSImage] = [:]
   var unavailable: Set<AttachmentKey> = []
   /// Workers being opened or stopped, and what the last attempt for each said.
@@ -337,7 +340,7 @@ struct MessageWindow: Equatable {
 
   func unread(_ name: String) -> Bool { (newest[name] ?? 0) > (seen[name] ?? .infinity) }
 
-  private func visible(_ name: String) -> Bool { expanded && !showingFeed && !showingMemory && selected == name }
+  private func visible(_ name: String) -> Bool { expanded && !showingFeed && pane == .chat && selected == name }
 
   func start() {
     Task {
@@ -369,21 +372,79 @@ struct MessageWindow: Equatable {
     Task { await refreshFeed() }
     if let name = selected { Task { await refreshMessages(name) } }
     if let name = selected, showingMemory { Task { await refreshMemory(name) } }
+    if let name = selected, showingInstructions { loadInstructions(name, discarding: false) }
   }
 
   func select(_ name: String) {
     showingFeed = false
     selected = name
-    if !showingMemory { seen[name] = newest[name] }
+    if pane == .chat { seen[name] = newest[name] }
     Task { await refreshMessages(name) }
     if showingMemory { Task { await refreshMemory(name) } }
+    if showingInstructions { loadInstructions(name, discarding: false) }
   }
 
-  /// Switches the selected dot between its chat and its Memory tab.
-  func showMemory(_ show: Bool) {
-    showingMemory = show
+  enum Pane: Hashable { case chat, memory, instructions }
+
+  var pane: Pane { showingInstructions ? .instructions : showingMemory ? .memory : .chat }
+
+  /// Switches the selected dot between its chat, its Memory tab and its Instructions tab. An
+  /// unsaved instructions draft stays for when the tab is shown again.
+  func show(_ pane: Pane) {
+    showingMemory = pane == .memory
+    showingInstructions = pane == .instructions
     guard let name = selected else { return }
-    if show { Task { await refreshMemory(name) } } else { seen[name] = newest[name] }
+    switch pane {
+    case .chat: seen[name] = newest[name]
+    case .memory: Task { await refreshMemory(name) }
+    case .instructions: loadInstructions(name, discarding: false)
+    }
+  }
+
+  /// The dots whose instructions have unsaved edits.
+  var unsavedInstructions: [String] { instructions.filter { $0.value.dirty }.map(\.key).sorted() }
+
+  /// Reads the dot's AGENTS.md into its editor: when shown with no edits, or, `discarding` them,
+  /// once the owner chose Reload. A failure keeps what's shown.
+  func loadInstructions(_ name: String, discarding: Bool) {
+    guard instructions[name, default: InstructionsState()].beginRead(discarding: discarding) else { return }
+    Task {
+      do {
+        let read = try await api.instructions(name)
+        instructions[name, default: InstructionsState()].finishRead(.success(read))
+      } catch {
+        instructions[name, default: InstructionsState()].finishRead(.failure(MemoryInvalid("Couldn't read AGENTS.md. \(Self.describe(error))")))
+      }
+    }
+  }
+
+  /// Saves the draft at the revision it started from, or, for Overwrite, at the revision the
+  /// conflict reported. Never retried on its own.
+  func saveInstructions(_ name: String, overwrite: Bool) {
+    guard let request = instructions[name]?.beginSave(overwrite: overwrite) else { return }
+    Task {
+      do {
+        let outcome = try await api.saveInstructions(name, content: request.content, revision: request.revision)
+        instructions[name, default: InstructionsState()].finish(.outcome(outcome))
+      } catch {
+        let message = Self.describeMemory(error, "Not saved", unknown: "It may have been saved. Save again to check: the daemon refuses it if the first one landed. Or Reload.")
+        instructions[name, default: InstructionsState()].finish(.failed(message))
+      }
+    }
+  }
+
+  /// Puts back the previous version, once the owner confirmed it. Never retried on its own.
+  func revertInstructions(_ name: String) {
+    guard let revision = instructions[name]?.beginRevert() else { return }
+    Task {
+      do {
+        let outcome = try await api.revertInstructions(name, revision: revision)
+        instructions[name, default: InstructionsState()].finish(.outcome(outcome))
+      } catch {
+        let message = Self.describeMemory(error, "Not reverted", unknown: "It may have been reverted. Reload to see the file.")
+        instructions[name, default: InstructionsState()].finish(.failed(message))
+      }
+    }
   }
 
   func send(_ name: String) {
@@ -594,6 +655,7 @@ struct MessageWindow: Equatable {
       }
     }
     showingMemory = false
+    showingInstructions = false
     select(first)
   }
 
