@@ -144,13 +144,120 @@ struct AvatarState {
   }
 }
 
+struct MessageRecheck: Equatable {
+  enum Desired: Equatable {
+    case reaction(String?)
+    case hidden
+  }
+
+  let session: String
+  let desired: Desired
+  var order: Int
+
+  func matches(_ message: Message) -> Bool {
+    guard message.sessionID == session else { return false }
+    switch desired {
+    case .reaction(let emoji): return message.reactions?.first(where: { $0.actor == "owner" })?.emoji == emoji
+    case .hidden: return message.hidden == true
+    }
+  }
+}
+
+struct MessageWindow: Equatable {
+  private(set) var items: [Message] = []
+  private(set) var sessionID: String?
+  private(set) var next: String?
+  private var followingLatest = true
+  var atBottom: Bool {
+    get { followingLatest }
+    set { followingLatest = newValue && !hasNewer }
+  }
+  private var latest: [Message] = []
+  private var latestNext: String?
+
+  var retainedIDs: Set<String> { Set((items + latest).map(\.id)) }
+  var hasNewer: Bool { items.last?.id != latest.last?.id }
+
+  mutating func mergeLatest(_ page: MessagePage) {
+    if sessionID != page.sessionID {
+      self = MessageWindow()
+      sessionID = page.sessionID
+    }
+    latest = page.messages
+    latestNext = page.next
+    let ids = Set(items.map(\.id))
+    let updates = Dictionary(page.messages.map { ($0.id, $0) }) { _, last in last }
+    if items.isEmpty || (atBottom && !page.messages.contains { ids.contains($0.id) }) {
+      items = page.messages
+      next = page.next
+    } else {
+      items = items.map { updates[$0.id] ?? $0 }
+      if let overlap = page.messages.lastIndex(where: { ids.contains($0.id) }) {
+        items.append(contentsOf: page.messages.suffix(from: overlap + 1).filter { !ids.contains($0.id) })
+      }
+    }
+    trim()
+  }
+
+  mutating func prepend(_ page: MessagePage) {
+    guard page.sessionID == sessionID else { return }
+    let ids = Set(items.map(\.id))
+    for message in page.messages { reconcile(message) }
+    items = page.messages.filter { !ids.contains($0.id) } + items
+    next = page.next
+    trim()
+  }
+
+  mutating func showLatest() {
+    items = latest
+    next = latestNext
+    atBottom = true
+  }
+
+  mutating func edit(_ id: String, _ change: (inout Message) -> Void) {
+    if let index = items.firstIndex(where: { $0.id == id }) { change(&items[index]) }
+    if let index = latest.firstIndex(where: { $0.id == id }) { change(&latest[index]) }
+  }
+
+  mutating func reconcile(_ message: Message) {
+    guard message.sessionID == sessionID else { return }
+    edit(message.id) { $0 = message }
+  }
+
+  func delivered(_ id: String, sentAt: Double, statuses: [String: String]) -> Bool {
+    retainedIDs.contains(id) || ((latest.first?.time ?? 0) > sentAt && statuses[id] == nil)
+  }
+
+  private mutating func trim() {
+    if atBottom {
+      if items.count > 100 {
+        items = Array(items.suffix(100))
+        next = latestNext
+      }
+    } else {
+      let latestIDs = Set(latest.map(\.id))
+      var count = latestIDs.count
+      items = items.prefix { item in
+        if !latestIDs.contains(item.id) { count += 1 }
+        return count <= 100
+      }.map { $0 }
+    }
+  }
+}
+
 @MainActor @Observable final class Store {
   var dots: [Dot] = []
   var avatars = AvatarState()
   var status: String?
   var loaded = false
   var selected: String?
-  var messages: [String: [Message]] = [:]
+  var conversations: [String: MessageWindow] = [:]
+  var loadingOlder: Set<String> = []
+  var historyErrors: [String: String] = [:]
+  private var historyEpoch: [String: Int] = [:]
+  @ObservationIgnored private var messageRechecks: [MessageKey: MessageRecheck] = [:]
+  @ObservationIgnored private var recheckOrder = 0
+  @ObservationIgnored private var reconciling: Set<MessageKey> = []
   var pending: [String: [Pending]] = [:]
   /// Per dot, where each accepted send stands until it's in the conversation: sending, confirming or sent.
   var sendStatus: [String: [String: String]] = [:]
@@ -505,11 +612,23 @@ struct AvatarState {
     pending[name]?.removeAll { $0.id == id }
   }
 
+  func messageMutationPending(_ key: MessageKey) -> Bool {
+    if reacting.contains(key) || hiding.contains(key) { return true }
+    guard let recheck = messageRechecks[key] else { return false }
+    return recheck.session == conversations[key.dot]?.sessionID
+  }
+
   func react(_ key: MessageKey, emoji: String) {
-    guard let message = messages[key.dot]?.first(where: { $0.id == key.message }),
+    guard !messageMutationPending(key),
+      let message = conversations[key.dot]?.items.first(where: { $0.id == key.message }),
       message.kind == "dot", reacting.insert(key).inserted else { return }
     let selected = message.reactions?.first(where: { $0.actor == "owner" })?.emoji
     let next = selected == emoji ? nil : emoji
+    if let session = message.sessionID {
+      recheckOrder += 1
+      messageRechecks[key] = MessageRecheck(session: session, desired: .reaction(next), order: recheckOrder)
+    }
+    let recheck = messageRechecks[key]
     writeEpoch[key.dot, default: 0] += 1
     recentWrites += 1
     if reacting.count > 1 { recentContended = true }
@@ -519,6 +638,7 @@ struct AvatarState {
         reacting.remove(key)
         writeEpoch[key.dot, default: 0] += 1
         recentWrites += 1
+        Task { await refreshMessage(key) }
         if reacting.isEmpty && recentContended {
           recentContended = false
           Task { await refreshMessages(key.dot) }
@@ -527,19 +647,25 @@ struct AvatarState {
       do {
         let (confirmed, recent) = try await api.react(key, emoji: next)
         guard confirmed.dot == key.dot, confirmed.messageID == key.message,
-          confirmed.actor == "owner", confirmed.emoji == next else {
+          confirmed.actor == "owner", confirmed.emoji == next, confirmed.sessionID == message.sessionID else {
           reactionErrors[key] = "Reaction outcome unknown: unexpected response. Refreshing saved state."
           return
         }
+        if messageRechecks[key] == recheck { messageRechecks[key] = nil }
         // Only a reaction that overlapped no other knows the latest order.
         if let recent, !recentContended, recent != recentEmojis { recentEmojis = recent }
-        if let index = messages[key.dot]?.firstIndex(where: { $0.id == key.message }) {
-          var saved = messages[key.dot]![index].reactions ?? []
-          saved.removeAll { $0.actor == "owner" }
-          saved.append(confirmed)
-          messages[key.dot]![index].reactions = saved
+        if conversations[key.dot]?.sessionID == confirmed.sessionID {
+          conversations[key.dot]?.edit(key.message) { message in
+            var saved = message.reactions ?? []
+            saved.removeAll { $0.actor == "owner" }
+            saved.append(confirmed)
+            message.reactions = saved
+          }
         }
       } catch {
+        if let failure = error as? APIError, case .server = failure, messageRechecks[key] == recheck {
+          messageRechecks[key] = nil
+        }
         if let failure = error as? APIError, case .lost = failure {
           reactionErrors[key] = "Reaction outcome unknown: no response. It may have been saved. No automatic retry."
         } else {
@@ -560,7 +686,7 @@ struct AvatarState {
 
   /// The message as shown now, only while it's still the one in the session a menu was opened for.
   func current(_ key: MessageKey, session: String?) -> Message? {
-    messages[key.dot]?.first { $0.id == key.message && $0.sessionID == session && $0.hidden != true }
+    conversations[key.dot]?.items.first { $0.id == key.message && $0.sessionID == session && $0.hidden != true }
   }
 
   /// A delayed action's message, or nil, saying so, once it's gone or the dot's session changed.
@@ -680,7 +806,11 @@ struct AvatarState {
 
   /// Hides the message in the notch only. OpenCode history and the dot's memory keep it.
   func hide(_ key: MessageKey, session: String) {
-    guard stillShown(key, session: session) != nil, hiding.insert(key).inserted else { return }
+    guard !messageMutationPending(key), stillShown(key, session: session) != nil,
+      hiding.insert(key).inserted else { return }
+    recheckOrder += 1
+    let recheck = MessageRecheck(session: session, desired: .hidden, order: recheckOrder)
+    messageRechecks[key] = recheck
     writeEpoch[key.dot, default: 0] += 1
     actionErrors[key] = nil
     chatActionErrors[key.dot] = nil
@@ -688,18 +818,24 @@ struct AvatarState {
       defer {
         hiding.remove(key)
         writeEpoch[key.dot, default: 0] += 1
+        Task { await refreshMessage(key) }
       }
       do {
         let marker = try await api.hide(key, session: session)
         guard marker.dot == key.dot, marker.sessionID == session, marker.messageID == key.message else {
           return fail(key, "Delete outcome unknown: unexpected response. The next refresh shows the saved state.")
         }
-        if let index = messages[key.dot]?.firstIndex(where: { $0.id == key.message && $0.sessionID == session }) {
-          messages[key.dot]![index].hidden = true
+        if messageRechecks[key] == recheck { messageRechecks[key] = nil }
+        if conversations[key.dot]?.sessionID == session {
+          conversations[key.dot]?.edit(key.message) { $0.hidden = true }
+          pruneThumbnails(key.dot)
         }
         // Queued replies keep their own quote; only the unsent selection goes.
         if replyTargets[key.dot]?.id == key.message { replyTargets[key.dot] = nil }
       } catch {
+        if let failure = error as? APIError, case .server = failure, messageRechecks[key] == recheck {
+          messageRechecks[key] = nil
+        }
         if let failure = error as? APIError, case .lost = failure {
           fail(key, "Delete outcome unknown: no response. It may be hidden after the next refresh. No automatic retry.")
         } else {
@@ -714,7 +850,7 @@ struct AvatarState {
   /// Shows a failure under its message while that message is shown, otherwise above the dot's
   /// message box, so it's never only spoken, and reads it aloud.
   func report(_ text: String, dot: String, key: MessageKey?) {
-    if let key, messages[dot]?.contains(where: { $0.id == key.message && $0.hidden != true }) == true {
+    if let key, conversations[dot]?.items.contains(where: { $0.id == key.message && $0.hidden != true }) == true {
       actionErrors[key] = text
     } else {
       chatActionErrors[dot] = text
@@ -946,9 +1082,13 @@ struct AvatarState {
   /// Loads an image attachment's thumbnail once, when its message is shown.
   func loadThumbnail(_ key: AttachmentKey) {
     guard thumbnails[key] == nil, !unavailable.contains(key), loading.insert(key).inserted else { return }
+    let session = conversations[key.dot]?.sessionID
     Task {
       defer { loading.remove(key) }
-      if let data = try? await api.attachment(key), let image = Self.decode(data, maxPixels: 240) {
+      let data = try? await api.attachment(key, session: session)
+      guard conversations[key.dot]?.sessionID == session,
+        conversations[key.dot]?.items.contains(where: { $0.id == key.message && $0.hidden != true }) == true else { return }
+      if let data, let image = Self.decode(data, maxPixels: 240) {
         thumbnails[key] = image
       } else {
         unavailable.insert(key)
@@ -1056,30 +1196,98 @@ struct AvatarState {
     messageReads[name, default: 0] += 1
     let read = messageReads[name]
     guard let result = try? await api.messages(name) else { return }
-    let (list, statuses, recent) = result
+    let list = result.messages
+    let statuses = result.statuses
+    let recent = result.recentEmojis
     // Discard polls begun before/during a write, and older overlapping reads.
     guard epoch == writeEpoch[name, default: 0], read == messageReads[name],
       !reacting.contains(where: { $0.dot == name }), !hiding.contains(where: { $0.dot == name }) else { return }
-    messages[name] = list
-    sendStatus[name] = statuses
+    var window = conversations[name] ?? MessageWindow()
+    if window.sessionID != result.sessionID { pruneThumbnails(name, reset: true) }
+    window.mergeLatest(result)
+    if window != conversations[name] { conversations[name] = window }
+    if sendStatus[name] != statuses { sendStatus[name] = statuses }
     // Recent emoji are the owner's across dots, so a reaction to any dot's message makes this read stale.
     if let recent, recentEpoch == recentWrites, reacting.isEmpty, recent != recentEmojis { recentEmojis = recent }
-    // Hidden messages still count here, so a pending send matches its delivered ID.
-    let ids = Set(list.map(\.id))
-    let shown = Set(list.filter { $0.hidden != true }.map(\.id))
-    // Forget images of messages that have scrolled out or were hidden, but write only when something goes.
-    let gone = { (key: AttachmentKey) in key.dot == name && !shown.contains(key.message) }
+    pruneThumbnails(name)
+    matchPending(name, window: window, statuses: statuses)
+    let latest = list.filter { $0.kind != "owner" && $0.hidden != true }.map(\.time).max() ?? 0
+    if newest[name] != latest { newest[name] = latest }
+    if (seen[name] == nil || visible(name)) && seen[name] != latest { seen[name] = latest }
+    for (key, _) in messageRechecks.filter({ $0.key.dot == name }).sorted(by: { $0.value.order < $1.value.order }).prefix(4) {
+      await refreshMessage(key)
+    }
+  }
+
+  private func refreshMessage(_ key: MessageKey) async {
+    guard var recheck = messageRechecks[key] else { return }
+    let session = recheck.session
+    guard conversations[key.dot]?.sessionID == session,
+      conversations[key.dot]?.retainedIDs.contains(key.message) == true else {
+      messageRechecks[key] = nil
+      return
+    }
+    guard !reacting.contains(key), !hiding.contains(key), reconciling.insert(key).inserted else { return }
+    recheckOrder += 1
+    recheck.order = recheckOrder
+    messageRechecks[key] = recheck
+    let epoch = writeEpoch[key.dot, default: 0]
+    defer { reconciling.remove(key) }
+    guard let message = try? await api.message(key, session: session),
+      message.id == key.message, message.sessionID == session,
+      epoch == writeEpoch[key.dot, default: 0], messageRechecks[key] == recheck,
+      var window = conversations[key.dot], window.sessionID == session else { return }
+    window.reconcile(message)
+    writeEpoch[key.dot, default: 0] += 1
+    if window != conversations[key.dot] { conversations[key.dot] = window }
+    if recheck.matches(message) { messageRechecks[key] = nil }
+    if message.hidden == true, replyTargets[key.dot]?.id == key.message { replyTargets[key.dot] = nil }
+    pruneThumbnails(key.dot)
+  }
+
+  func showLatest(_ name: String) {
+    historyEpoch[name, default: 0] += 1
+    conversations[name]?.showLatest()
+    historyErrors[name] = nil
+    pruneThumbnails(name)
+    Task { await refreshMessages(name) }
+  }
+
+  func loadOlder(_ name: String) async {
+    guard let window = conversations[name], let cursor = window.next,
+      loadingOlder.insert(name).inserted else { return }
+    let epoch = writeEpoch[name, default: 0]
+    let history = historyEpoch[name, default: 0]
+    historyErrors[name] = nil
+    defer { loadingOlder.remove(name) }
+    do {
+      let page = try await api.messages(name, before: cursor)
+      guard var current = conversations[name], current.sessionID == window.sessionID,
+        current.next == cursor, history == historyEpoch[name, default: 0], epoch == writeEpoch[name, default: 0],
+        !reacting.contains(where: { $0.dot == name }), !hiding.contains(where: { $0.dot == name }) else { return }
+      current.prepend(page)
+      if current != conversations[name] { conversations[name] = current }
+      let statuses = sendStatus[name] ?? [:]
+      matchPending(name, window: current, statuses: statuses)
+      pruneThumbnails(name)
+    } catch {
+      guard conversations[name]?.sessionID == window.sessionID, conversations[name]?.next == cursor else { return }
+      historyErrors[name] = Self.describe(error)
+    }
+  }
+
+  private func matchPending(_ name: String, window: MessageWindow, statuses: [String: String]) {
+    let delivered = { (item: Pending) in
+      item.messageID.map { window.delivered($0, sentAt: item.sentAt, statuses: statuses) } ?? false
+    }
+    if pending[name]?.contains(where: delivered) == true { pending[name]?.removeAll(where: delivered) }
+  }
+
+  private func pruneThumbnails(_ name: String, reset: Bool = false) {
+    let shown = Set((conversations[name]?.items ?? []).filter { $0.hidden != true }.map(\.id))
+    let gone = { (key: AttachmentKey) in key.dot == name && (reset || !shown.contains(key.message)) }
     if thumbnails.keys.contains(where: gone) { thumbnails = thumbnails.filter { !gone($0.key) } }
     if unavailable.contains(where: gone) { unavailable = unavailable.filter { !gone($0) } }
-    let oldest = list.first?.time ?? 0
-    // An accepted message older than everything shown was delivered and has scrolled out, unless
-    // the daemon still lists it as not delivered.
-    pending[name]?.removeAll { item in
-      item.messageID.map { ids.contains($0) || (oldest > item.sentAt && statuses[$0] == nil) } ?? false
-    }
-    let latest = list.filter { $0.kind != "owner" && $0.hidden != true }.map(\.time).max() ?? 0
-    newest[name] = latest
-    if seen[name] == nil || visible(name) { seen[name] = latest }
   }
 
   private func update(_ name: String, _ id: UUID, _ change: (inout Pending) -> Void) {

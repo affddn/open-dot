@@ -91,11 +91,176 @@ const entry = (
 
 const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
 
+type ConversationPage = {
+  messages: { id: string; hidden: boolean }[];
+  sessionID: string;
+  next: string | null;
+};
+const readPage = async (response: Response) => (await response.json()) as ConversationPage;
+
+test("conversation pages walk projection order without gaps, including hidden and tool-only items", async () => {
+  const history = Array.from({ length: 65 }, (_, index) =>
+    entry(`msg_${65 - index}`, "assistant", `Reply ${index}`),
+  );
+  history.splice(30, 0, entry("msg_mechanics", "assistant", "", ["read"]));
+  fake.state.history.set("ses_jojo", history);
+  db.insert(hiddenMessages)
+    .values({ dot: "jojo", sessionID: "ses_jojo", messageID: "msg_3", hiddenAt: 1 })
+    .run();
+  let next: string | null = null;
+  const ids: string[] = [];
+  const lengths: number[] = [];
+  do {
+    const response = await call(
+      `/dots/jojo/messages?limit=20${next ? `&before=${encodeURIComponent(next)}` : ""}`,
+    );
+    expect(response.status).toBe(200);
+    const body = await readPage(response);
+    expect(body.sessionID).toBe("ses_jojo");
+    lengths.push(body.messages.length);
+    ids.unshift(...body.messages.map((message: { id: string }) => message.id));
+    const hidden = body.messages.find((message: { id: string }) => message.id === "msg_3");
+    if (hidden) expect(hidden.hidden).toBe(true);
+    next = body.next;
+  } while (next);
+  expect(lengths).toEqual([20, 20, 20, 5]);
+  expect(ids).toEqual(history.filter((item) => item.id !== "msg_mechanics").map((item) => item.id));
+});
+
+test("conversation cursors reject invalid, unknown and rebound pages", async () => {
+  fake.state.history.set(
+    "ses_jojo",
+    Array.from({ length: 40 }, (_, i) => entry(`msg_${i}`, "user", `${i}`)),
+  );
+  const first = await readPage(await call("/dots/jojo/messages"));
+  expect(first.messages).toHaveLength(20);
+  expect(first.next).toBeString();
+  for (const query of [
+    "before=",
+    "before=unknown",
+    "before=msg_unknown",
+    "limit=0",
+    "limit=51",
+    "limit=1.5",
+    "limit=20&limit=20",
+    "other=1",
+  ]) {
+    expect((await call(`/dots/jojo/messages?${query}`)).status).toBe(400);
+  }
+  const older = `/dots/jojo/messages?before=${encodeURIComponent(first.next ?? "")}`;
+  db.update(dots).set({ sessionID: "ses_new" }).where(eq(dots.name, "jojo")).run();
+  expect((await call(older)).status).toBe(409);
+  db.update(dots).set({ sessionID: "ses_jojo" }).where(eq(dots.name, "jojo")).run();
+  fake.state.onRecent = () => {
+    db.update(dots).set({ sessionID: "ses_new" }).where(eq(dots.name, "jojo")).run();
+  };
+  expect((await call(older)).status).toBe(409);
+});
+
+test("an empty conversation and the exact page boundary reach the start", async () => {
+  expect(await (await call("/dots/jojo/messages")).json()).toMatchObject({
+    messages: [],
+    next: null,
+  });
+  fake.state.history.set(
+    "ses_jojo",
+    Array.from({ length: 20 }, (_, i) => entry(`msg_${i}`, "user", `${i}`)),
+  );
+  const first = await readPage(await call("/dots/jojo/messages"));
+  const last = first.next
+    ? await readPage(await call(`/dots/jojo/messages?before=${encodeURIComponent(first.next)}`))
+    : first;
+  expect(last.next).toBeNull();
+});
+
 const putReaction = (emoji: unknown) =>
   call("/dots/jojo/messages/msg_answer/reaction", {
     method: "PUT",
     body: JSON.stringify({ emoji }),
   });
+
+test("older message actions use the exact session message beyond the latest window", async () => {
+  fake.state.history.set("ses_jojo", [
+    entry(
+      "msg_image",
+      "user",
+      "image",
+      [],
+      [{ mime: "image/png", name: "old.png", data: png.toString("base64") }],
+    ),
+    entry("msg_answer", "assistant", "old answer"),
+    ...Array.from({ length: 150 }, (_, i) => entry(`msg_new${i}`, "user", "new")),
+  ]);
+  expect((await putReaction("👍")).status).toBe(200);
+  expect(
+    (
+      await call("/dots/jojo/messages/msg_answer/hidden", {
+        method: "PUT",
+        body: JSON.stringify({ sessionID: "ses_jojo", hidden: true }),
+      })
+    ).status,
+  ).toBe(200);
+  const image = await call("/dots/jojo/messages/msg_image/attachments/0?sessionID=ses_jojo");
+  expect(image.status).toBe(200);
+  expect(Buffer.from(await image.arrayBuffer())).toEqual(png);
+  expect(fake.state.prompted).toEqual([]);
+});
+
+test("sparse history yields a bounded continuation and cursor tampering is refused", async () => {
+  fake.state.history.set("ses_jojo", [
+    entry("msg_old", "user", "old"),
+    ...Array.from({ length: 250 }, (_, i) => entry(`msg_tool${i}`, "assistant", "", ["read"])),
+  ]);
+  let reads = 0;
+  fake.state.onRecent = () => {
+    reads++;
+  };
+  const first = await readPage(await call("/dots/jojo/messages"));
+  expect(first.messages).toEqual([]);
+  expect(reads).toBe(10);
+  expect(first.next).toBeString();
+  const next = await readPage(
+    await call(`/dots/jojo/messages?before=${encodeURIComponent(first.next ?? "")}`),
+  );
+  expect(next.messages.map((message: { id: string }) => message.id)).toEqual(["msg_old"]);
+  expect(next.next).toBeNull();
+  expect(
+    (await call(`/dots/jojo/messages?before=${encodeURIComponent(`x${first.next}`)}`)).status,
+  ).toBe(400);
+  expect(
+    (await call(`/dots/polnareff/messages?before=${encodeURIComponent(first.next ?? "")}`)).status,
+  ).toBe(400);
+});
+
+test("an exact pinned read reconciles lost older mutation responses without replay", async () => {
+  fake.state.history.set("ses_jojo", [
+    entry("msg_answer", "assistant", "old answer"),
+    ...Array.from({ length: 150 }, (_, i) => entry(`msg_new${i}`, "user", "new")),
+  ]);
+  await putReaction("👍");
+  await call("/dots/jojo/messages/msg_answer/hidden", {
+    method: "PUT",
+    body: JSON.stringify({ sessionID: "ses_jojo", hidden: true }),
+  });
+  const path = "/dots/jojo/messages/msg_answer?sessionID=ses_jojo";
+  const response = await call(path);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({
+    id: "msg_answer",
+    sessionID: "ses_jojo",
+    hidden: true,
+    reactions: [expect.objectContaining({ actor: "owner", emoji: "👍" })],
+  });
+  expect((await call("/dots/jojo/messages/msg_answer")).status).toBe(400);
+  expect((await call("/dots/jojo/messages/msg_missing?sessionID=ses_jojo")).status).toBe(404);
+  expect((await call(path + "&extra=1")).status).toBe(400);
+  expect((await call(path.replace("ses_jojo", "ses_other"))).status).toBe(409);
+  fake.state.onMessage = () => {
+    db.update(dots).set({ sessionID: "ses_new" }).where(eq(dots.name, "jojo")).run();
+  };
+  expect((await call(path)).status).toBe(409);
+  expect(fake.state.prompted).toEqual([]);
+});
 
 test("owner reactions add, replace and remove idempotently without queuing a turn", async () => {
   fake.state.history.set("ses_jojo", [entry("msg_answer", "assistant", "A".repeat(400))]);
@@ -660,7 +825,7 @@ test("an image's bytes come only from a message in the dot's own session, with t
     expect((await get(`msg_1/attachments/${index}`)).status).toBe(400);
   expect((await get("msg_1/attachments/0", { method: "POST" })).status).toBe(404);
   expect((await get("msg_1/attachments/0/more")).status).toBe(404);
-  expect((await get("msg_1")).status).toBe(404);
+  expect((await get("msg_1")).status).toBe(400);
 });
 
 const pinnedImage = (query = "") => call(`/dots/jojo/messages/msg_same/attachments/0${query}`);
@@ -678,7 +843,7 @@ test("a session-pinned image read refuses a wrong or rebinding session, and unpi
   // The notch captured ses_jojo, but the dot was rebound before it asked.
   db.update(dots).set({ sessionID: "ses_new" }).where(eq(dots.name, "jojo")).run();
   let reads = 0;
-  fake.state.onRecent = () => {
+  fake.state.onMessage = () => {
     reads += 1;
   };
   expect((await pinnedImage("?sessionID=ses_jojo")).status).toBe(409);
@@ -690,11 +855,11 @@ test("a session-pinned image read refuses a wrong or rebinding session, and unpi
   expect(reads).toBe(1);
 
   // A rebinding during the read refuses rather than returning bytes for a session it left.
-  fake.state.onRecent = () => {
+  fake.state.onMessage = () => {
     db.update(dots).set({ sessionID: "ses_jojo" }).where(eq(dots.name, "jojo")).run();
   };
   expect((await pinnedImage("?sessionID=ses_new")).status).toBe(409);
-  fake.state.onRecent = () => {};
+  fake.state.onMessage = () => {};
   const again = await pinnedImage("?sessionID=ses_jojo");
   expect(again.status).toBe(200);
   expect(Buffer.from(await again.arrayBuffer())).toEqual(png);
@@ -1264,6 +1429,7 @@ test("a rebinding during a hide or a read refuses rather than redirecting", asyn
   fake.state.onRecent = () => {
     db.update(dots).set({ sessionID: "ses_new" }).where(eq(dots.name, "jojo")).run();
   };
+  fake.state.onMessage = fake.state.onRecent;
   expect((await hideMessage("msg_answer")).status).toBe(409);
   db.update(dots).set({ sessionID: "ses_jojo" }).where(eq(dots.name, "jojo")).run();
   expect((await call("/dots/jojo/messages")).status).toBe(409);

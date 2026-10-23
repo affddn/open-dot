@@ -178,6 +178,15 @@ export function fakeOpenCode() {
         state.onRecent();
         return items;
       }),
+    messagePage: (sessionID, limit, cursor) =>
+      Effect.sync(() => {
+        const history = state.history.get(sessionID) ?? [];
+        const end = cursor ? Number(cursor) : history.length;
+        const start = Math.max(0, end - limit);
+        const entries = history.slice(start, end);
+        state.onRecent();
+        return { entries, next: start > 0 ? String(start) : undefined };
+      }),
     message: ({ sessionID, messageID }) =>
       Effect.suspend(() =>
         state.readFailure

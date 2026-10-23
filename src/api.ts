@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { SessionMessage } from "@opencode/client/effect";
 import { and, desc, eq, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { Effect, type Layer } from "effect";
@@ -51,9 +52,7 @@ export { quoted } from "./replies";
 
 const error = (status: number, message: string) => Response.json({ error: message }, { status });
 
-// History items include idles and other events, so read more than are shown.
-const shown = 50;
-const read = 100;
+const pageSize = 20;
 
 const framed = /<dot-message from="[^"]*">\n([\s\S]*)\n<\/dot-message>$/;
 
@@ -327,21 +326,98 @@ const visibleMessages = (db: Db, dot: Dot, entries: readonly Entry[]) => {
     const inner = framed.exec(item.text)?.[1]?.replace(/<\\\/dot-message/gi, "</dot-message");
     return [{ ...base, kind: "peer", peer: row?.fromDot, text: inner ?? item.text }];
   };
-  return entries.flatMap(label).slice(-shown);
+  return entries.flatMap(label);
 };
 
-const conversation = (db: Db, dot: Dot) =>
+const signCursor = (token: string, body: string) =>
+  createHmac("sha256", token).update(body).digest("base64url");
+
+const encodeCursor = (token: string, dot: Dot, cursor: string) => {
+  const body = Buffer.from(JSON.stringify([dot.name, dot.sessionID, cursor])).toString("base64url");
+  return `${body}.${signCursor(token, body)}`;
+};
+
+const decodeCursor = (token: string, value: string): string[] | undefined => {
+  if (value.length > 8192 || !/^[\w-]+\.[\w-]{43}$/.test(value)) return undefined;
+  const [body, signature] = value.split(".");
+  if (
+    !body ||
+    !signature ||
+    !timingSafeEqual(Buffer.from(signature), Buffer.from(signCursor(token, body)))
+  )
+    return undefined;
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(body, "base64url").toString());
+    return Array.isArray(parsed) &&
+      parsed.length === 3 &&
+      parsed.every((part) => typeof part === "string" && part.length > 0)
+      ? parsed
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const conversation = (db: Db, dot: Dot, request: Request, token: string) =>
   Effect.gen(function* () {
-    if (dot.sessionState !== "ready") return Response.json({ messages: [] });
-    const entries = yield* (yield* OpenCode).recentMessages(dot.sessionID, read);
-    // A read that began before a rebinding must not pass as the new session's conversation.
-    if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+    const query = new URL(request.url).searchParams;
+    const limit = query.get("limit") ?? String(pageSize);
+    if (
+      [...query.keys()].some(
+        (key) => !["before", "limit"].includes(key) || query.getAll(key).length !== 1,
+      ) ||
+      !/^[1-9]\d?$/.test(limit) ||
+      Number(limit) > 50
+    )
+      return error(400, "Use limit 1–50 and an optional before cursor.");
+    const before = query.get("before");
+    const cursor = before === null ? undefined : decodeCursor(token, before);
+    if (before !== null && (!cursor || cursor[0] !== dot.name))
+      return error(400, "Invalid conversation cursor. Refresh.");
+    if (dot.sessionState !== "ready" || (cursor && cursor[1] !== dot.sessionID))
+      return error(409, "The dot's conversation changed. Refresh.");
+    const oc = yield* OpenCode;
+    let next = cursor?.[2];
+    let messages: ReturnType<typeof visibleMessages> = [];
+    const entries: Entry[] = [];
+    const visited = new Set<string>();
+    for (let reads = 0; reads < 10; reads++) {
+      if (next) visited.add(next);
+      const page = yield* oc.messagePage(dot.sessionID, Number(limit) - messages.length, next);
+      if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+      entries.unshift(...page.entries);
+      messages = [...visibleMessages(db, dot, page.entries), ...messages];
+      next = page.next;
+      if (next && visited.has(next)) return error(502, "History cursor did not advance.");
+      if (!next || messages.length >= Number(limit)) break;
+    }
     return Response.json({
-      messages: visibleMessages(db, dot, entries),
+      messages,
+      sessionID: dot.sessionID,
+      next: next ? encodeCursor(token, dot, next) : null,
       pending: pendingSends(db, dot, entries),
       // The owner's, across every dot: the menu's second row.
       recentEmojis: recentEmojis(db),
     });
+  });
+
+const conversationMessage = (db: Db, dot: Dot, id: string, request: Request) =>
+  Effect.gen(function* () {
+    const query = new URL(request.url).searchParams;
+    const sessionID = query.get("sessionID");
+    if (
+      !sessionID ||
+      sessionID.length > 255 ||
+      [...query.keys()].some((key) => key !== "sessionID" || query.getAll(key).length !== 1)
+    )
+      return error(400, "Use the message's sessionID.");
+    if (id.length > 255) return error(404, "There's no such conversation message.");
+    if (dot.sessionState !== "ready" || sessionID !== dot.sessionID)
+      return error(409, "The dot's conversation changed. Refresh.");
+    const target = yield* (yield* OpenCode).message({ sessionID, messageID: id });
+    if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+    const message = target && visibleMessages(db, dot, [target])[0];
+    return message ? Response.json(message) : error(404, "There's no such conversation message.");
   });
 
 /**
@@ -381,8 +457,7 @@ const react = (db: Db, dot: Dot, id: string, request: Request) =>
     )
       return error(400, "Send {emoji: exactly one emoji, or null to remove}.");
     if (dot.sessionState !== "ready") return error(404, "There's no such dot message.");
-    const entries = yield* (yield* OpenCode).recentMessages(dot.sessionID, read);
-    const target = entries.find((item) => item.id === id);
+    const target = yield* (yield* OpenCode).message({ sessionID: dot.sessionID, messageID: id });
     if (
       !target ||
       target.role !== "assistant" ||
@@ -421,10 +496,10 @@ const hide = (db: Db, dot: Dot, id: string, request: Request) =>
     if (id.length > 255) return error(404, "There's no such message in recent history.");
     if (dot.sessionState !== "ready" || body.sessionID !== dot.sessionID)
       return error(409, "The dot's conversation changed. Refresh before deleting.");
-    const entries = yield* (yield* OpenCode).recentMessages(dot.sessionID, read);
+    const target = yield* (yield* OpenCode).message({ sessionID: dot.sessionID, messageID: id });
     if (rebound(db, dot))
       return error(409, "The dot's conversation changed. Refresh before deleting.");
-    if (!visibleMessages(db, dot, entries).some((message) => message.id === id))
+    if (!target || !visibleMessages(db, dot, [target]).some((message) => message.id === id))
       return error(404, "There's no such message in recent history.");
     if (messageSources(db, dot.sessionID, [id]).get(id)?.state === "pending")
       return error(409, "This message is still being delivered.");
@@ -581,10 +656,10 @@ const attachment = (db: Db, dot: Dot, id: string, index: string, sessionID: stri
     if (sessionID !== null && (dot.sessionState !== "ready" || sessionID !== dot.sessionID))
       return error(409, "The dot's conversation changed. Refresh.");
     if (dot.sessionState !== "ready") return error(404, "There's no such attachment.");
-    const entries = yield* (yield* OpenCode).recentMessages(dot.sessionID, read);
+    const target = yield* (yield* OpenCode).message({ sessionID: dot.sessionID, messageID: id });
     if (sessionID !== null && rebound(db, dot))
       return error(409, "The dot's conversation changed. Refresh.");
-    const file = entries.find((item) => item.id === id)?.files[Number(index)];
+    const file = target?.files[Number(index)];
     return file ? imageBytes(file) : error(404, "There's no such attachment.");
   });
 
@@ -914,6 +989,7 @@ const route = (
   db: Db,
   request: Request,
   path: string[],
+  token: string,
 ): Effect.Effect<Response, OpenCodeError, OpenCode> => {
   const [root, name, rest, ...extra] = path;
   if (root !== "dots") return Effect.succeed(error(404, "Not found"));
@@ -930,10 +1006,12 @@ const route = (
   const dot = findDot(db, decoded);
   if (!dot) return Effect.succeed(error(404, `There's no dot named "${name}".`));
   if (rest === "messages" && extra.length === 0) {
-    if (request.method === "GET") return conversation(db, dot);
+    if (request.method === "GET") return conversation(db, dot, request, token);
     if (request.method === "POST") return send(db, dot, request);
   }
   const [id, part, index, ...more] = extra;
+  if (rest === "messages" && id !== undefined && extra.length === 1 && request.method === "GET")
+    return conversationMessage(db, dot, id, request);
   if (
     rest === "messages" &&
     part === "reaction" &&
@@ -1178,7 +1256,7 @@ export const api =
         return error(500, "Couldn't read or save the dot's memory.");
       });
     return Effect.runPromise(
-      route(db, request, path).pipe(
+      route(db, request, path, token).pipe(
         Effect.provide(layer),
         Effect.catch((failure) => Effect.succeed(error(503, failure.message))),
       ),

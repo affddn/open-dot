@@ -40,7 +40,7 @@ test("images survive SQLite reopen and public HTTP delivery, including lost admi
     auth: undefined,
   });
   const admitted = new Map<string, object>();
-  const history: object[] = [];
+  const history = new Map<string, object>();
   const posts: unknown[] = [];
   let lost = false;
   let lookupFailure = false;
@@ -92,13 +92,16 @@ test("images survive SQLite reopen and public HTTP delivery, including lost admi
         payload,
       };
       admitted.set(body.id, item);
-      history.push({ type: "user", id: body.id, time: { created: 1 }, ...payload });
+      history.set(body.id, { type: "user", id: body.id, time: { created: 1 }, ...payload });
       if (lost) throw new TypeError("Response lost after admission");
       return Response.json({ data: item });
     }
     if (url.pathname === "/api/session/ses_images/message")
-      return Response.json({ data: history.toReversed(), cursor: {} });
-    if (url.pathname.startsWith("/api/session/ses_images/message/"))
+      return Response.json({ data: [...history.values()].toReversed(), cursor: {} });
+    if (url.pathname.startsWith("/api/session/ses_images/message/")) {
+      const messageID = url.pathname.slice("/api/session/ses_images/message/".length);
+      const message = history.get(messageID);
+      if (message) return Response.json({ data: message });
       return Response.json(
         {
           _tag: "MessageNotFoundError",
@@ -108,6 +111,7 @@ test("images survive SQLite reopen and public HTTP delivery, including lost admi
         },
         { status: 404 },
       );
+    }
     throw new Error(`Unexpected fake HTTP request: ${request.method} ${url.pathname}`);
   };
   const transport: typeof fetch = Object.assign(fakeFetch, {

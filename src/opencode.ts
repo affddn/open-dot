@@ -359,6 +359,11 @@ export class OpenCode extends Context.Service<
       limit: number,
     ) => Effect.Effect<readonly Entry[], OpenCodeError>;
     readonly message: (ref: MessageRef) => Effect.Effect<Entry | undefined, OpenCodeError>;
+    readonly messagePage: (
+      sessionID: string,
+      limit: number,
+      cursor?: string,
+    ) => Effect.Effect<{ entries: readonly Entry[]; next: string | undefined }, OpenCodeError>;
     /** The session's directory, or undefined once OpenCode says the session doesn't exist. */
     readonly sessionDirectory: (
       sessionID: string,
@@ -609,6 +614,20 @@ export class OpenCode extends Context.Service<
             Effect.map((page) => page.data.flatMap(entry).toReversed()),
             Effect.mapError(failed(`Could not read session ${sessionID}`)),
           ),
+        messagePage: (sessionID, limit, cursor) =>
+          client.message
+            .list({
+              sessionID: Session.ID.make(sessionID),
+              limit,
+              ...(cursor ? { cursor } : { order: "desc" as const }),
+            })
+            .pipe(
+              Effect.map((page) => ({
+                entries: page.data.flatMap(entry).toReversed(),
+                next: page.data.length === limit ? page.cursor?.next : undefined,
+              })),
+              Effect.mapError(failed(`Could not read session ${sessionID}`)),
+            ),
         message: ({ sessionID, messageID }) =>
           client.session.message
             .get({

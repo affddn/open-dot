@@ -220,6 +220,18 @@ struct WorkerOpened: Decodable, Equatable {
   }
 }
 
+struct MessagePage: Decodable {
+  struct Status: Decodable { let id: String; let status: String }
+  var messages: [Message]
+  let sessionID: String?
+  let next: String?
+  let pending: [Status]?
+  let recentEmojis: [String]?
+  var statuses: [String: String] {
+    Dictionary((pending ?? []).map { ($0.id, $0.status) }) { first, _ in first }
+  }
+}
+
 struct Message: Decodable, Equatable, Identifiable {
   struct Attachment: Decodable, Equatable {
     let index: Int
@@ -456,11 +468,13 @@ enum APIError: Error {
 
   /// The conversation, where each of the owner's sends that isn't in it yet stands, and the owner's
   /// recent emoji for the menu's second row, which a daemon older than any-emoji Tapbacks omits.
-  func messages(_ dot: String) async throws -> (messages: [Message], pending: [String: String], recent: [String]?) {
-    struct Status: Decodable { let id: String; let status: String }
-    struct Body: Decodable { let messages: [Message]; let pending: [Status]?; let recentEmojis: [String]? }
-    let body = try decode(Body.self, await send("GET", "/dots/\(escape(dot))/messages"))
-    return (body.messages, Dictionary((body.pending ?? []).map { ($0.id, $0.status) }) { first, _ in first }, body.recentEmojis)
+  func messages(_ dot: String, before: String? = nil) async throws -> MessagePage {
+    let query = before.map { "?before=\(escape($0))" } ?? ""
+    return try decode(MessagePage.self, await send("GET", "/dots/\(escape(dot))/messages\(query)"))
+  }
+
+  func message(_ key: MessageKey, session: String) async throws -> Message {
+    try decode(Message.self, await send("GET", "/dots/\(escape(key.dot))/messages/\(escape(key.message))?sessionID=\(escape(session))"))
   }
 
   /// Saves the owner's reaction, any single emoji or nil to remove it, and returns the second row as it now stands.
@@ -468,7 +482,8 @@ enum APIError: Error {
     struct Body: Decodable { let reaction: Reaction; let recentEmojis: [String]? }
     // JSONEncoder omits nil optional fields; removal needs an explicit JSON null.
     let body = try JSONSerialization.data(withJSONObject: ["emoji": emoji as Any? ?? NSNull()])
-    let saved = try decode(Body.self, await send("PUT", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/reaction", body: body))
+    let data = try await send("PUT", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/reaction", body: body)
+    guard let saved = try? decode(Body.self, data) else { throw APIError.lost }
     return (saved.reaction, saved.recentEmojis)
   }
 
@@ -476,7 +491,9 @@ enum APIError: Error {
   func hide(_ key: MessageKey, session: String) async throws -> HiddenMarker {
     struct Body: Decodable { let hidden: HiddenMarker }
     let body = try JSONSerialization.data(withJSONObject: ["sessionID": session, "hidden": true] as [String: Any])
-    return try decode(Body.self, await send("PUT", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/hidden", body: body)).hidden
+    let data = try await send("PUT", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/hidden", body: body)
+    guard let saved = try? decode(Body.self, data) else { throw APIError.lost }
+    return saved.hidden
   }
 
   /// Queues the text, as a reply to a feed item when `feed` is its ID. Never retried on its own.

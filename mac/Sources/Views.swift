@@ -536,15 +536,45 @@ class DraftTextView: NSTextView {
 struct Conversation: View {
   let store: Store
   let name: String
+  @State private var anchor: String?
 
   var body: some View {
     // Messages deleted in the notch stay in the store, so pending sends still match their IDs.
-    let messages = (store.messages[name] ?? []).filter { $0.hidden != true }
+    let window = store.conversations[name] ?? MessageWindow()
+    let messages = window.items.filter { $0.hidden != true }
     let pending = store.pending[name] ?? []
+    GeometryReader { viewport in
     ScrollViewReader { proxy in
       ScrollView {
         // Lazy, so a thumbnail loads only when its message scrolls into view.
         LazyVStack(alignment: .leading, spacing: 8) {
+          VStack(spacing: 4) {
+            if store.loadingOlder.contains(name) {
+              HStack { ProgressView().controlSize(.small); Text("Loading earlier messages").font(.caption) }
+            } else if window.next != nil {
+              Button("Load older messages") {
+                store.conversations[name]?.atBottom = false
+                Task { await store.loadOlder(name) }
+              }
+              .accessibilityIdentifier("messages-load-older")
+            } else if !window.items.isEmpty {
+              Text("Start of conversation").font(.caption).foregroundStyle(.secondary)
+            }
+            if let error = store.historyErrors[name] {
+              Text(error).font(.caption).foregroundStyle(.secondary)
+              Button("Back to latest") { store.showLatest(name); proxy.scrollTo("end", anchor: .bottom) }
+            }
+          }
+          .frame(maxWidth: .infinity)
+          .background {
+            GeometryReader { top in
+              Color.clear.onChange(of: top.frame(in: .named("conversation-\(name)")).maxY >= 0) { _, reached in
+                if reached && !window.atBottom && store.historyErrors[name] == nil {
+                  Task { await store.loadOlder(name) }
+                }
+              }
+            }
+          }
           ForEach(messages) { MessageRow(store: store, dot: name, message: $0) }
           // In the conversation means OpenCode delivered it to the dot. Nothing reports whether the
           // model has read it, so there's no "Read".
@@ -560,12 +590,36 @@ struct Conversation: View {
               if item.error != nil { store.dismiss(name, item.id) }
             }
           }
-          Color.clear.frame(height: 1).id("end")
+          Color.clear.frame(height: 1).id("end").background {
+            GeometryReader { end in
+              Color.clear.onChange(of: end.frame(in: .named("conversation-\(name)")).minY <= viewport.size.height + 8, initial: true) { _, bottom in
+                if store.conversations[name]?.atBottom != bottom {
+                  store.conversations[name]?.atBottom = bottom
+                }
+              }
+            }
+          }
+        }
+        .scrollTargetLayout()
+      }
+      .coordinateSpace(name: "conversation-\(name)")
+      .defaultScrollAnchor(.bottom)
+      .scrollPosition(id: $anchor, anchor: .top)
+      .scrollIndicators(.never)
+      .onChange(of: "\(name) \(messages.last?.id ?? "") \(pending.count)") {
+        if window.atBottom { proxy.scrollTo("end", anchor: .bottom) }
+      }
+      .overlay(alignment: .bottom) {
+        if !window.atBottom || window.hasNewer {
+          Button("Latest messages") {
+            store.showLatest(name)
+            proxy.scrollTo("end", anchor: .bottom)
+          }
+          .buttonStyle(.borderedProminent)
+          .accessibilityIdentifier("messages-latest")
         }
       }
-      .defaultScrollAnchor(.bottom)
-      .scrollIndicators(.never)
-      .onChange(of: "\(name) \(messages.last?.id ?? "") \(pending.count)") { proxy.scrollTo("end", anchor: .bottom) }
+    }
     }
     .accessibilityElement(children: .contain)
     .accessibilityIdentifier("message-list")
@@ -1603,12 +1657,13 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
   let menu = NSMenu()
   menu.autoenablesItems = false
   let selected = message.reactions?.first { $0.actor == "owner" }?.emoji
-  let reactable = message.kind == "dot" && !store.reacting.contains(key)
+  let mutationPending = store.messageMutationPending(key)
+  let reactable = message.kind == "dot" && !mutationPending
   // Every choice, including one from the emoji picker long after, goes to this message in this session.
   let choose = { (emoji: String) -> Void in
     guard store.stillShown(key, session: session) != nil else { return }
-    if store.reacting.contains(key) {
-      return store.report("A reaction to this message is still saving, so nothing was done.", dot: dot, key: key)
+    if store.messageMutationPending(key) {
+      return store.report("Waiting for saved message state before another change.", dot: dot, key: key)
     }
     store.react(key, emoji: emoji)
   }
@@ -1616,6 +1671,7 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
   let row = recentTapbacks(store.recentEmojis)
   menu.addItem(moreTapbacks(row, selected: selected, enabled: reactable, id: "\(dot)-\(message.id)", choose: choose) { [weak anchor] in
     guard store.stillShown(key, session: session) != nil else { return }
+    guard !store.messageMutationPending(key) else { return }
     guard let anchor else {
       return store.report("The message scrolled away, so the emoji picker didn't open.", dot: dot, key: key)
     }
@@ -1650,10 +1706,12 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
     store.share(key, session: session, from: anchor)
   })
   menu.addItem(.separator())
-  menu.addItem(action("Delete…", symbol: "trash", id: "message-menu-delete", enabled: session != nil && !store.hiding.contains(key)) {
+  menu.addItem(action("Delete…", symbol: "trash", id: "message-menu-delete", enabled: session != nil && !mutationPending) {
+    guard !store.messageMutationPending(key) else { return }
     if let session { confirmHide(key, session: session, store: store) }
   })
   let reasons = [
+    mutationPending ? "Waiting for saved message state before another change." : nil,
     message.kind == "dot" ? nil : "Tapbacks are only for \(dot)'s messages.",
     repliable ? nil : "Reply is only for your messages and \(dot)'s.",
     content ? nil : "There's no text or image to copy or share.",
