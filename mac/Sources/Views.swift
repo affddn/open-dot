@@ -58,6 +58,19 @@ struct BusyDot: View {
   }
 }
 
+/// A dot's avatar, already downscaled, in a circle. Decorative, so VoiceOver reads only the text.
+struct AvatarView: View {
+  let image: NSImage
+  let size: CGFloat
+
+  var body: some View {
+    Image(nsImage: image).resizable().interpolation(.high).scaledToFill()
+      .frame(width: size, height: size)
+      .clipShape(Circle())
+      .accessibilityHidden(true)
+  }
+}
+
 struct UnreadDot: View {
   var body: some View {
     Circle().fill(.blue).frame(width: 6, height: 6)
@@ -131,6 +144,7 @@ struct ExpandedView: View {
           Button { store.select(dot.name) } label: {
             HStack(spacing: 5) {
               if dot.busy { BusyDot() }
+              if let image = store.avatars.images[dot.name] { AvatarView(image: image, size: 16) }
               Text(dot.name).font(.callout.weight(.medium))
               if dot.needsYouCount > 0 {
                 Text("\(dot.needsYouCount)")
@@ -847,36 +861,18 @@ struct MessageRow: View {
         }
       }
     case "dot":
-      HStack {
-        VStack(alignment: .leading, spacing: 2) {
-          VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 8) {
-              replyButton
-              MessageActionsButton(id: anchorID)
-            }
-            if let quote = message.quote { MessageQuoteView(quote: quote, dot: dot) }
-            if !message.text.isEmpty { Bubble(text: message.text, fill: messageGray) }
-            attachments
-            if let tools = message.tools, !tools.isEmpty {
-              Text("used \(tools.joined(separator: ", "))").font(.caption2).foregroundStyle(.tertiary)
-            }
-          }
-          .padding(.bottom, badge == nil ? 0 : 22)
-          .overlay(alignment: .bottomTrailing) { reactionBadge }
-          .background(menuAnchor)
-          .accessibilityElement(children: .contain)
-          .accessibilityAction(named: "Message actions") { MenuAnchorView.open(anchorID) }
-          .accessibilityIdentifier(anchorID)
-          if store.reacting.contains(key) {
-            Text("Saving reaction…").font(.caption2).foregroundStyle(.secondary)
-          }
-          if let error = store.reactionErrors[key] {
-            Text(error).font(.caption2).foregroundStyle(.red)
-              .accessibilityIdentifier("reaction-error-\(dot)-\(message.id)")
-          }
-          actionError
+      // Without an avatar, the row keeps its earlier stack and alignment.
+      if let image = store.avatars.images[dot] {
+        HStack(alignment: .top) {
+          AvatarView(image: image, size: 22)
+          dotMessage
+          Spacer(minLength: 60)
         }
-        Spacer(minLength: 60)
+      } else {
+        HStack {
+          dotMessage
+          Spacer(minLength: 60)
+        }
       }
     default:
       VStack(alignment: .leading, spacing: 2) {
@@ -905,6 +901,38 @@ struct MessageRow: View {
 }
 
 extension MessageRow {
+  /// A dot's message and what's under it, beside its avatar when it has one.
+  private var dotMessage: some View {
+    VStack(alignment: .leading, spacing: 2) {
+      VStack(alignment: .leading, spacing: 3) {
+        HStack(spacing: 8) {
+          replyButton
+          MessageActionsButton(id: anchorID)
+        }
+        if let quote = message.quote { MessageQuoteView(quote: quote, dot: dot) }
+        if !message.text.isEmpty { Bubble(text: message.text, fill: messageGray) }
+        attachments
+        if let tools = message.tools, !tools.isEmpty {
+          Text("used \(tools.joined(separator: ", "))").font(.caption2).foregroundStyle(.tertiary)
+        }
+      }
+      .padding(.bottom, badge == nil ? 0 : 22)
+      .overlay(alignment: .bottomTrailing) { reactionBadge }
+      .background(menuAnchor)
+      .accessibilityElement(children: .contain)
+      .accessibilityAction(named: "Message actions") { MenuAnchorView.open(anchorID) }
+      .accessibilityIdentifier(anchorID)
+      if store.reacting.contains(key) {
+        Text("Saving reaction…").font(.caption2).foregroundStyle(.secondary)
+      }
+      if let error = store.reactionErrors[key] {
+        Text(error).font(.caption2).foregroundStyle(.red)
+          .accessibilityIdentifier("reaction-error-\(dot)-\(message.id)")
+      }
+      actionError
+    }
+  }
+
   private var replyButton: some View {
     Button("Reply") { store.reply(dot, to: message) }
       .buttonStyle(.plain)

@@ -4,6 +4,7 @@ import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { Effect, Schedule } from "effect";
 import { api } from "./api";
+import { avatarPath, setAvatar } from "./avatar";
 import { daemonLoops } from "./daemon";
 import { backupDatabase, claimDaemon, openDatabase, restoreDatabase } from "./db";
 import { createDot, ensureSession, findDot, listDots, pickDot } from "./dots";
@@ -43,6 +44,7 @@ const usage = `Usage:
   open-dot create <name> [purpose]   Create a dot and its OpenCode session
   open-dot list                      List dots
   open-dot open [name]               Open a dot in OpenCode
+  open-dot avatar <name> <file>      Set a dot's avatar from a square PNG or JPEG
   open-dot daemon                    Deliver reminders and run workers until stopped
   open-dot backup                    Back up the database without migrating it
   open-dot restore <file>            Restore a backup while the daemon is stopped
@@ -320,6 +322,20 @@ const open = (name: string | undefined) =>
     yield* Effect.promise(() => child.exited);
   }).pipe(Effect.provide(OpenCode.layer));
 
+/** Checks the image and copies it in. A failure leaves the dot's current avatar as it was. */
+const avatar = (name: string, file: string) =>
+  Effect.suspend(() => {
+    if (!findDot(db, name)) return fail(`No dot named "${name}".`);
+    const image = setAvatar(name, file);
+    if (typeof image === "string")
+      return fail(`Couldn't use ${file}: ${image} ${name}'s avatar is unchanged.`);
+    return Effect.sync(() =>
+      console.log(
+        `Saved ${name}'s avatar (${image.mime === "image/png" ? "PNG" : "JPEG"}, ${image.width}×${image.height}) at ${avatarPath(name)}. The notch shows it within a few seconds.`,
+      ),
+    );
+  });
+
 const list = Effect.sync(() => {
   const all = listDots(db);
   if (all.length === 0) return console.log("No dots yet. Run: open-dot create <name>");
@@ -405,15 +421,17 @@ const program =
     ? create(args[0], args.slice(1).join(" "))
     : command === "list"
       ? list
-      : command === "open"
-        ? open(args[0])
-        : command === "daemon"
-          ? daemon
-          : command === "slack"
-            ? slackCommand(args[0], args[1], args.slice(2))
-            : command === "watch"
-              ? watchCommand(args[0], args.slice(1))
-              : Effect.sync(() => console.log(usage));
+      : command === "avatar" && args.length === 2 && args[0] && args[1]
+        ? avatar(args[0], args[1])
+        : command === "open"
+          ? open(args[0])
+          : command === "daemon"
+            ? daemon
+            : command === "slack"
+              ? slackCommand(args[0], args[1], args.slice(2))
+              : command === "watch"
+                ? watchCommand(args[0], args.slice(1))
+                : Effect.sync(() => console.log(usage));
 
 await Effect.runPromise(
   program.pipe(

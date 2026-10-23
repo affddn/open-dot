@@ -72,12 +72,19 @@ struct Dot: Decodable, Equatable {
     }
   }
 
+  /// The dot has an avatar. Its revision changes whenever the file is replaced or rewritten.
+  struct Avatar: Decodable, Equatable {
+    let revision: String
+  }
+
   let name: String
   let purpose: String?
   let busy: Bool
   let workers: [Worker]
   /// Older daemons send none.
   var sessions: [SessionRequest]? = nil
+  /// Nil without one, and from older daemons.
+  var avatar: Avatar? = nil
 
   /// How many of its workers and other sessions wait on you.
   var needsYouCount: Int { workers.filter(\.needsYou).count + (sessions ?? []).filter(\.needsYou).count }
@@ -489,6 +496,11 @@ enum APIError: Error {
     let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
     let pin = session.map { "?sessionID=\($0.addingPercentEncoding(withAllowedCharacters: unreserved) ?? $0)" } ?? ""
     return try await send("GET", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/attachments/\(key.index)\(pin)")
+  }
+
+  /// The dot's avatar image, which the daemon reads only from its own avatar.png.
+  func avatar(_ dot: String) async throws -> Data {
+    try await send("GET", "/dots/\(escape(dot))/avatar")
   }
 
   func feed() async throws -> (items: [FeedItem], handedOff: [FeedItem], remaining: Int) {

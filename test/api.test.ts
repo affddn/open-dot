@@ -1,4 +1,4 @@
-import { beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,8 +23,14 @@ import { fakeOpenCode } from "./fake-opencode";
 
 let db: Db;
 let fake: ReturnType<typeof fakeOpenCode>;
+let home: string;
+let previousHome: string | undefined;
 
 beforeEach(() => {
+  // /dots reads avatars from the home, so never the owner's own.
+  previousHome = process.env.OPEN_DOT_HOME;
+  home = mkdtempSync(join(tmpdir(), "open-dot-api-"));
+  process.env.OPEN_DOT_HOME = home;
   db = openDatabase(":memory:");
   fake = fakeOpenCode();
   for (const name of ["jojo", "polnareff"])
@@ -38,6 +44,12 @@ beforeEach(() => {
         createdAt: name === "jojo" ? 0 : 1,
       })
       .run();
+});
+
+afterEach(() => {
+  rmSync(home, { recursive: true, force: true });
+  if (previousHome === undefined) delete process.env.OPEN_DOT_HOME;
+  else process.env.OPEN_DOT_HOME = previousHome;
 });
 
 const call = (
@@ -371,6 +383,7 @@ test("/dots lists each dot with whether it's busy and its unfinished workers", a
       name: "jojo",
       purpose: "Second brain.",
       busy: true,
+      avatar: null,
       workers: [
         {
           id: 1,
@@ -393,7 +406,7 @@ test("/dots lists each dot with whether it's busy and its unfinished workers", a
       ],
       sessions: [],
     },
-    { name: "polnareff", purpose: null, busy: false, workers: [], sessions: [] },
+    { name: "polnareff", purpose: null, busy: false, avatar: null, workers: [], sessions: [] },
   ]);
 });
 

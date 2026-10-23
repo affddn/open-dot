@@ -22,7 +22,10 @@ Then create and open a dot:
 bun src/cli.ts create jojo "Keep me on top of my week."
 bun src/cli.ts list
 bun src/cli.ts open jojo
+bun src/cli.ts avatar jojo ~/Pictures/jojo.png   # optional
 ```
+
+An avatar is a square-ish PNG or JPEG of 128 to 4,096 pixels a side and at most 8 MiB. The command checks its structure, has macOS decode a temporary copy with `sips`, then copies its original bytes to `~/.opendot/dots/<name>/avatar.png`, even for a JPEG; a refused image leaves the current avatar. The notch shows it in the dot's tab and beside its messages, and picks up a replaced or deleted file within a few seconds. A dot without one looks as before.
 
 In the OpenCode TUI, `/dot [name]` opens a dot too, and the sidebar lists your dots and their recent workers. A dot saves notes, schedules one-off or repeating reminders, and tracks ongoing responsibilities with its own tools. It hands substantial work to worker sessions and relays their reports. A worker in a git repository gets its own worktree under `~/.opendot/worktrees/` and commits on its own `dot/<name>-<id>` branch. Worktrees aren't removed automatically. With several dots, each sees the others' purposes and can message them; a dot sends at most 10 messages an hour. It acts without asking, except before destructive shell commands.
 
@@ -141,7 +144,7 @@ A dot can have its own Slack app, with its own name, profile and agent view, and
      ```
 
 4. Within a minute the daemon checks the tokens and connects over Socket Mode. `slack status` then says `active`. Invite the dot to a channel with `/invite @jotaro`.
-5. Give it a profile picture yourself. No Slack API or manifest field sets an app's icon (`users.setPhoto` sets a person's photo, with their user token), so open the app's **Basic Information** page at api.slack.com/apps, scroll to **Display Information**, add a square image of 512 to 2000 pixels under **App icon & Preview**, and click **Save Changes**. This works for an app that's already active too. `slack status` shows the link.
+5. Give it a profile picture yourself. No Slack API or manifest field sets an app's icon (`users.setPhoto` sets a person's photo, with their user token), so open the app's **Basic Information** page at api.slack.com/apps, scroll to **Display Information**, add a square image of 512 to 2000 pixels under **App icon & Preview**, and click **Save Changes**. This works for an app that's already active too. `slack status` shows the link and names the dot's avatar file to upload.
 
 An app created before suggested prompts existed lacks the agent view's thread events. `slack status` says so; run `bun src/cli.ts slack update jotaro` in a terminal to fix it. The command exports the app's manifest from Slack with a freshly rotated configuration token, checks that its bot is named after the dot and uses Socket Mode, lists the scopes and events it would add, and asks you to confirm. Only those are added; everything else in the manifest, including changes you made at api.slack.com, stays, since Slack's update replaces the whole manifest. The attempt is saved before the call. If Slack says the change needs your approval, `slack status` keeps telling you to reinstall the app until you run `slack update` again. If the answer is lost, nothing is sent again on its own: the next `slack update` checks the exported manifest to see whether it landed. The daemon never updates an app.
 

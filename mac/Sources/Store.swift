@@ -100,8 +100,53 @@ struct FeedState {
   }
 }
 
+/// Each dot's avatar, downscaled once per revision the daemon lists. A load counts only while its
+/// revision is still the dot's current one, so a slow load can't bring back a replaced or deleted
+/// image. A failed request is retried on the next update; bytes that don't decode aren't loaded
+/// again until the revision changes.
+struct AvatarState {
+  private(set) var images: [String: NSImage] = [:]
+  private var current: [String: String] = [:]
+  private var loading: [String: String] = [:]
+  /// The revision each dot's image, or refused load, is for.
+  private var loaded: [String: String] = [:]
+
+  /// Takes the dots' current revisions and returns the loads to start. A dot without an avatar
+  /// shows none at once; a replaced one keeps its old image until the new one loads.
+  mutating func update(_ dots: [Dot]) -> [(name: String, revision: String)] {
+    current = Dictionary(dots.compactMap { dot in dot.avatar.map { (dot.name, $0.revision) } }) { first, _ in first }
+    images = images.filter { current[$0.key] != nil }
+    loading = loading.filter { current[$0.key] != nil }
+    loaded = loaded.filter { current[$0.key] != nil }
+    var loads: [(name: String, revision: String)] = []
+    for (name, revision) in current.sorted(by: { $0.key < $1.key })
+    where loaded[name] != revision && loading[name] != revision {
+      loading[name] = revision
+      loads.append((name, revision))
+    }
+    return loads
+  }
+
+  /// A load's decoded image, or nil when the bytes didn't decode. False when the revision is no
+  /// longer current, so it's dropped.
+  @discardableResult
+  mutating func finish(_ name: String, _ revision: String, image: NSImage?) -> Bool {
+    if loading[name] == revision { loading[name] = nil }
+    guard current[name] == revision else { return false }
+    loaded[name] = revision
+    images[name] = image
+    return true
+  }
+
+  /// A load whose request failed, for any reason, which the next update starts again.
+  mutating func abandon(_ name: String, _ revision: String) {
+    if loading[name] == revision { loading[name] = nil }
+  }
+}
+
 @MainActor @Observable final class Store {
   var dots: [Dot] = []
+  var avatars = AvatarState()
   var status: String?
   var loaded = false
   var selected: String?
@@ -963,12 +1008,28 @@ struct FeedState {
       let finished = dots.filter { old in old.busy && next.contains { $0.name == old.name && !$0.busy } }
       dots = next
       status = nil
+      for load in avatars.update(next) { loadAvatar(load.name, load.revision) }
       if !next.contains(where: { $0.name == selected }) { selected = next.first?.name }
       for dot in finished { Task { await refreshMessages(dot.name) } }
     } catch {
       status = Self.describe(error)
     }
     loaded = true
+  }
+
+  /// Enough pixels for the largest avatar shown, 22 points, on a Retina display.
+  private static let avatarPixels = 64
+
+  /// Loads and downscales one revision of a dot's avatar. Only the downscaled image is kept.
+  private func loadAvatar(_ name: String, _ revision: String) {
+    Task {
+      // A failed request is tried again on the next dots poll; bytes that don't decode wait for a new revision.
+      if let data = try? await api.avatar(name) {
+        avatars.finish(name, revision, image: Self.decode(data, maxPixels: Self.avatarPixels))
+      } else {
+        avatars.abandon(name, revision)
+      }
+    }
   }
 
   private func refreshFeed() async {

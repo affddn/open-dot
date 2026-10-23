@@ -11,7 +11,7 @@ import { type Dot, dots } from "./schema";
 
 export class DotError extends Data.TaggedError("DotError")<{ readonly message: string }> {}
 
-const validName = /^[a-z][a-z0-9-]{0,31}$/;
+export const validName = /^[a-z][a-z0-9-]{0,31}$/;
 
 const instructions = (name: string, purpose: string) => `# ${name}
 

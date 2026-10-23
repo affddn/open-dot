@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { SessionMessage } from "@opencode/client/effect";
 import { and, desc, eq, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { Effect, type Layer } from "effect";
+import { avatarRevision, readAvatar } from "./avatar";
 import { stopWorker } from "./daemon";
 import type { Db } from "./db";
 import { findDot, listDots } from "./dots";
@@ -126,6 +127,12 @@ const sessionsView = (rows: readonly WorkerRequest[], now: number) =>
       : [];
   });
 
+/** Whether the dot has an avatar, and a revision the notch reloads it on whenever it changes. */
+const avatarView = (name: string) => {
+  const revision = avatarRevision(name);
+  return revision ? { revision } : null;
+};
+
 const listAll = (db: Db) =>
   Effect.gen(function* () {
     const active = yield* (yield* OpenCode).activeSessions;
@@ -155,6 +162,7 @@ const listAll = (db: Db) =>
         name: dot.name,
         purpose: dot.purpose,
         busy: active.has(dot.sessionID),
+        avatar: avatarView(dot.name),
         workers: unfinished
           .filter((worker) => worker.dot === dot.name)
           .map((worker) => workerView(worker, rows, now)),
@@ -208,6 +216,40 @@ const requestAudit = (db: Db, request: Request, path: string[]) => {
   return Response.json({
     requests: page.map((row) => requestView(row, now)),
     next: page.length === auditPage ? (page.at(-1)?.id ?? null) : null,
+  });
+};
+
+/**
+ * `GET /dots/<name>/avatar`: exactly `dots/<name>/avatar.png` of a known dot, refused when it or
+ * a directory above it is a link, and only if its structure is a whole PNG or JPEG avatar; its
+ * pixels aren't decoded
+ * here. Nothing in the request names a path, and a bad name is just an unknown dot.
+ */
+const avatarRoute = (db: Db, request: Request, path: string[]) => {
+  if (path.length !== 3 || request.method !== "GET") return error(404, "Not found");
+  const name = (() => {
+    try {
+      return decodeURIComponent(path[1] ?? "");
+    } catch {
+      return undefined;
+    }
+  })();
+  const dot = name === undefined ? undefined : findDot(db, name);
+  if (!dot) return error(404, "There's no such dot.");
+  let avatar: ReturnType<typeof readAvatar>;
+  try {
+    avatar = readAvatar(dot.name);
+  } catch (cause) {
+    console.error(`Avatar: ${cause instanceof Error ? cause.message : String(cause)}`);
+    return error(500, "Couldn't read the avatar.");
+  }
+  if ("status" in avatar) return error(avatar.status, avatar.reason);
+  return new Response(avatar.bytes, {
+    headers: {
+      "content-type": avatar.mime,
+      "x-content-type-options": "nosniff",
+      "cache-control": "no-store",
+    },
   });
 };
 
@@ -1128,6 +1170,8 @@ export const api =
     if (path[0] === "requests") return requestRoute(db, request, path.slice(1), run);
     if (path[0] === "dots" && path[2] === "requests")
       return Promise.resolve(requestAudit(db, request, path));
+    if (path[0] === "dots" && path[2] === "avatar")
+      return Promise.resolve(avatarRoute(db, request, path));
     if (path[0] === "dots" && path[2] === "memory")
       return memoryRoute(db, request, path).catch((cause) => {
         console.error(`Memory: ${cause instanceof Error ? cause.message : String(cause)}`);

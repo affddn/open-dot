@@ -1,5 +1,6 @@
 import { and, eq, inArray, isNull, lt } from "drizzle-orm";
 import { Option, Schema } from "effect";
+import { avatarPath, avatarRevision } from "./avatar";
 import type { Db } from "./db";
 import { findDot } from "./dots";
 import { type Fetch, output } from "./feed";
@@ -818,9 +819,14 @@ export function describe(db: Db, app: SlackApp) {
         `  Its manifest is older than this open-dot, so the agent view can't get suggested prompts. Update it with: open-dot slack update ${app.dot}`,
       );
     if (app.updateNote) lines.push(`  Manifest update: ${app.updateNote}`);
+    const avatar = avatarRevision(app.dot) ? avatarPath(app.dot) : undefined;
     lines.push(
-      `  Profile picture: Slack has no API or manifest field for an app's icon, so set it yourself. Open ${appURL(app.appID)}/general, scroll to Display Information, add an image under App icon & Preview (square, 512 to 2000 pixels), then click Save Changes.`,
+      `  Profile picture: Slack has no API or manifest field for an app's icon, so set it yourself. Open ${appURL(app.appID)}/general, scroll to Display Information, upload ${avatar ?? "an image"} under App icon & Preview (square, 512 to 2000 pixels), then click Save Changes.`,
     );
+    if (!avatar)
+      lines.push(
+        `  ${app.dot} has no avatar yet. Set one with: open-dot avatar ${app.dot} <file>, then upload ${avatarPath(app.dot)}.`,
+      );
   }
   return lines.join("\n");
 }
