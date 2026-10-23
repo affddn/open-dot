@@ -7,7 +7,7 @@ import {
   SessionMessage,
 } from "@opencode/client/effect";
 import { Service } from "@opencode/client/service";
-import { Context, Data, DateTime, Effect, Layer, Schema } from "effect";
+import { Context, Data, DateTime, Effect, Layer, Schema, Stream } from "effect";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import type { RequestAnswer, RequestDetail } from "./schema";
 
@@ -117,6 +117,39 @@ export interface Pending {
   readonly id: string;
   readonly delivery: Delivery;
 }
+
+/** An assistant message of a running turn, with its text parts in order: `ordinal` indexes them. */
+export interface Written {
+  readonly id: string;
+  /** Each text part, empty until OpenCode 2.1.1 finishes it; only then does history hold its text. */
+  readonly texts: readonly string[];
+}
+
+/**
+ * A text part's live progress, from OpenCode's event stream: its start, each delta and its end.
+ * The stream is live only, so a part started before a connection can't be pieced together.
+ */
+export type TextEvent =
+  | {
+      readonly type: "started";
+      readonly sessionID: string;
+      readonly messageID: string;
+      readonly ordinal: number;
+    }
+  | {
+      readonly type: "delta";
+      readonly sessionID: string;
+      readonly messageID: string;
+      readonly ordinal: number;
+      readonly delta: string;
+    }
+  | {
+      readonly type: "ended";
+      readonly sessionID: string;
+      readonly messageID: string;
+      readonly ordinal: number;
+      readonly text: string;
+    };
 
 export interface Turn {
   readonly outcome: "succeeded" | "failed" | "interrupted";
@@ -303,6 +336,15 @@ export class OpenCode extends Context.Service<
     /** The first turn that ended after the message, or undefined while none has. */
     readonly turnAfter: (ref: MessageRef) => Effect.Effect<Turn | undefined, OpenCodeError>;
     /**
+     * The assistant messages of the turn after the message so far, while it runs, each with its text
+     * parts. Undefined once it has ended, or while the message isn't in the history.
+     */
+    readonly turnSoFar: (
+      ref: MessageRef,
+    ) => Effect.Effect<readonly Written[] | undefined, OpenCodeError>;
+    /** Every session's text parts as they're written, and nothing else: no reasoning or tools. */
+    readonly textEvents: Stream.Stream<TextEvent, OpenCodeError>;
+    /**
      * Stops the session's running turn without resuming anything. Queued input stays parked in its
      * inbox until something wakes the session again. False when nothing was running, or the
      * session doesn't exist.
@@ -408,6 +450,33 @@ export class OpenCode extends Context.Service<
           }
         });
 
+      /**
+       * The history items after the prompt, up to the idle that ends its turn, if one has. The full
+       * history in processing order: session.context would start at the latest compaction, which
+       * can hide the prompt or its idle. Undefined while the prompt isn't in the history.
+       */
+      const afterPrompt = ({ sessionID, messageID }: MessageRef) =>
+        Effect.gen(function* () {
+          const limit = 200;
+          const items: SessionMessage.Info[] = [];
+          let prompted = false;
+          let cursor: string | undefined;
+          for (;;) {
+            const page = yield* client.message.list(
+              cursor
+                ? { sessionID: Session.ID.make(sessionID), cursor, limit }
+                : { sessionID: Session.ID.make(sessionID), order: "asc", limit },
+            );
+            for (const item of page.data) {
+              if (!prompted) prompted = item.id === messageID;
+              else if (item.type === "idle") return { items, idle: item };
+              else items.push(item);
+            }
+            if (page.data.length < limit) return prompted ? { items, idle: undefined } : undefined;
+            cursor = page.cursor.next;
+          }
+        });
+
       return {
         sessionExists: (sessionID) =>
           client.session.get({ sessionID: Session.ID.make(sessionID) }).pipe(
@@ -462,30 +531,65 @@ export class OpenCode extends Context.Service<
           Effect.map((active) => new Set<string>(Object.keys(active))),
           Effect.mapError(failed("Could not list running sessions")),
         ),
-        turnAfter: ({ sessionID, messageID }) =>
-          Effect.gen(function* () {
-            // The full history in processing order. session.context would start at the latest
-            // compaction, which can hide the prompt or its idle.
-            const limit = 200;
-            const turn: SessionMessage.Info[] = [];
-            let prompted = false;
-            let cursor: string | undefined;
-            for (;;) {
-              const page = yield* client.message.list(
-                cursor
-                  ? { sessionID: Session.ID.make(sessionID), cursor, limit }
-                  : { sessionID: Session.ID.make(sessionID), order: "asc", limit },
-              );
-              for (const item of page.data) {
-                if (!prompted) prompted = item.id === messageID;
-                else if (item.type === "idle")
-                  return { outcome: item.outcome, text: lastText(turn), end: item.id };
-                else turn.push(item);
-              }
-              if (page.data.length < limit) return undefined;
-              cursor = page.cursor.next;
-            }
-          }).pipe(Effect.mapError(failed(`Could not read session ${sessionID}`))),
+        turnAfter: (ref) =>
+          afterPrompt(ref).pipe(
+            Effect.map((found) =>
+              found?.idle
+                ? { outcome: found.idle.outcome, text: lastText(found.items), end: found.idle.id }
+                : undefined,
+            ),
+            Effect.mapError(failed(`Could not read session ${ref.sessionID}`)),
+          ),
+        turnSoFar: (ref) =>
+          afterPrompt(ref).pipe(
+            Effect.map((found) =>
+              found && !found.idle
+                ? found.items.flatMap((item) =>
+                    item.type === "assistant"
+                      ? [
+                          {
+                            id: item.id,
+                            texts: item.content.flatMap((part) =>
+                              part.type === "text" ? [part.text] : [],
+                            ),
+                          },
+                        ]
+                      : [],
+                  )
+                : undefined,
+            ),
+            Effect.mapError(failed(`Could not read session ${ref.sessionID}`)),
+          ),
+        textEvents: client.event.subscribe().pipe(
+          Stream.map((event): TextEvent | undefined =>
+            event.type === "session.text.started"
+              ? {
+                  type: "started",
+                  sessionID: event.data.sessionID,
+                  messageID: event.data.assistantMessageID,
+                  ordinal: event.data.ordinal,
+                }
+              : event.type === "session.text.delta"
+                ? {
+                    type: "delta",
+                    sessionID: event.data.sessionID,
+                    messageID: event.data.assistantMessageID,
+                    ordinal: event.data.ordinal,
+                    delta: event.data.delta,
+                  }
+                : event.type === "session.text.ended"
+                  ? {
+                      type: "ended",
+                      sessionID: event.data.sessionID,
+                      messageID: event.data.assistantMessageID,
+                      ordinal: event.data.ordinal,
+                      text: event.data.text,
+                    }
+                  : undefined,
+          ),
+          Stream.filter((event): event is TextEvent => event !== undefined),
+          Stream.mapError(failed("Could not follow OpenCode's text events")),
+        ),
         interrupt: (sessionID) =>
           client.session.interrupt({ sessionID: Session.ID.make(sessionID), resume: false }).pipe(
             Effect.map((result) => result.interrupted),

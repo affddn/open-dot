@@ -523,9 +523,25 @@ export const slackApps = sqliteTable("slack_apps", {
   botUser: text("bot_user"),
   // What the owner should know or do, as the daemon last saw it.
   problem: text(),
+  // The owner's suggested prompts for the agent view. Null uses ones made from the dot's purpose.
+  prompts: text({ mode: "json" }).$type<readonly SuggestedPrompt[]>(),
+  // The manifest version open-dot knows the app has. Null is the first, from before version 2.
+  manifestVersion: integer("manifest_version"),
+  // The owner's last `open-dot slack update`. "updating" is saved just before apps.manifest.update,
+  // and "unknown" means its answer was lost, so the next update checks the export, never resends.
+  updateState: text("update_state", { enum: ["updating", "unknown", "failed"] }),
+  updateAt: integer("update_at"),
+  // What the owner should do after it, such as reinstalling to approve new events.
+  updateNote: text("update_note"),
   createdAt: integer("created_at").notNull(),
   updatedAt: integer("updated_at").notNull(),
 });
+
+/** One suggested prompt in a dot's agent view. */
+export interface SuggestedPrompt {
+  readonly title: string;
+  readonly message: string;
+}
 
 export type SlackApp = typeof slackApps.$inferSelect;
 
@@ -563,7 +579,8 @@ export const slackEvents = sqliteTable(
       .references(() => dots.name),
     // "mention": the owner mentioned the dot in a channel. "dm": the owner wrote in its DM.
     // "outsider": someone else did either. "report": a worker's report for the owner's DM.
-    kind: text({ enum: ["mention", "dm", "outsider", "report"] }).notNull(),
+    // "prompts": the owner opened the agent view, so it gets the dot's suggested prompts.
+    kind: text({ enum: ["mention", "dm", "outsider", "report", "prompts"] }).notNull(),
     eventID: text("event_id"),
     channel: text(),
     ts: text(),
@@ -578,6 +595,23 @@ export const slackEvents = sqliteTable(
     replyID: text("reply_id"),
     replyText: text("reply_text"),
     replyTS: text("reply_ts"),
+    // When the "is thinking…" status was last set on the DM thread. Null once it's cleared.
+    statusAt: integer("status_at"),
+    // The reply streamed while the turn runs. "starting": the stream's marker ID is saved just
+    // before chat.startStream, so a lost answer is only looked up by that marker. "open": Slack
+    // confirmed it, and stream_text holds what it shows. "appending": an append may be in flight.
+    // "broken": an append's outcome was lost, so nothing more is appended. "stopping" and "stopped":
+    // the stream is being or was stopped, before the final text replaces it with chat.update.
+    // "denied": Slack refused to start it, so the reply is posted the usual way.
+    stream: text({
+      enum: ["starting", "open", "appending", "broken", "stopping", "stopped", "denied"],
+    }),
+    streamID: text("stream_id"),
+    streamTS: text("stream_ts"),
+    streamText: text("stream_text"),
+    // The agent view thread's title, saved before the one call that sets it. Empty for a thread
+    // that never gets one, such as one from before titles.
+    title: text(),
     // "new" waits to be queued to the dot. "waiting" waits for its turn to end. "posting" means
     // the reply is surely not posted yet, and "unknown" that a post may have happened, so it's only
     // looked up. "answered" shares a later DM's reply. "done" is an outsider's handled message.

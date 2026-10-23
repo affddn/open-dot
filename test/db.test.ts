@@ -32,6 +32,9 @@ import {
 
 const repoMigrations = join(import.meta.dir, "..", "drizzle");
 
+// 0024 appends columns to these, so earlier migrations' tests compare only their first columns.
+const polished = ["slack_apps", "slack_events"];
+
 type LedgerRow = { seq: number; id: unknown; hash: string; created_at: number };
 
 function ledgerOf(sqlite: Database) {
@@ -466,7 +469,7 @@ test("0016 adds only nullable outbox files and preserves every 0015 column, row 
         });
       } else expect(after.slice(0, stored.length)).toEqual(stored);
       // Only 0020 adds columns elsewhere.
-      if (!["outbox", "notes", "reminders", "responsibilities"].includes(name))
+      if (!["outbox", "notes", "reminders", "responsibilities", ...polished].includes(name))
         expect(after).toHaveLength(stored.length);
     }
     expect(db.select().from(outbox).get()?.files).toBeNull();
@@ -641,7 +644,7 @@ test("0018 adds only nullable outbox delivery and preserves every 0017 table, co
       const stored = columns.get(name);
       assert(stored, `Missing stored columns for ${name}`);
       const after = db.$client.query(`pragma table_info("${name}")`).all();
-      if (["notes", "reminders", "responsibilities"].includes(name))
+      if (["notes", "reminders", "responsibilities", ...polished].includes(name))
         expect(after.slice(0, stored.length)).toEqual(stored);
       else if (name !== "outbox") expect(after).toEqual(stored);
       else {
@@ -732,7 +735,7 @@ test("0019 adds only recent_reactions and preserves every 0018 table, column, ro
       assert(stored, `Missing stored columns for ${name}`);
       const after = db.$client.query(`pragma table_info("${name}")`).all();
       // 0020 to 0022 append columns to these.
-      if (["notes", "reminders", "responsibilities", "outbox"].includes(name))
+      if (["notes", "reminders", "responsibilities", "outbox", ...polished].includes(name))
         expect(after.slice(0, stored.length)).toEqual(stored);
       else expect(after).toEqual(stored);
     }
@@ -841,7 +844,7 @@ test("0020 adds memory versions that legacy writers still advance, and keeps eve
     ]);
     expect(added("outbox").map((column) => column.name)).toEqual(["supervision"]);
     for (const name of tables.filter(
-      (table) => !["notes", "reminders", "responsibilities", "outbox"].includes(table),
+      (table) => !["notes", "reminders", "responsibilities", "outbox", ...polished].includes(table),
     ))
       expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(
         columns.get(name) ?? [],
@@ -1062,7 +1065,8 @@ test("0022 adds supervisions and a nullable outbox.supervision, and keeps every 
     for (const name of tables) {
       const after = db.$client.query(`pragma table_info("${name}")`).all();
       expect(after.slice(0, columns.get(name)?.length)).toEqual(columns.get(name) ?? []);
-      if (name !== "outbox") expect(after).toHaveLength(columns.get(name)?.length ?? 0);
+      if (name !== "outbox" && !polished.includes(name))
+        expect(after).toHaveLength(columns.get(name)?.length ?? 0);
     }
     expect(
       db.$client.query(`pragma table_info("outbox")`).all().slice(columns.get("outbox")?.length),
@@ -1134,10 +1138,12 @@ test("0023 adds only requests, one row per session, kind and request, and keeps 
   let db = openDatabase(path);
   try {
     expect(tableNames(db.$client)).toEqual([...tables, "requests"].toSorted());
-    for (const name of tables)
-      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(
-        columns.get(name) ?? [],
-      );
+    for (const name of tables) {
+      const after = db.$client.query(`pragma table_info("${name}")`).all();
+      if (polished.includes(name))
+        expect(after.slice(0, columns.get(name)?.length)).toEqual(columns.get(name) ?? []);
+      else expect(after).toEqual(columns.get(name) ?? []);
+    }
     expect(rows(db.$client)).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
     expectLedger(db.$client, ledger, "0023");
@@ -1155,6 +1161,90 @@ test("0023 adds only requests, one row per session, kind and request, and keeps 
     db.$client.close();
     db = openDatabase(path);
     expectLedger(db.$client, ledger, "0023");
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0024 appends nullable Slack polish columns, keeps every 0023 row, and leaves old DM threads untitled", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-slack-polish-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0024");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run(
+    "insert into slack_apps (dot,state,app_id,team_id,owner_id,created_at,updated_at) values ('jojo','active','AJOJO','T1','UOWNER',1,1)",
+  );
+  for (const [kind, ts, state] of [
+    ["dm", "1.000001", "posted"],
+    ["dm", "1.000002", "waiting"],
+    ["mention", "1.000003", "posted"],
+  ])
+    old.run(
+      `insert into slack_events (app,dot,kind,channel,ts,thread,state,created_at) values ('AJOJO','jojo','${kind}','DJ','${ts}','${ts}','${state}',1)`,
+    );
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
+  );
+  const rows = (sqlite: Database, name: string) =>
+    sqlite
+      .query(
+        `select ${(columns.get(name) as { name: string }[]).map((c) => `"${c.name}"`).join(",")} from "${name}"`,
+      )
+      .all();
+  const before = tables.map((name) => [name, rows(old, name)]);
+  const ledger = ledgerOf(old);
+  const triggers = triggerSQL(old);
+  old.close();
+  let db = openDatabase(path);
+  try {
+    expect(tableNames(db.$client)).toEqual(tables);
+    for (const name of tables) {
+      const after = db.$client.query<{ name: string }, []>(`pragma table_info("${name}")`).all();
+      const stored = columns.get(name) ?? [];
+      expect(after.slice(0, stored.length)).toEqual(stored as { name: string }[]);
+      const added = after.slice(stored.length).map((column) => column.name);
+      expect(added).toEqual(
+        name === "slack_apps"
+          ? ["prompts", "manifest_version", "update_state", "update_at", "update_note"]
+          : name === "slack_events"
+            ? ["status_at", "stream", "stream_id", "stream_ts", "stream_text", "title"]
+            : [],
+      );
+    }
+    expect(tables.map((name) => [name, rows(db.$client, name)])).toEqual(before);
+    expect(triggerSQL(db.$client)).toEqual(triggers);
+    expectLedger(db.$client, ledger, "0024");
+    expect(db.select().from(slackApps).get()).toMatchObject({
+      prompts: null,
+      manifestVersion: null,
+      updateState: null,
+      updateNote: null,
+    });
+    expect(
+      db
+        .select()
+        .from(slackEvents)
+        .all()
+        .map((row) => [row.kind, row.title, row.stream, row.statusAt]),
+    ).toEqual([
+      ["dm", "", null, null],
+      ["dm", "", null, null],
+      ["mention", null, null, null],
+    ]);
+    db.$client.close();
+    db = openDatabase(path);
+    expectLedger(db.$client, ledger, "0024");
   } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });

@@ -3,7 +3,7 @@ import { Option, Schema } from "effect";
 import type { Db } from "./db";
 import { findDot } from "./dots";
 import { type Fetch, output } from "./feed";
-import { type SlackApp, slackApps, slackConfig } from "./schema";
+import { type SlackApp, type SuggestedPrompt, slackApps, slackConfig } from "./schema";
 import { isRecord, type Slack } from "./slack";
 
 /** The Keychain item holding the owner's app configuration token pair, as JSON. */
@@ -25,6 +25,21 @@ export const botScopes = [
   "users:read",
 ];
 
+/**
+ * The bot events a dot's app subscribes to. The agent view's thread events, added in manifest
+ * version 2, let the dot set its suggested prompts when the owner opens a thread or its DM.
+ */
+export const botEvents = [
+  "app_mention",
+  "message.im",
+  "assistant_thread_started",
+  "assistant_thread_context_changed",
+  "app_home_opened",
+];
+
+/** The version of the manifest below. An app with an older one needs `open-dot slack update`. */
+export const manifestVersion = 2;
+
 const clip = (text: string, limit: number) =>
   text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 
@@ -44,13 +59,95 @@ export const manifest = (dot: string, purpose: string | null) => {
     },
     oauth_config: { scopes: { bot: botScopes } },
     settings: {
-      event_subscriptions: { bot_events: ["app_mention", "message.im"] },
+      event_subscriptions: { bot_events: botEvents },
       interactivity: { is_enabled: false },
       org_deploy_enabled: false,
       socket_mode_enabled: true,
       token_rotation_enabled: false,
     },
   };
+};
+
+export const promptTitleLimit = 75;
+export const promptMessageLimit = 1000;
+
+/** Prompts the agent view suggests when the owner hasn't chosen their own: two plain ones, and the purpose. */
+export const defaultPrompts = (purpose: string | null): SuggestedPrompt[] => {
+  const about = purpose?.replace(/\s+/g, " ").trim();
+  return [
+    { title: "What needs me today?", message: "What needs my attention today?" },
+    {
+      title: "Catch me up",
+      message: "Catch me up on what you're keeping track of for me, and what's next.",
+    },
+    ...(about
+      ? [
+          {
+            title: clip(about, promptTitleLimit),
+            message: clip(`Help me with this: ${about}`, promptMessageLimit),
+          },
+        ]
+      : []),
+  ];
+};
+
+/** The owner's prompts as given in a file, checked, or what's wrong with them. */
+export function checkPrompts(value: unknown): SuggestedPrompt[] | string {
+  if (!Array.isArray(value) || value.length < 2 || value.length > 4)
+    return 'Give 2 to 4 prompts, as a JSON array of { "title": …, "message": … }.';
+  const prompts: SuggestedPrompt[] = [];
+  for (const [index, item] of value.entries()) {
+    const keys = isRecord(item) ? Object.keys(item).toSorted() : [];
+    if (!isRecord(item) || keys.join() !== "message,title")
+      return `Prompt ${index + 1} needs exactly a "title" and a "message".`;
+    const title = typeof item.title === "string" ? item.title.trim() : "";
+    const message = typeof item.message === "string" ? item.message.trim() : "";
+    if (!title || title.length > promptTitleLimit || /[\n\r]/.test(title))
+      return `Prompt ${index + 1}'s title must be one line of 1 to ${promptTitleLimit} characters.`;
+    if (!message || message.length > promptMessageLimit)
+      return `Prompt ${index + 1}'s message must be 1 to ${promptMessageLimit} characters.`;
+    prompts.push({ title, message });
+  }
+  return prompts;
+}
+
+/** Saves the owner's prompts for the dot's agent view, or with null goes back to the purpose's. */
+export const setPrompts = (db: Db, dot: string, prompts: readonly SuggestedPrompt[] | null) =>
+  db
+    .update(slackApps)
+    .set({ prompts, updatedAt: Date.now() })
+    .where(eq(slackApps.dot, dot))
+    .returning({ dot: slackApps.dot })
+    .get() !== undefined;
+
+/** The prompts the dot's agent view shows now. */
+export const promptsOf = (app: SlackApp, purpose: string | null) =>
+  app.prompts ?? defaultPrompts(purpose);
+
+const union = (have: unknown, want: readonly string[]) => {
+  const list = Array.isArray(have) ? have.filter((item) => typeof item === "string") : [];
+  return [...list, ...want.filter((item) => !list.includes(item))];
+};
+
+const nested = (parent: Record<string, unknown>, key: string) => {
+  const value = parent[key];
+  if (isRecord(value)) return value;
+  const made: Record<string, unknown> = {};
+  parent[key] = made;
+  return made;
+};
+
+/**
+ * An exported manifest with what this version needs added: its bot scopes and events. Everything
+ * else is kept as Slack gave it, since apps.manifest.update replaces the whole manifest.
+ */
+export const upgraded = (exported: Record<string, unknown>) => {
+  const copy = structuredClone(exported);
+  const scopes = nested(nested(copy, "oauth_config"), "scopes");
+  scopes.bot = union(scopes.bot, botScopes);
+  const events = nested(nested(copy, "settings"), "event_subscriptions");
+  events.bot_events = union(events.bot_events, botEvents);
+  return copy;
 };
 
 const Pair = Schema.Struct({
@@ -362,6 +459,7 @@ async function create(db: Db, setup: Setup, app: SlackApp, owner: { id: string; 
       appID: answer.body.app_id,
       teamID: config.team,
       ownerID: config.user,
+      manifestVersion,
     });
     console.log(`Slack: created the app ${answer.body.app_id} for ${app.dot}`);
     return;
@@ -431,6 +529,133 @@ async function attach(db: Db, setup: Setup, app: SlackApp, owner: { id: string; 
         ? `Slack wouldn't show the app ${app.appID} to your configuration token: ${answer.error}`
         : `the app ${app.appID} isn't ${app.dot}'s: its bot isn't named ${app.dot} or it doesn't use Socket Mode`,
   });
+}
+
+/**
+ * Moves the owner's update on, only from the very state and stamp `seen` was read with. Each
+ * move stamps `update_at` past the last one, so an answer or confirmation about an older attempt
+ * never touches a newer one, even one that has already gone back to no update. Gives the new
+ * stamp, or undefined when something changed meanwhile.
+ */
+const setUpdate = (db: Db, seen: SlackApp, now: number, set: Partial<SlackApp>) => {
+  const stamp = Math.max(now, (seen.updateAt ?? 0) + 1);
+  const saved = db
+    .update(slackApps)
+    .set({ ...set, updateAt: stamp, updatedAt: Date.now() })
+    .where(
+      and(
+        eq(slackApps.dot, seen.dot),
+        seen.appID === null ? isNull(slackApps.appID) : eq(slackApps.appID, seen.appID),
+        seen.updateState === null
+          ? isNull(slackApps.updateState)
+          : eq(slackApps.updateState, seen.updateState),
+        seen.updateAt === null ? isNull(slackApps.updateAt) : eq(slackApps.updateAt, seen.updateAt),
+      ),
+    )
+    .returning({ dot: slackApps.dot })
+    .get();
+  return saved ? stamp : undefined;
+};
+
+const listAt = (from: Record<string, unknown>, path: readonly string[]) => {
+  let value: unknown = from;
+  for (const key of path) value = isRecord(value) ? value[key] : undefined;
+  return Array.isArray(value) ? value : [];
+};
+
+/** What an update adds to the exported manifest, in the owner's words. */
+const added = (before: Record<string, unknown>, after: Record<string, unknown>) =>
+  (
+    [
+      ["bot scopes", ["oauth_config", "scopes", "bot"]],
+      ["bot events", ["settings", "event_subscriptions", "bot_events"]],
+    ] as const
+  ).flatMap(([name, path]) => {
+    const had = listAt(before, path);
+    const extra = listAt(after, path).filter((item) => !had.includes(item));
+    return extra.length ? [`${name}: ${extra.join(", ")}`] : [];
+  });
+
+const reinstallNote = (appID: string, dot: string) =>
+  `Slack says the update needs your approval. Reinstall the app at ${appURL(appID)}/install-on-team (Install, then Allow). If its Bot User OAuth Token changes, save it again with: ${save(botItem(dot))}. Once that's done, run open-dot slack update ${dot} to clear this note.`;
+
+const landedNote = (appID: string, dot: string) =>
+  `The update reached Slack, but its answer was lost, so Slack may want you to reinstall the app to approve its new events: open ${appURL(appID)}/install-on-team. If Slack shows nothing to approve, there's nothing to do. Run open-dot slack update ${dot} to clear this note.`;
+
+/**
+ * Brings the dot's existing app up to this version's manifest. Only the owner's
+ * `open-dot slack update` runs it, never the daemon. The app's current manifest is exported and
+ * checked to be the dot's, and only the missing scopes and events are added, since an update
+ * replaces the whole manifest. The attempt is saved before apps.manifest.update. A lost answer
+ * is never sent again: the next run checks the export to learn whether it landed.
+ */
+export async function updateApp(
+  db: Db,
+  setup: Setup,
+  dot: string,
+  confirm: (changes: readonly string[]) => boolean | Promise<boolean>,
+) {
+  const app = db.select().from(slackApps).where(eq(slackApps.dot, dot)).get();
+  if (!app?.appID || !app.ownerID || !app.teamID || !["created", "active"].includes(app.state))
+    return `${dot} has no created Slack app to update. Run: open-dot slack status ${dot}`;
+  if (app.updateState === "updating" && setup.now() - (app.updateAt ?? 0) < 60_000)
+    return `An update of ${dot}'s app started less than a minute ago. Run this again in a minute to check how it went.`;
+  const config = await freshConfig(db, setup, { id: app.ownerID, team: app.teamID });
+  const exported = await configCall(setup, "apps.manifest.export", {
+    token: config.token,
+    app_id: app.appID,
+  });
+  if (exported.kind !== "ok")
+    return `Slack didn't show the manifest of ${app.appID} (${exported.kind === "refused" ? exported.error : "no clear answer"}), so nothing was changed. Try again later.`;
+  const current = isRecord(exported.body.manifest) ? exported.body.manifest : undefined;
+  const checked = Schema.decodeUnknownOption(Exported)(exported.body);
+  if (
+    !current ||
+    Option.isNone(checked) ||
+    checked.value.manifest.features.bot_user.display_name !== dot ||
+    checked.value.manifest.settings.socket_mode_enabled !== true
+  )
+    return `The app ${app.appID} isn't ${dot}'s: its bot isn't named ${dot} or it doesn't use Socket Mode. Nothing was changed.`;
+  const wanted = upgraded(current);
+  const pending = app.updateState === "updating" || app.updateState === "unknown";
+  if (Bun.deepEquals(wanted, current)) {
+    const note = pending ? landedNote(app.appID, dot) : null;
+    if (!setUpdate(db, app, setup.now(), { manifestVersion, updateState: null, updateNote: note }))
+      return "The app's update changed meanwhile, so nothing was saved. Run this again.";
+    return note ?? `${dot}'s app already has everything this version needs. Nothing was changed.`;
+  }
+  const changes = added(current, wanted);
+  if (pending)
+    changes.unshift("The last update didn't reach Slack: its manifest still lacks these.");
+  if (!(await confirm(changes))) return "Nothing was changed.";
+  // Claimed only if nothing moved since the export was read, so a stale export is never sent.
+  const stamp = setUpdate(db, app, setup.now(), { updateState: "updating", updateNote: null });
+  if (stamp === undefined) return "The app changed meanwhile, so nothing was sent. Run this again.";
+  const claimed: SlackApp = { ...app, updateState: "updating", updateAt: stamp };
+  const answer = await configCall(setup, "apps.manifest.update", {
+    token: config.token,
+    app_id: app.appID,
+    manifest: JSON.stringify(wanted),
+  });
+  const settle = (set: Partial<SlackApp>, said: string) =>
+    setUpdate(db, claimed, setup.now(), set)
+      ? said
+      : `A newer update of ${dot}'s app replaced this one, so its answer was ignored. Run: open-dot slack status ${dot}`;
+  if (answer.kind === "ok") {
+    // Slack says whether the new scopes or events need the owner's approval; that's kept for status.
+    const note = answer.body.permissions_updated === true ? reinstallNote(app.appID, dot) : null;
+    return settle(
+      { updateState: null, manifestVersion, updateNote: note },
+      `Updated ${dot}'s app. ${note ?? "Slack needs no reinstall for it."}`,
+    );
+  }
+  if (answer.kind === "refused" && !maybeDone.has(answer.error)) {
+    const details = errorsOf(answer.body);
+    const note = `Slack refused the manifest update: ${answer.error}${details ? ` (${details})` : ""}. Nothing changed in Slack.`;
+    return settle({ updateState: "failed", updateNote: note }, note);
+  }
+  const note = `The manifest update got no clear answer, so it may have landed. It's never sent again on its own: run open-dot slack update ${dot} to check the app's manifest with Slack.`;
+  return settle({ updateState: "unknown", updateNote: note }, note);
 }
 
 /**
@@ -574,9 +799,8 @@ export function describe(db: Db, app: SlackApp) {
       if (!app.appID) break;
       lines.push(
         `  1. Install it: open ${appURL(app.appID)}/install-on-team, click Install, then Allow.`,
-        `  2. Optionally set its icon under Display Information at ${appURL(app.appID)}/general.`,
-        `  3. Under App-Level Tokens at ${appURL(app.appID)}/general, generate a token with the connections:write scope.`,
-        `  4. Save the Bot User OAuth Token (xoxb-…, from ${appURL(app.appID)}/oauth) and the app-level token (xapp-…). Each command asks for the token without echoing it:`,
+        `  2. Under App-Level Tokens at ${appURL(app.appID)}/general, generate a token with the connections:write scope.`,
+        `  3. Save the Bot User OAuth Token (xoxb-…, from ${appURL(app.appID)}/oauth) and the app-level token (xapp-…). Each command asks for the token without echoing it:`,
         `     ${save(botItem(app.dot))}`,
         `     ${save(appItem(app.dot))}`,
         "  The daemon reads them within a minute, checks they belong to this app, and connects.",
@@ -587,6 +811,16 @@ export function describe(db: Db, app: SlackApp) {
         `  Connected as <@${app.botUser ?? "?"}>. Invite it to a channel with /invite @${app.dot}, then mention it there, or DM it.`,
       );
       break;
+  }
+  if (app.appID && (app.state === "created" || app.state === "active")) {
+    if ((app.manifestVersion ?? 1) < manifestVersion && app.updateState === null)
+      lines.push(
+        `  Its manifest is older than this open-dot, so the agent view can't get suggested prompts. Update it with: open-dot slack update ${app.dot}`,
+      );
+    if (app.updateNote) lines.push(`  Manifest update: ${app.updateNote}`);
+    lines.push(
+      `  Profile picture: Slack has no API or manifest field for an app's icon, so set it yourself. Open ${appURL(app.appID)}/general, scroll to Display Information, add an image under App icon & Preview (square, 512 to 2000 pixels), then click Save Changes.`,
+    );
   }
   return lines.join("\n");
 }

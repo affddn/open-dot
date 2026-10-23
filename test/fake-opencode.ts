@@ -1,4 +1,4 @@
-import { Effect, Layer } from "effect";
+import { Cause, Effect, Layer, Queue, Stream } from "effect";
 import {
   type Attachment,
   type Delivery,
@@ -6,6 +6,8 @@ import {
   OpenCode,
   OpenCodeError,
   type SessionInput,
+  type TextEvent,
+  type Written,
   type Turn,
   type ThreadsWorker,
   type TurnEnd,
@@ -49,6 +51,17 @@ export function fakeOpenCode() {
     active: new Set<string>(),
     turns: new Map<string, Omit<Turn, "end"> & { end?: string }>(),
     messageTurns: new Map<string, Turn>(),
+    // What each message's running turn has written so far, until its turn ends: as its assistant
+    // messages' text parts, or as one finished part of one message.
+    written: new Map<string, Written[]>(),
+    soFar: new Map<string, string>(),
+    // Each text event connection, in order: a test emits into it, ends it or fails it.
+    subscribers: [] as {
+      open: boolean;
+      emit: (event: TextEvent) => void;
+      end: () => void;
+      fail: () => void;
+    }[],
     readFailure: false,
     lookupFailure: false,
     onMessage: () => {},
@@ -122,6 +135,32 @@ export function fakeOpenCode() {
               return turn && { end: `idle_${messageID}`, ...turn };
             }),
       ),
+    turnSoFar: ({ sessionID, messageID }) =>
+      Effect.suspend(() =>
+        state.readFailure
+          ? broken("history unavailable")
+          : Effect.sync(() => {
+              if (state.messageTurns.has(messageID) || state.turns.has(sessionID)) return undefined;
+              if (!state.messages.has(messageID)) return undefined;
+              const written = state.written.get(messageID);
+              if (written) return written;
+              const soFar = state.soFar.get(messageID);
+              return soFar === undefined ? [] : [{ id: `msg_reply_${messageID}`, texts: [soFar] }];
+            }),
+      ),
+    textEvents: Stream.callback<TextEvent, OpenCodeError>((queue) =>
+      Effect.gen(function* () {
+        const subscriber = {
+          open: true,
+          emit: (event: TextEvent) => void Queue.offerUnsafe(queue, event),
+          end: () => void Queue.endUnsafe(queue),
+          fail: () =>
+            void Queue.failCauseUnsafe(queue, Cause.fail(new OpenCodeError({ message: "reset" }))),
+        };
+        state.subscribers.push(subscriber);
+        yield* Effect.addFinalizer(() => Effect.sync(() => (subscriber.open = false)));
+      }),
+    ),
     interrupt: (sessionID) =>
       Effect.suspend(() => {
         if (state.interrupt === "fail") return broken("connection refused");

@@ -341,6 +341,7 @@ export const HistoryMessage = Schema.Struct({
   thread_ts: Schema.optionalKey(Schema.String),
   text: Schema.optionalKey(Schema.String),
   metadata: Schema.optionalKey(Schema.Unknown),
+  blocks: Schema.optionalKey(Schema.Unknown),
 });
 
 export const History = Schema.Struct({

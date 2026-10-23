@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { randomBytes } from "node:crypto";
-import { renameSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { Effect, Schedule } from "effect";
 import { api } from "./api";
@@ -23,15 +23,20 @@ import {
 } from "./supervise";
 import {
   attachApp,
+  checkPrompts,
   configItem,
   configSaved,
   describe,
   noticesLine,
+  promptsOf,
   provision,
   readHidden,
+  realSetup,
   requestApp,
   saveSecret,
   setNotices,
+  setPrompts,
+  updateApp,
 } from "./slack-setup";
 
 const usage = `Usage:
@@ -47,6 +52,9 @@ const usage = `Usage:
   open-dot slack attach <name> <app ID>
                                      Adopt an app whose creation had no clear answer
   open-dot slack status [name]       Show each dot's Slack app and what to do next
+  open-dot slack update <name>       Add this version's events to the dot's existing app, once you confirm
+  open-dot slack prompts <name> [<file.json> | --reset]
+                                     Show or set the 2 to 4 prompts the dot's agent view suggests
   open-dot slack notices enable|disable
                                      Turn on or off the shared app's one note to others who DM it
   open-dot watch add <name> <session ID> [--send] [--busy-minutes N]
@@ -160,6 +168,62 @@ const slackCommand = (sub: string | undefined, name: string | undefined, rest: s
       const app = requestApp(db, name, rest.includes("--retry"));
       if (app) console.log(describe(db, app));
     });
+  if (sub === "prompts") {
+    const app = db.select().from(slackApps).where(eq(slackApps.dot, name)).get();
+    if (!app)
+      return fail(`${name} has no Slack app of its own. Run: open-dot slack connect ${name}`);
+    if (rest[0] === "--reset" && rest.length === 1)
+      return Effect.sync(() => {
+        setPrompts(db, name, null);
+        console.log(`${name}'s agent view suggests prompts made from its purpose again.`);
+      });
+    if (rest.length === 0)
+      return Effect.sync(() =>
+        console.log(JSON.stringify(promptsOf(app, findDot(db, name)?.purpose ?? null), null, 2)),
+      );
+    if (rest.length !== 1 || !rest[0]) return fail(usage);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(rest[0], "utf8"));
+    } catch (error) {
+      return fail(
+        `Couldn't read ${rest[0]} as JSON: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const prompts = checkPrompts(parsed);
+    if (typeof prompts === "string") return fail(`${prompts} Nothing changed.`);
+    return Effect.sync(() => {
+      setPrompts(db, name, prompts);
+      console.log(
+        `Saved ${prompts.length} prompts. ${name}'s agent view shows them the next time you open it.`,
+      );
+    });
+  }
+  if (sub === "update" && rest.length === 0) {
+    if (!process.stdin.isTTY)
+      return fail(
+        "Run this in a terminal: an app update needs you to confirm it. Nothing changed.",
+      );
+    return Effect.promise(() =>
+      updateApp(db, realSetup, name, (changes) => {
+        console.log(`This adds to ${name}'s app manifest, keeping everything else in it:`);
+        for (const change of changes) console.log(`  ${change}`);
+        return confirmed("Update the app in Slack?");
+      }).then(
+        (said) => ({ said, failed: false }),
+        (error: unknown) => ({
+          said: error instanceof Error ? error.message : String(error),
+          failed: true,
+        }),
+      ),
+    ).pipe(
+      Effect.andThen(({ said, failed }) =>
+        failed
+          ? fail(`Couldn't update ${name}'s app: ${said}`)
+          : Effect.sync(() => console.log(said)),
+      ),
+    );
+  }
   if (sub === "attach" && rest[0])
     return attachApp(db, name, rest[0])
       ? Effect.sync(() =>
@@ -324,6 +388,8 @@ const daemon = Effect.sync(() => console.log(`open-dot daemon watching ${databas
         daemonLoops(db, OpenCode.layer),
         Effect.repeat(converse, Schedule.spaced("3 seconds")),
         Effect.repeat(agents.tick, Schedule.spaced("3 seconds")),
+        // Only while a dot's own app is active; it only keeps text for the tick to stream.
+        agents.events,
         Effect.repeat(setUp, Schedule.spaced("10 seconds")),
         Effect.repeat(tellOutsiders, Schedule.spaced("1 minute")),
         // GitHub asks clients to poll notifications at most once a minute.

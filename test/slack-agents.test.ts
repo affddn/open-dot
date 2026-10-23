@@ -1,7 +1,7 @@
 import { beforeEach, expect, spyOn, test } from "bun:test";
 import assert from "node:assert/strict";
 import { eq } from "drizzle-orm";
-import { Effect } from "effect";
+import { Effect, Fiber, Layer } from "effect";
 import { advanceWorkers, claimDue, step } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
 import {
@@ -19,7 +19,10 @@ import { receive, sharedNotices, slackChat, slackClient } from "../src/slack";
 import { type Socket, slackAgents } from "../src/slack-agents";
 import {
   attachApp,
+  botScopes,
+  checkPrompts,
   configItem,
+  defaultPrompts,
   configSaved,
   describe,
   noticesLine,
@@ -27,7 +30,10 @@ import {
   readHidden,
   requestApp,
   setNotices,
+  setPrompts,
+  updateApp,
 } from "../src/slack-setup";
+import { OpenCode, OpenCodeError, type TextEvent } from "../src/opencode";
 import { fakeOpenCode } from "./fake-opencode";
 
 // Fake IDs and tokens only.
@@ -91,6 +97,22 @@ function fakeSlack() {
     // While set, apps.manifest.export waits for it before answering.
     exportGate: undefined as Promise<void> | undefined,
     onExport: () => {},
+    // The agent view's methods: each status, prompts and title call, in order.
+    assistant: [] as { method: string; params: Record<string, string> }[],
+    title: "ok" as Mode,
+    // Streaming: each method's mode. "refused" refuses as Slack does where it won't stream.
+    start: "ok" as Mode,
+    append: "ok" as Mode,
+    stop: "ok" as Mode,
+    edit: "ok" as Mode,
+    // Each streamed message's ts, while it streams.
+    streaming: new Set<string>(),
+    update: "ok" as Mode,
+    onUpdate: () => {},
+    // While set, apps.manifest.update waits for it before doing anything.
+    updateGate: undefined as Promise<void> | undefined,
+    updated: [] as unknown[],
+    permissionsUpdated: false,
   };
   // After every ts a test writes by hand, as Slack's ts only grows.
   let clock = 1000;
@@ -104,6 +126,21 @@ function fakeSlack() {
       has_more: more,
       response_metadata: { next_cursor: more ? String(start + size) : "" },
     };
+  };
+  /** A bot message in its thread, as Slack keeps it. */
+  const find = (channel = "", messageTS = "") =>
+    [...state.threads.entries()]
+      .filter(([key]) => key.startsWith(`${channel} `))
+      .flatMap(([, messages]) => messages)
+      .find((message) => message.ts === messageTS);
+  // Answers as each mode says: "lost" and "internal" after doing it, "dropped" without.
+  const outcome = async (mode: Mode, act: () => Response) => {
+    if (mode === "dropped") throw new Error("connection reset");
+    if (mode === "refused") return json({ ok: false, error: "channel_type_not_supported" });
+    const answer = act();
+    if (mode === "lost") throw new Error("connection reset");
+    if (mode === "internal") return json({ ok: false, error: "internal_error" });
+    return answer;
   };
   const fetch = async (url: string, init: RequestInit) => {
     const method = url.split("/").at(-1) ?? "";
@@ -186,6 +223,81 @@ function fakeSlack() {
         if (state.post === "internal") return json({ ok: false, error: "internal_error" });
         return json({ ok: true, ts: posted.ts });
       }
+      case "assistant.threads.setStatus":
+      case "assistant.threads.setSuggestedPrompts":
+        state.assistant.push({ method, params });
+        return json({ ok: true });
+      case "assistant.threads.setTitle":
+        state.assistant.push({ method, params });
+        return outcome(state.title, () => json({ ok: true }));
+      case "chat.startStream":
+        return outcome(state.start, () => {
+          const chunks = JSON.parse(params.chunks ?? "[]") as Record<string, unknown>[];
+          const posted: Message = {
+            ts: next(),
+            user: bot?.user,
+            bot_id: bot?.bot,
+            text: chunks
+              .flatMap((chunk) => (chunk.type === "markdown_text" ? [chunk.text] : []))
+              .join(""),
+            blocks: chunks.flatMap((chunk) =>
+              chunk.type === "blocks" ? (chunk.blocks as unknown[]) : [],
+            ),
+          };
+          const key = `${params.channel} ${params.thread_ts}`;
+          state.threads.set(key, [...(state.threads.get(key) ?? []), posted]);
+          state.streaming.add(posted.ts);
+          return json({ ok: true, channel: params.channel, ts: posted.ts });
+        });
+      case "chat.appendStream": {
+        const message = find(params.channel, params.ts);
+        if (!message || !state.streaming.has(message.ts))
+          return json({ ok: false, error: "message_not_in_streaming_state" });
+        return outcome(state.append, () => {
+          const chunks = JSON.parse(params.chunks ?? "[]") as { text: string }[];
+          message.text = `${typeof message.text === "string" ? message.text : ""}${chunks.map((chunk) => chunk.text).join("")}`;
+          return json({ ok: true });
+        });
+      }
+      case "chat.stopStream": {
+        const message = find(params.channel, params.ts);
+        if (!message || !state.streaming.has(message.ts))
+          return json({ ok: false, error: "message_not_in_streaming_state" });
+        return outcome(state.stop, () => {
+          state.streaming.delete(message.ts);
+          return json({ ok: true });
+        });
+      }
+      case "chat.update": {
+        const message = find(params.channel, params.ts);
+        if (!message) return json({ ok: false, error: "message_not_found" });
+        if (state.streaming.has(message.ts))
+          return json({ ok: false, error: "streaming_state_conflict" });
+        // Slack's limits: 4,000 characters of text, and 12,000 in a markdown block.
+        if ((params.text ?? "").length > 4000) return json({ ok: false, error: "msg_too_long" });
+        const blocks = JSON.parse(params.blocks ?? "[]") as { text: string }[];
+        if (blocks.some((block) => block.text.length > 12_000))
+          return json({ ok: false, error: "invalid_blocks" });
+        return outcome(state.edit, () => {
+          message.blocks = blocks;
+          message.text = blocks.map((block) => block.text).join("");
+          message.metadata = JSON.parse(params.metadata ?? "{}");
+          return json({ ok: true, ts: message.ts });
+        });
+      }
+      case "apps.manifest.update":
+        state.onUpdate();
+        if (state.updateGate) await state.updateGate;
+        return outcome(state.update, () => {
+          const manifest: unknown = JSON.parse(params.manifest ?? "null");
+          state.updated.push(manifest);
+          state.exported.set(params.app_id ?? "", manifest);
+          return json({
+            ok: true,
+            app_id: params.app_id,
+            permissions_updated: state.permissionsUpdated,
+          });
+        });
       case "chat.postEphemeral":
         state.ephemerals.push(params);
         if (state.ephemeral === "lost") throw new Error("connection reset");
@@ -269,13 +381,14 @@ let agents: ReturnType<typeof slackAgents>;
 let shared: ReturnType<typeof slackClient>;
 
 /** The daemon's per-dot app runtime, as a fresh daemon starts it. */
-const start = () =>
-  slackAgents(db, opencode.layer, {
-    fetch: fake.fetch,
-    read: async (service) => fake.state.keychain.get(service),
-    socket: fake.socket,
-    now: () => time,
-  });
+const deps = () => ({
+  fetch: fake.fetch,
+  read: async (service: string) => fake.state.keychain.get(service),
+  socket: fake.socket,
+  now: () => time,
+  pause: 1,
+});
+const start = () => slackAgents(db, opencode.layer, deps());
 
 const setup = () => ({
   fetch: fake.fetch,
@@ -403,10 +516,21 @@ test("connecting creates the app once from its manifest, saving its intent first
       },
       settings: {
         socket_mode_enabled: true,
-        event_subscriptions: { bot_events: ["app_mention", "message.im"] },
+        event_subscriptions: {
+          bot_events: [
+            "app_mention",
+            "message.im",
+            "assistant_thread_started",
+            "assistant_thread_context_changed",
+            "app_home_opened",
+          ],
+        },
       },
     },
   ]);
+  // No static prompts: the daemon sets them when a thread opens.
+  expect(JSON.stringify(fake.state.manifests)).not.toContain("suggested_prompts");
+  expect(app()?.manifestVersion).toBe(2);
   // The rotated pair replaced the old one in its one Keychain item, and nothing secret is in the DB.
   expect(JSON.parse(fake.state.keychain.get(configItem) ?? "{}")).toMatchObject({
     token: "xoxe.xoxp-1-t1",
@@ -1361,3 +1485,983 @@ test("a late answer about one attached app never validates or resets another att
   });
   expect(fake.state.manifests).toEqual([]);
 });
+
+/** The owner's DM to the dot's app, top-level or in a thread. */
+const dm = (n: number, words: string, thread?: number) =>
+  send({
+    type: "message",
+    channel_type: "im",
+    channel: "DJ",
+    user: owner,
+    text: words,
+    ts: ts(n),
+    ...(thread !== undefined && { thread_ts: ts(thread) }),
+  });
+const calls = (method: string) =>
+  fake.state.requests.filter((request) => request.method === method).map(({ params }) => params);
+const statuses = () =>
+  fake.state.assistant
+    .filter(({ method }) => method === "assistant.threads.setStatus")
+    .map(({ params }) => params);
+const botMessages = (key: string) =>
+  (fake.state.threads.get(key) ?? []).filter((message) => message.bot_id === botID);
+const quiet = <T>(run: () => Promise<T>) => {
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  return run().finally(() => errors.mockRestore());
+};
+
+test("a DM thread shows the thinking status once its turn runs, and it's cleared after the reply, a failure and a restart", () =>
+  quiet(async () => {
+    await connected();
+    fake.state.start = "refused";
+    dm(10, "hi");
+    await tick();
+    // Queued, but not admitted yet: no status.
+    expect(statuses()).toEqual([]);
+    await deliver();
+    await tick();
+    expect(statuses()).toEqual([{ channel_id: "DJ", thread_ts: ts(10), status: "is thinking…" }]);
+    // Kept up once a minute while the turn runs, also by a restarted daemon.
+    await tick();
+    expect(statuses()).toHaveLength(1);
+    agents.stop();
+    agents = start();
+    time += 61_000;
+    await tick();
+    expect(statuses()).toHaveLength(2);
+
+    // The turn fails: the reply says so, and the status is cleared after it, even across a restart.
+    const [prompt] = prompts();
+    assert(prompt);
+    opencode.state.messageTurns.set(prompt.messageID, {
+      end: "idle_1",
+      outcome: "failed",
+      text: undefined,
+    });
+    agents.stop();
+    agents = start();
+    await tick();
+    expect(events()[0]).toMatchObject({ state: "posted", replyText: "(no reply: failed)" });
+    expect(statuses().at(-1)).toEqual({ channel_id: "DJ", thread_ts: ts(10), status: "" });
+    expect(events()[0]?.statusAt).toBeNull();
+    await tick();
+    expect(statuses()).toHaveLength(3);
+
+    // A channel mention gets no status.
+    send({ type: "app_mention", channel: "C1", user: owner, text: "look", ts: ts(20), team });
+    await tick();
+    await deliver();
+    await tick();
+    expect(statuses()).toHaveLength(3);
+  }));
+
+test("the agent view suggests the purpose's prompts, or the owner's own, only for the owner", async () => {
+  await connected();
+  const started = (user: string, n: number) =>
+    send({
+      type: "assistant_thread_started",
+      assistant_thread: {
+        user_id: user,
+        channel_id: "DJ",
+        thread_ts: ts(n),
+        context: { channel_id: "CSECRET" },
+      },
+      event_ts: ts(n),
+    });
+  started("UFRIEND", 1);
+  started(owner, 2);
+  await tick();
+  await tick();
+  const set = fake.state.assistant.filter(
+    ({ method }) => method === "assistant.threads.setSuggestedPrompts",
+  );
+  expect(set).toHaveLength(1);
+  // An agent view app's call with thread_ts silently does nothing, so there's none.
+  expect(set[0]?.params.thread_ts).toBeUndefined();
+  expect(set[0]?.params.channel_id).toBe("DJ");
+  const shown = JSON.parse(set[0]?.params.prompts ?? "[]") as { title: string; message: string }[];
+  expect(shown.length).toBeGreaterThanOrEqual(2);
+  expect(shown.length).toBeLessThanOrEqual(4);
+  expect(shown.at(-1)).toEqual({
+    title: "Keep me <on> track & honest.",
+    message: "Help me with this: Keep me <on> track & honest.",
+  });
+  // The thread's context isn't kept.
+  expect(everything()).not.toContain("CSECRET");
+
+  // Prompts made from any purpose pass the same checks as the owner's own.
+  expect(Array.isArray(checkPrompts(defaultPrompts("x".repeat(1500))))).toBe(true);
+  // The owner's own prompts, checked first, show the next time the Messages tab opens.
+  expect(checkPrompts([{ title: "One", message: "Only one" }])).toContain("2 to 4");
+  expect(
+    checkPrompts([
+      { title: "A", message: "a" },
+      { title: "B", message: "b", extra: true },
+    ]),
+  ).toContain("exactly");
+  const mine = checkPrompts([
+    { title: " Plan ", message: "Plan my day." },
+    { title: "Inbox", message: "What's in my inbox?" },
+  ]);
+  assert(typeof mine !== "string");
+  expect(setPrompts(db, "jotaro", mine)).toBe(true);
+  send({ type: "app_home_opened", user: owner, channel: "DJ", tab: "home", event_ts: ts(3) });
+  send({ type: "app_home_opened", user: owner, channel: "DJ", tab: "messages", event_ts: ts(4) });
+  await tick();
+  const latest = fake.state.assistant.filter(
+    ({ method }) => method === "assistant.threads.setSuggestedPrompts",
+  );
+  expect(latest).toHaveLength(2);
+  expect(JSON.parse(latest[1]?.params.prompts ?? "[]")).toEqual([
+    { title: "Plan", message: "Plan my day." },
+    { title: "Inbox", message: "What's in my inbox?" },
+  ]);
+  expect(prompts()).toEqual([]);
+});
+
+test("an agent view thread gets a short title once, after its first exchange, and never again", () =>
+  quiet(async () => {
+    await connected();
+    fake.state.start = "refused";
+    opencode.state.turns.set("ses_jotaro", { outcome: "succeeded", text: "Sure." });
+    dm(1, "Plan   my week, please, with every meeting and errand I have on the calendar");
+    await tick();
+    await deliver();
+    await tick();
+    const titles = () =>
+      fake.state.assistant.filter(({ method }) => method === "assistant.threads.setTitle");
+    expect(titles().map(({ params }) => params)).toEqual([
+      {
+        channel_id: "DJ",
+        thread_ts: ts(1),
+        title: "Plan my week, please, with every meeting and errand I have…",
+      },
+    ]);
+    // Later messages in the thread never rename it.
+    dm(2, "and Friday?", 1);
+    await tick();
+    await deliver();
+    await tick();
+    await tick();
+    expect(titles()).toHaveLength(1);
+
+    // A title whose answer was lost isn't set again, even after a restart.
+    fake.state.title = "lost";
+    dm(3, "New topic");
+    await tick();
+    await deliver();
+    await tick();
+    agents.stop();
+    agents = start();
+    time += 61_000;
+    await tick();
+    expect(titles()).toHaveLength(2);
+    expect(events().find((row) => row.ts === ts(3))?.title).toBe("New topic");
+
+    // A channel thread has no title.
+    send({ type: "app_mention", channel: "C1", user: owner, text: "look", ts: ts(4), team });
+    await tick();
+    await deliver();
+    await tick();
+    await tick();
+    expect(titles()).toHaveLength(2);
+  }));
+
+/** Starts a DM turn: the message is queued, admitted and running. Gives its prompt. */
+const running = async (n: number, words = "hi") => {
+  dm(n, words);
+  await tick();
+  await deliver();
+  const prompt = prompts().at(-1);
+  assert(prompt);
+  return prompt;
+};
+const ends = (messageID: string, words: string) =>
+  opencode.state.messageTurns.set(messageID, {
+    end: `idle_${messageID}`,
+    outcome: "succeeded",
+    text: words,
+  });
+
+test("a reply streams as the turn writes, and the turn's final text replaces it in that one message", () =>
+  quiet(async () => {
+    await connected();
+    const prompt = await running(10);
+    await tick();
+    // Nothing written yet: only the status.
+    expect(calls("chat.startStream")).toEqual([]);
+    opencode.state.soFar.set(prompt.messageID, "Looking it up.");
+    await tick();
+    const [started] = calls("chat.startStream");
+    expect(started).toMatchObject({ channel: "DJ", thread_ts: ts(10) });
+    expect(started?.recipient_user_id).toBeUndefined();
+    const marker = `open-dot-stream-${events()[0]?.streamID}`;
+    expect(JSON.parse(started?.chunks ?? "[]")).toEqual([
+      {
+        type: "blocks",
+        blocks: [{ type: "section", block_id: marker, text: { type: "plain_text", text: "…" } }],
+      },
+      { type: "markdown_text", text: "Looking it up." },
+    ]);
+    // Only what's new is appended, and nothing when nothing is.
+    opencode.state.soFar.set(prompt.messageID, "Looking it up.\n\nFound three.");
+    await tick();
+    await tick();
+    expect(calls("chat.appendStream").map((params) => JSON.parse(params.chunks ?? "[]"))).toEqual([
+      [{ type: "markdown_text", text: "\n\nFound three." }],
+    ]);
+    expect(botMessages(`DJ ${ts(10)}`)[0]?.text).toBe("Looking it up.\n\nFound three.");
+
+    // The turn's reply is only its last message's text: it replaces what streamed.
+    ends(prompt.messageID, "Here are the three.");
+    await tick();
+    expect(calls("chat.stopStream")).toEqual([
+      { channel: "DJ", ts: botMessages(`DJ ${ts(10)}`)[0]?.ts ?? "" },
+    ]);
+    const [final] = botMessages(`DJ ${ts(10)}`);
+    expect(botMessages(`DJ ${ts(10)}`)).toHaveLength(1);
+    expect(final).toMatchObject({
+      text: "Here are the three.",
+      metadata: { event_type: "open_dot_reply", event_payload: { reply_id: events()[0]?.replyID } },
+    });
+    expect(calls("chat.postMessage")).toEqual([]);
+    expect(events()[0]).toMatchObject({ state: "posted", replyTS: final?.ts, stream: "stopped" });
+  }));
+
+test("a stream Slack refuses falls back to one ordinary post", () =>
+  quiet(async () => {
+    await connected();
+    fake.state.start = "refused";
+    const prompt = await running(10);
+    opencode.state.soFar.set(prompt.messageID, "Partial");
+    await tick();
+    await tick();
+    expect(calls("chat.startStream")).toHaveLength(1);
+    expect(events()[0]?.stream).toBe("denied");
+    ends(prompt.messageID, "Done.");
+    await tick();
+    expect(fake.state.posts).toMatchObject([
+      { channel: "DJ", thread_ts: ts(10), markdown_text: "Done." },
+    ]);
+    expect(botMessages(`DJ ${ts(10)}`)).toHaveLength(1);
+  }));
+
+test("a start whose answer was lost is found by its marker after a restart, never started twice", () =>
+  quiet(async () => {
+    await connected();
+    const prompt = await running(10);
+    fake.state.start = "lost";
+    opencode.state.soFar.set(prompt.messageID, "First part.");
+    await tick();
+    expect(events()[0]?.stream).toBe("starting");
+    agents.stop();
+    agents = start();
+    fake.state.start = "ok";
+    opencode.state.soFar.set(prompt.messageID, "First part. Second part.");
+    await tick();
+    socket()?.on.message(hello);
+    expect(events()[0]).toMatchObject({ stream: "open", streamText: "First part." });
+    await tick();
+    ends(prompt.messageID, "Final.");
+    await tick();
+    expect(calls("chat.startStream")).toHaveLength(1);
+    expect(calls("chat.appendStream")).toHaveLength(1);
+    expect(botMessages(`DJ ${ts(10)}`).map((message) => message.text)).toEqual(["Final."]);
+    expect(events()[0]?.state).toBe("posted");
+
+    // A start that never landed is only looked up: nothing more is sent, ever.
+    const second = await running(20);
+    fake.state.start = "dropped";
+    opencode.state.soFar.set(second.messageID, "Part.");
+    await tick();
+    fake.state.start = "ok";
+    ends(second.messageID, "Second final.");
+    for (let minute = 0; minute < 3; minute++) {
+      time += 61_000;
+      await tick();
+    }
+    expect(calls("chat.startStream")).toHaveLength(2);
+    expect(calls("chat.postMessage")).toEqual([]);
+    expect(botMessages(`DJ ${ts(20)}`)).toEqual([]);
+    expect(events().find((row) => row.ts === ts(20))).toMatchObject({ stream: "starting" });
+  }));
+
+test("an append whose answer was lost, or a crash mid-append, ends appends; the final text still lands once", () =>
+  quiet(async () => {
+    await connected();
+    const prompt = await running(10);
+    opencode.state.soFar.set(prompt.messageID, "One.");
+    await tick();
+    fake.state.append = "lost";
+    opencode.state.soFar.set(prompt.messageID, "One. Two.");
+    await tick();
+    expect(events()[0]?.stream).toBe("broken");
+    fake.state.append = "ok";
+    opencode.state.soFar.set(prompt.messageID, "One. Two. Three.");
+    agents.stop();
+    agents = start();
+    await tick();
+    socket()?.on.message(hello);
+    // The lost append landed, and isn't sent again.
+    expect(calls("chat.appendStream")).toHaveLength(1);
+    ends(prompt.messageID, "One. Two. Three.");
+    await tick();
+    expect(botMessages(`DJ ${ts(10)}`).map((message) => message.text)).toEqual([
+      "One. Two. Three.",
+    ]);
+
+    // A daemon stopped with an append in flight.
+    const second = await running(20);
+    opencode.state.soFar.set(second.messageID, "A.");
+    await tick();
+    db.update(slackEvents)
+      .set({ stream: "appending" })
+      .where(eq(slackEvents.ts, ts(20)))
+      .run();
+    agents.stop();
+    agents = start();
+    opencode.state.soFar.set(second.messageID, "A. B.");
+    await tick();
+    expect(events().find((row) => row.ts === ts(20))?.stream).toBe("broken");
+    expect(calls("chat.appendStream")).toHaveLength(1);
+    ends(second.messageID, "A. B.");
+    await tick();
+    expect(botMessages(`DJ ${ts(20)}`).map((message) => message.text)).toEqual(["A. B."]);
+  }));
+
+test("a lost stop or final update is repeated as the same call to the same message, and nothing more", () =>
+  quiet(async () => {
+    await connected();
+    const prompt = await running(10);
+    opencode.state.soFar.set(prompt.messageID, "Working.");
+    await tick();
+    ends(prompt.messageID, "Answer.");
+    fake.state.stop = "lost";
+    await tick();
+    expect(events()[0]).toMatchObject({ stream: "stopping", state: "posting" });
+    fake.state.stop = "ok";
+    fake.state.edit = "lost";
+    agents.stop();
+    agents = start();
+    await tick();
+    // Slack had stopped it, so it says it isn't streaming, and the update follows.
+    expect(events()[0]).toMatchObject({ stream: "stopped", state: "unknown" });
+    fake.state.edit = "ok";
+    await tick();
+    expect(calls("chat.update")).toHaveLength(1);
+    time += 61_000;
+    await tick();
+    const updates = calls("chat.update");
+    expect(updates).toHaveLength(2);
+    expect(updates[1]).toEqual(updates[0]);
+    expect(events()[0]?.state).toBe("posted");
+    expect(botMessages(`DJ ${ts(10)}`).map((message) => message.text)).toEqual(["Answer."]);
+    expect(calls("chat.postMessage")).toEqual([]);
+  }));
+
+test("mentions sharing a turn each keep their own reply; only the thread's oldest streams, to the owner", () =>
+  quiet(async () => {
+    await connected();
+    const key = `C1 ${ts(100)}`;
+    say(key, { ts: ts(100), user: "UFRIEND", text: "kick off" });
+    for (const n of [101, 102]) {
+      say(key, { ts: ts(n), user: owner, text: `<@${botUser}> q${n}` });
+      send({
+        type: "app_mention",
+        channel: "C1",
+        user: owner,
+        text: `<@${botUser}> q${n}`,
+        ts: ts(n),
+        thread_ts: ts(100),
+        team,
+      });
+    }
+    await tick();
+    await deliver();
+    const [first, second] = prompts();
+    assert(first && second);
+    opencode.state.soFar.set(first.messageID, "Thinking aloud.");
+    opencode.state.soFar.set(second.messageID, "Thinking aloud.");
+    await tick();
+    expect(calls("chat.startStream")).toMatchObject([
+      { channel: "C1", thread_ts: ts(100), recipient_user_id: owner, recipient_team_id: team },
+    ]);
+    for (const prompt of [first, second])
+      opencode.state.messageTurns.set(prompt.messageID, {
+        end: "idle_both",
+        outcome: "succeeded",
+        text: "Both answered.",
+      });
+    await tick();
+    expect(events().map((row) => row.state)).toEqual(["posted", "posted"]);
+    expect(botMessages(key).map((message) => message.text)).toEqual([
+      "Both answered.",
+      "Both answered.",
+    ]);
+    expect(calls("chat.postMessage")).toHaveLength(1);
+  }));
+
+test("a DM's messages sharing a turn get one reply, in the message that streamed", () =>
+  quiet(async () => {
+    await connected();
+    dm(1, "Root");
+    dm(2, "More", 1);
+    await tick();
+    await deliver();
+    const [first, second] = prompts();
+    assert(first && second);
+    opencode.state.soFar.set(first.messageID, "Partial.");
+    await tick();
+    for (const prompt of [first, second])
+      opencode.state.messageTurns.set(prompt.messageID, {
+        end: "idle_shared",
+        outcome: "succeeded",
+        text: "Together.",
+      });
+    await tick();
+    expect(events().map((row) => row.state)).toEqual(["posted", "answered"]);
+    expect(botMessages(`DJ ${ts(1)}`).map((message) => message.text)).toEqual(["Together."]);
+    expect(calls("chat.postMessage")).toEqual([]);
+  }));
+
+const legacyManifest = () => ({
+  _metadata: { major_version: 1, minor_version: 1 },
+  display_information: {
+    name: "jotaro",
+    description: "Owner's own words",
+    background_color: "#123456",
+  },
+  features: {
+    bot_user: { display_name: "jotaro", always_online: true },
+    agent_view: { agent_description: "Owner's own words" },
+  },
+  oauth_config: { scopes: { bot: ["chat:write", "reactions:write"] } },
+  settings: {
+    event_subscriptions: { bot_events: ["app_mention", "message.im"] },
+    socket_mode_enabled: true,
+  },
+});
+
+test("only the owner's update adds this version's events to an existing app, keeping the rest, and never resends a lost one", () =>
+  quiet(async () => {
+    await connected();
+    savePair();
+    expect(app()?.manifestVersion).toBeNull();
+    expect(describe(db, must(app()))).toContain("open-dot slack update jotaro");
+    expect(describe(db, must(app()))).toContain(`https://api.slack.com/apps/${appID}/general`);
+    fake.state.exported.set(appID, legacyManifest());
+    // The daemon never updates an app on its own.
+    for (let pass = 0; pass < 3; pass++) {
+      await provision(db, shared, setup());
+      await tick();
+    }
+    expect(calls("apps.manifest.update")).toEqual([]);
+
+    // The owner says no: nothing is sent.
+    let asked: readonly string[] = [];
+    expect(
+      await updateApp(db, setup(), "jotaro", (changes) => {
+        asked = changes;
+        return false;
+      }),
+    ).toBe("Nothing was changed.");
+    expect(asked).toEqual([
+      "bot scopes: app_mentions:read, assistant:write, channels:history, groups:history, im:history, im:read, im:write, metadata.message:read, users:read",
+      "bot events: assistant_thread_started, assistant_thread_context_changed, app_home_opened",
+    ]);
+    expect(calls("apps.manifest.update")).toEqual([]);
+
+    // Its answer is lost after it landed: the next update checks the export and sends nothing.
+    fake.state.update = "lost";
+    const seen: (string | null | undefined)[] = [];
+    fake.state.onUpdate = () => seen.push(app()?.updateState);
+    expect(await updateApp(db, setup(), "jotaro", () => true)).toContain("no clear answer");
+    expect(app()).toMatchObject({ updateState: "unknown", manifestVersion: null });
+    const [sent] = fake.state.updated;
+    expect(sent).toEqual({
+      ...legacyManifest(),
+      oauth_config: {
+        scopes: {
+          bot: [
+            "chat:write",
+            "reactions:write",
+            ...botScopes.filter((scope) => scope !== "chat:write"),
+          ],
+        },
+      },
+      settings: {
+        event_subscriptions: {
+          bot_events: [
+            "app_mention",
+            "message.im",
+            "assistant_thread_started",
+            "assistant_thread_context_changed",
+            "app_home_opened",
+          ],
+        },
+        socket_mode_enabled: true,
+      },
+    });
+    fake.state.update = "ok";
+    expect(await updateApp(db, setup(), "jotaro", () => true)).toContain("reached Slack");
+    expect(calls("apps.manifest.update")).toHaveLength(1);
+    expect(app()).toMatchObject({ updateState: null, manifestVersion: 2 });
+    expect(describe(db, must(app()))).toContain("install-on-team");
+    expect(describe(db, must(app()))).not.toContain("Its manifest is older");
+
+    // A lost update that never landed is found missing in the export, and sent again only once the
+    // owner confirms it.
+    fake.state.exported.set(appID, legacyManifest());
+    db.update(slackApps).set({ manifestVersion: null, updateNote: null }).run();
+    fake.state.update = "dropped";
+    await updateApp(db, setup(), "jotaro", () => true);
+    expect(app()?.updateState).toBe("unknown");
+    fake.state.update = "ok";
+    fake.state.permissionsUpdated = true;
+    let again: readonly string[] = [];
+    expect(
+      await updateApp(db, setup(), "jotaro", (changes) => {
+        again = changes;
+        return true;
+      }),
+    ).toContain("Reinstall");
+    expect(again[0]).toContain("didn't reach Slack");
+    expect(calls("apps.manifest.update")).toHaveLength(3);
+    // Each attempt was saved just before its call.
+    expect(seen).toEqual(["updating", "updating", "updating"]);
+    expect(app()).toMatchObject({ updateState: null, manifestVersion: 2 });
+    expect(app()?.updateNote).toContain("Reinstall");
+    expect(describe(db, must(app()))).toContain("Reinstall the app");
+
+    // Another app, or a refusal, changes nothing in Slack.
+    fake.state.exported.set(appID, {
+      ...legacyManifest(),
+      features: { bot_user: { display_name: "dio" } },
+    });
+    expect(await updateApp(db, setup(), "jotaro", () => true)).toContain("isn't jotaro's");
+    expect(calls("apps.manifest.update")).toHaveLength(3);
+    expect(everything()).not.toMatch(/xoxe|xoxb|xapp/);
+  }));
+
+test("a DM group's carrier and its other rows move together, so a crash between them makes no second reply", () =>
+  quiet(async () => {
+    await connected();
+    dm(1, "Root");
+    dm(2, "More", 1);
+    await tick();
+    await deliver();
+    const [first, second] = prompts();
+    assert(first && second);
+    opencode.state.soFar.set(first.messageID, "Partial.");
+    await tick();
+    expect(events()[0]?.stream).toBe("open");
+    for (const prompt of [first, second])
+      opencode.state.messageTurns.set(prompt.messageID, {
+        end: "idle_shared",
+        outcome: "succeeded",
+        text: "Together.",
+      });
+    // The daemon stops after the carrier's change and before the other row's.
+    db.$client.exec(
+      "CREATE TRIGGER crash BEFORE UPDATE OF state ON slack_events WHEN NEW.state = 'answered' BEGIN SELECT RAISE(ABORT, 'daemon stopped'); END;",
+    );
+    await tick();
+    expect(events().map((row) => row.state)).toEqual(["waiting", "waiting"]);
+    db.$client.exec("DROP TRIGGER crash");
+    agents.stop();
+    agents = start();
+    await tick();
+    socket()?.on.message(hello);
+    await tick();
+    await tick();
+    expect(events().map((row) => row.state)).toEqual(["posted", "answered"]);
+    expect(botMessages(`DJ ${ts(1)}`).map((message) => message.text)).toEqual(["Together."]);
+    expect(calls("chat.postMessage")).toEqual([]);
+  }));
+
+test("a long final answer keeps its whole markdown block, with its notification text within Slack's limit", () =>
+  quiet(async () => {
+    await connected();
+    const prompt = await running(10);
+    opencode.state.soFar.set(prompt.messageID, "Working.");
+    await tick();
+    const long = "word ".repeat(1800).trim();
+    ends(prompt.messageID, long);
+    await tick();
+    const [update] = calls("chat.update");
+    expect(update?.text?.length).toBeLessThanOrEqual(4000);
+    expect(JSON.parse(update?.blocks ?? "[]")).toEqual([{ type: "markdown", text: long }]);
+    expect(events()[0]?.state).toBe("posted");
+    expect(botMessages(`DJ ${ts(10)}`).map((message) => message.text)).toEqual([long]);
+  }));
+
+test("a stale confirmation or a late update answer never overwrites a newer update", () =>
+  quiet(async () => {
+    await connected();
+    savePair();
+    fake.state.exported.set(appID, legacyManifest());
+    // Another update runs to the end while the owner is still deciding on this one's export.
+    const stale = await updateApp(db, setup(), "jotaro", async () => {
+      expect(await updateApp(db, setup(), "jotaro", () => true)).toContain("Updated");
+      return true;
+    });
+    expect(stale).toContain("changed meanwhile");
+    expect(calls("apps.manifest.update")).toHaveLength(1);
+    expect(app()).toMatchObject({ updateState: null, manifestVersion: 2 });
+
+    // An update's answer is held past a minute; the next update checks the export and replaces it.
+    fake.state.exported.set(appID, legacyManifest());
+    db.update(slackApps).set({ manifestVersion: null }).run();
+    const { promise, resolve } = Promise.withResolvers<void>();
+    const reached = new Promise<void>((resolveReached) => {
+      fake.state.onUpdate = resolveReached;
+    });
+    fake.state.updateGate = promise;
+    const held = updateApp(db, setup(), "jotaro", () => true);
+    await reached;
+    fake.state.updateGate = undefined;
+    fake.state.onUpdate = () => {};
+    expect(app()?.updateState).toBe("updating");
+    expect(await updateApp(db, setup(), "jotaro", () => true)).toContain("less than a minute");
+    time += 61_000;
+    expect(await updateApp(db, setup(), "jotaro", () => true)).toContain("Updated");
+    const newer = app();
+    expect(newer).toMatchObject({ updateState: null, manifestVersion: 2, updateNote: null });
+
+    // The held answer arrives late, as a refusal: it changes nothing.
+    fake.state.update = "refused";
+    resolve();
+    expect(await held).toContain("newer update");
+    expect(app()).toEqual(newer);
+  }));
+
+test("coalesced DMs make one reply even when their turn ends between the two rows' history reads", () =>
+  quiet(async () => {
+    await connected();
+    dm(1, "Root");
+    dm(2, "More", 1);
+    await tick();
+    await deliver();
+    const [first, second] = prompts();
+    assert(first && second);
+    opencode.state.soFar.set(first.messageID, "Partial.");
+    await tick();
+    expect(events()[0]?.stream).toBe("open");
+    const real = await Effect.runPromise(
+      Effect.provide(
+        Effect.gen(function* () {
+          return yield* OpenCode;
+        }),
+        opencode.layer,
+      ),
+    );
+    let firstRead = true;
+    agents.stop();
+    agents = slackAgents(
+      db,
+      Layer.succeed(OpenCode, {
+        ...real,
+        turnAfter: (ref) =>
+          Effect.sync(() => {
+            if (ref.messageID === first.messageID && firstRead) {
+              firstRead = false;
+              // The turn ends just after the first row's history read.
+              for (const row of [first, second])
+                opencode.state.messageTurns.set(row.messageID, {
+                  end: "idle_shared",
+                  outcome: "succeeded",
+                  text: "Together.",
+                });
+              return undefined;
+            }
+            return opencode.state.messageTurns.get(ref.messageID);
+          }),
+      }),
+      deps(),
+    );
+    await tick();
+    // The later row waits for the earlier one rather than reply on its own.
+    expect(events().map((row) => row.state)).toEqual(["waiting", "waiting"]);
+    await tick();
+    expect(events().map((row) => row.state)).toEqual(["posted", "answered"]);
+    expect(botMessages(`DJ ${ts(1)}`).map((message) => message.text)).toEqual(["Together."]);
+    expect(calls("chat.postMessage")).toEqual([]);
+  }));
+
+/** Waits, in real time, until `done` holds. The text event follower runs on its own fiber. */
+const until = async (done: () => boolean) => {
+  for (let wait = 0; wait < 500 && !done(); wait++) await Bun.sleep(2);
+  expect(done()).toBe(true);
+};
+/** Runs the text event follower for one test. */
+const following = async <T>(run: (fiber: Fiber.Fiber<never>) => Promise<T>) => {
+  const fiber = Effect.runFork(agents.events);
+  try {
+    return await run(fiber);
+  } finally {
+    await Effect.runPromise(Fiber.interrupt(fiber));
+  }
+};
+const text = (
+  type: "started" | "delta" | "ended",
+  more: { delta?: string; text?: string; messageID?: string; sessionID?: string } = {},
+): TextEvent => {
+  const base = {
+    sessionID: more.sessionID ?? "ses_jotaro",
+    messageID: more.messageID ?? "msg_answer",
+    ordinal: 0,
+  };
+  return type === "started"
+    ? { type, ...base }
+    : type === "delta"
+      ? { type, ...base, delta: more.delta ?? "" }
+      : { type, ...base, text: more.text ?? "" };
+};
+const subscriber = (index: number) => must(opencode.state.subscribers[index]);
+const appended = () =>
+  calls("chat.appendStream").map(
+    (params) => (JSON.parse(params.chunks ?? "[]") as { text: string }[])[0]?.text,
+  );
+
+test("a single-text reply streams from OpenCode's text events before the text is finished", () =>
+  quiet(async () => {
+    await connected();
+    await following(async () => {
+      await until(() => opencode.state.subscribers.length === 1);
+      const prompt = await running(10);
+      // History has the reply's one text part, still empty: OpenCode fills it in once it's done.
+      opencode.state.written.set(prompt.messageID, [{ id: "msg_answer", texts: [""] }]);
+      await tick();
+      const live = subscriber(0);
+      live.emit(text("started"));
+      live.emit(text("delta", { delta: "Hello" }));
+      live.emit(text("delta", { delta: " there" }));
+      await Bun.sleep(10);
+      await tick();
+      expect(JSON.parse(calls("chat.startStream")[0]?.chunks ?? "[]")[1]).toEqual({
+        type: "markdown_text",
+        text: "Hello there",
+      });
+      live.emit(text("delta", { delta: "!" }));
+      await Bun.sleep(10);
+      await tick();
+      expect(appended()).toEqual(["!"]);
+      ends(prompt.messageID, "Hello there!");
+      await tick();
+      expect(botMessages(`DJ ${ts(10)}`).map((message) => message.text)).toEqual(["Hello there!"]);
+      expect(calls("chat.startStream")).toHaveLength(1);
+      expect(calls("chat.postMessage")).toEqual([]);
+    });
+  }));
+
+test("a dropped text event connection reconnects with nothing kept, so no text is sent twice", () =>
+  quiet(async () => {
+    await connected();
+    await following(async () => {
+      await until(() => opencode.state.subscribers.length === 1);
+      const prompt = await running(10);
+      opencode.state.written.set(prompt.messageID, [{ id: "msg_answer", texts: [""] }]);
+      await tick();
+      subscriber(0).emit(text("started"));
+      subscriber(0).emit(text("delta", { delta: "Hel" }));
+      await Bun.sleep(10);
+      await tick();
+      expect(events()[0]).toMatchObject({ stream: "open", streamText: "Hel" });
+      subscriber(0).fail();
+      await until(() => opencode.state.subscribers.length === 2);
+      expect(subscriber(0).open).toBe(false);
+      // The part started before this connection, so its later deltas alone are never shown.
+      subscriber(1).emit(text("delta", { delta: "lo wor" }));
+      await Bun.sleep(10);
+      await tick();
+      expect(appended()).toEqual([]);
+      // Once OpenCode finishes the part, history fills in what the gap missed.
+      opencode.state.written.set(prompt.messageID, [{ id: "msg_answer", texts: ["Hello world"] }]);
+      await tick();
+      expect(appended()).toEqual(["lo world"]);
+      ends(prompt.messageID, "Hello world");
+      await tick();
+      expect(botMessages(`DJ ${ts(10)}`).map((message) => message.text)).toEqual(["Hello world"]);
+    });
+  }));
+
+test("only the waiting reply's own turn feeds its stream: no other message, session or thread", () =>
+  quiet(async () => {
+    await connected();
+    await following(async () => {
+      await until(() => opencode.state.subscribers.length === 1);
+      dm(10, "A");
+      dm(20, "B");
+      await tick();
+      await deliver();
+      const [first, second] = prompts();
+      assert(first && second);
+      // Only A is in the turn; B waits for its own.
+      expect(opencode.state.messages.has(second.messageID)).toBe(false);
+      opencode.state.written.set(first.messageID, [{ id: "msg_answer", texts: [""] }]);
+      await tick();
+      const live = subscriber(0);
+      for (const [messageID, sessionID, words] of [
+        ["msg_answer", "ses_jotaro", "Mine"],
+        ["msg_other", "ses_jotaro", "Another turn"],
+        ["msg_answer", "ses_polnareff", "Another dot"],
+      ] as const) {
+        live.emit(text("started", { messageID, sessionID }));
+        live.emit(text("delta", { messageID, sessionID, delta: words }));
+      }
+      await Bun.sleep(10);
+      await tick();
+      expect(calls("chat.startStream").map((params) => params.thread_ts)).toEqual([ts(10)]);
+      expect(JSON.parse(calls("chat.startStream")[0]?.chunks ?? "[]")[1]).toEqual({
+        type: "markdown_text",
+        text: "Mine",
+      });
+      expect(botMessages(`DJ ${ts(20)}`)).toEqual([]);
+    });
+  }));
+
+test("text events are followed only while a dot's own app is active", () =>
+  quiet(async () => {
+    await following(async () => {
+      await Bun.sleep(20);
+      expect(opencode.state.subscribers).toEqual([]);
+      await connected();
+      await until(() => opencode.state.subscribers.length === 1);
+      db.update(slackApps).set({ state: "created" }).run();
+      await until(() => !subscriber(0).open);
+      await Bun.sleep(20);
+      expect(opencode.state.subscribers).toHaveLength(1);
+    });
+  }));
+
+/** A fresh runtime whose history reads go through `turnAfter`, as after a daemon restart. */
+const withTurns = async (
+  turnAfter: (real: OpenCode["Service"]) => OpenCode["Service"]["turnAfter"],
+) => {
+  const real = await Effect.runPromise(
+    Effect.provide(
+      Effect.gen(function* () {
+        return yield* OpenCode;
+      }),
+      opencode.layer,
+    ),
+  );
+  agents.stop();
+  agents = slackAgents(
+    db,
+    Layer.succeed(OpenCode, { ...real, turnAfter: turnAfter(real) }),
+    deps(),
+  );
+};
+
+for (const failing of ["later", "earlier"] as const)
+  test(`one transient history failure of the ${failing} of two coalesced DMs never splits their reply, and other threads go on`, () =>
+    quiet(async () => {
+      await connected();
+      send({ type: "app_mention", channel: "C1", user: owner, text: "status?", ts: ts(50), team });
+      dm(1, "Root");
+      dm(2, "More", 1);
+      await tick();
+      const [mention, first, second] = prompts();
+      assert(mention && first && second);
+      await deliver();
+      opencode.state.messageTurns.set(mention.messageID, {
+        end: "idle_mention",
+        outcome: "succeeded",
+        text: "All good.",
+      });
+      await deliver();
+      await deliver();
+      expect(opencode.state.prompted).toEqual([
+        mention.messageID,
+        first.messageID,
+        second.messageID,
+      ]);
+      for (const prompt of [first, second])
+        opencode.state.messageTurns.set(prompt.messageID, {
+          end: "idle_shared",
+          outcome: "succeeded",
+          text: "Together.",
+        });
+      const flaky = failing === "later" ? second : first;
+      let fail = true;
+      await withTurns((real) => (ref) => {
+        if (ref.messageID !== flaky.messageID || !fail) return real.turnAfter(ref);
+        fail = false;
+        return Effect.fail(new OpenCodeError({ message: "history unavailable" }));
+      });
+      await tick();
+      // The mention's thread replies at once; the DM thread waits a pass for its unread message.
+      expect(events().map((row) => [row.kind, row.state])).toEqual([
+        ["mention", "posted"],
+        ["dm", "waiting"],
+        ["dm", "waiting"],
+      ]);
+      await tick();
+      await tick();
+      expect(events().map((row) => row.state)).toEqual(["posted", "answered", "posted"]);
+      expect(botMessages(`DJ ${ts(1)}`).map((message) => message.text)).toEqual(["Together."]);
+      expect(botMessages(`C1 ${ts(50)}`).map((message) => message.text)).toEqual(["All good."]);
+    }));
+
+test("a DM thread's later message in a later turn never holds back the earlier one's reply", () =>
+  quiet(async () => {
+    await connected();
+    dm(1, "Root");
+    dm(2, "More", 1);
+    await tick();
+    await deliver();
+    const [first, second] = prompts();
+    assert(first && second);
+    // Only the first turn ended; the second message's turn is still running.
+    opencode.state.messageTurns.set(first.messageID, {
+      end: "idle_first",
+      outcome: "succeeded",
+      text: "First.",
+    });
+    await tick();
+    expect(events().map((row) => row.state)).toEqual(["posted", "waiting"]);
+    opencode.state.messageTurns.set(second.messageID, {
+      end: "idle_second",
+      outcome: "succeeded",
+      text: "Second.",
+    });
+    await tick();
+    expect(botMessages(`DJ ${ts(1)}`).map((message) => message.text)).toEqual([
+      "First.",
+      "Second.",
+    ]);
+  }));
+
+test("a text event part that ends past Slack's limit is never appended, and the final text is clipped", () =>
+  quiet(async () => {
+    await connected();
+    await following(async () => {
+      await until(() => opencode.state.subscribers.length === 1);
+      const prompt = await running(10);
+      opencode.state.written.set(prompt.messageID, [{ id: "msg_answer", texts: [""] }]);
+      await tick();
+      const live = subscriber(0);
+      live.emit(text("started"));
+      live.emit(text("delta", { delta: "Hi" }));
+      await Bun.sleep(10);
+      await tick();
+      expect(events()[0]).toMatchObject({ stream: "open", streamText: "Hi" });
+      // The part ends far past the limit, before history has its text.
+      const long = `Hi${"x".repeat(20_000)}`;
+      live.emit(text("ended", { text: long }));
+      await Bun.sleep(10);
+      await tick();
+      expect(calls("chat.appendStream")).toEqual([]);
+      ends(prompt.messageID, long);
+      await tick();
+      const [update] = calls("chat.update");
+      const [block] = JSON.parse(update?.blocks ?? "[]") as { text: string }[];
+      expect(block?.text.length).toBeLessThanOrEqual(12_000);
+      expect(block?.text.endsWith("[cut at Slack's limit]")).toBe(true);
+      expect(update?.text?.length).toBeLessThanOrEqual(4000);
+      expect(events()[0]?.state).toBe("posted");
+      expect(calls("chat.startStream")).toHaveLength(1);
+      expect(calls("chat.postMessage")).toEqual([]);
+    });
+  }));
