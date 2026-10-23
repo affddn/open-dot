@@ -130,6 +130,9 @@ struct FeedState {
   }
   var feedStatus: String?
   var showingFeed = false
+  /// The selected dot's Memory tab is open instead of its chat.
+  var showingMemory = false
+  var memories: [String: MemoryState] = [:]
   var thumbnails: [AttachmentKey: NSImage] = [:]
   var unavailable: Set<AttachmentKey> = []
   var reacting: Set<MessageKey> = []
@@ -174,7 +177,7 @@ struct FeedState {
 
   func unread(_ name: String) -> Bool { (newest[name] ?? 0) > (seen[name] ?? .infinity) }
 
-  private func visible(_ name: String) -> Bool { expanded && !showingFeed && selected == name }
+  private func visible(_ name: String) -> Bool { expanded && !showingFeed && !showingMemory && selected == name }
 
   func start() {
     Task {
@@ -186,6 +189,7 @@ struct FeedState {
     Task {
       while true {
         if let name = selected, visible(name) { await refreshMessages(name) }
+        if let name = selected, expanded, !showingFeed, showingMemory { await refreshMemory(name) }
         try? await Task.sleep(for: .seconds(1))
       }
     }
@@ -204,13 +208,22 @@ struct FeedState {
     Task { await refreshDots() }
     Task { await refreshFeed() }
     if let name = selected { Task { await refreshMessages(name) } }
+    if let name = selected, showingMemory { Task { await refreshMemory(name) } }
   }
 
   func select(_ name: String) {
     showingFeed = false
     selected = name
-    seen[name] = newest[name]
+    if !showingMemory { seen[name] = newest[name] }
     Task { await refreshMessages(name) }
+    if showingMemory { Task { await refreshMemory(name) } }
+  }
+
+  /// Switches the selected dot between its chat and its Memory tab.
+  func showMemory(_ show: Bool) {
+    showingMemory = show
+    guard let name = selected else { return }
+    if show { Task { await refreshMemory(name) } } else { seen[name] = newest[name] }
   }
 
   func send(_ name: String) {
@@ -431,6 +444,7 @@ struct FeedState {
         await refreshFeed()
       }
     }
+    showingMemory = false
     select(first)
   }
 
@@ -706,6 +720,88 @@ struct FeedState {
 
   func clearFeedError(_ id: Int) {
     feedErrors[id] = nil
+  }
+
+  /// Adds the owner's note. A failed or unanswered add keeps the draft and is never sent again on
+  /// its own; success clears the draft only if it's unchanged since.
+  func addNote(_ name: String) {
+    let draft = memories[name]?.noteDraft ?? ""
+    let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else { return }
+    guard text.utf16.count <= memoryTextLimit else {
+      memories[name, default: MemoryState()].notice = "A note must be at most \(memoryTextLimit) characters."
+      return
+    }
+    guard memories[name, default: MemoryState()].beginAdd() else { return }
+    Task {
+      do {
+        let note = try await api.addNote(name, text: text)
+        memories[name, default: MemoryState()].finishAdd(.success(note))
+        if memories[name]?.noteDraft == draft { memories[name]?.noteDraft = "" }
+      } catch {
+        let message = Self.describeMemory(error, "Not added", unknown: "It may have been added; it shows on the next refresh.")
+        memories[name, default: MemoryState()].finishAdd(.failure(MemoryInvalid(message)))
+      }
+    }
+  }
+
+  /// Sends the edit at the version the owner started from. Nothing changed closes the editor.
+  func saveMemory(_ name: String, _ key: MemoryKey) {
+    guard let draft = memories[name]?.drafts[key] else { return }
+    let changed: [String: Any]?
+    do {
+      changed = try draft.changes()
+    } catch {
+      memories[name]?.errors[key] = (error as? MemoryInvalid)?.message ?? "\(error)"
+      return
+    }
+    guard var fields = changed else {
+      memories[name]?.drafts[key] = nil
+      return
+    }
+    fields["version"] = draft.version
+    guard let body = try? JSONSerialization.data(withJSONObject: fields) else { return }
+    change(name, key, version: draft.version, body: body)
+  }
+
+  /// Deletes a note or cancels a reminder at the version shown, once the owner confirmed it.
+  func removeMemory(_ name: String, _ item: MemoryItem) {
+    let version: Int
+    switch item {
+    case .note(let note): version = note.version
+    case .reminder(let reminder): version = reminder.version
+    case .responsibility: return
+    }
+    change(name, item.key, version: version, body: nil)
+  }
+
+  private func change(_ name: String, _ key: MemoryKey, version: Int, body: Data?) {
+    guard memories[name, default: MemoryState()].begin(key) else { return }
+    Task {
+      do {
+        let outcome = try await api.changeMemory(name, key, version: version, body: body)
+        memories[name, default: MemoryState()].finish(key, .outcome(outcome))
+      } catch {
+        let message = Self.describeMemory(error, "Not saved", unknown: "It may have been saved; the next refresh shows what the daemon has.")
+        memories[name, default: MemoryState()].finish(key, .failed(message))
+      }
+    }
+  }
+
+  private func refreshMemory(_ name: String) async {
+    let read = memories[name, default: MemoryState()].startRead()
+    do {
+      let memory = try await api.memory(name)
+      _ = memories[name, default: MemoryState()].apply(read, memory)
+    } catch {
+      guard memories[name]?.isCurrent(read) == true else { return }
+      memories[name]?.readError = Self.describe(error)
+    }
+  }
+
+  private static func describeMemory(_ error: Error, _ refused: String, unknown: String) -> String {
+    if case .lost = error as? APIError { return "Outcome unknown: no response. \(unknown) No automatic retry." }
+    return "\(refused). \(describe(error)) No automatic retry."
   }
 
   /// Loads an image attachment's thumbnail once, when its message is shown.

@@ -11,6 +11,7 @@ import { openDatabase } from "../src/db";
 import {
   feed,
   hiddenMessages,
+  notes,
   outbox,
   reactions,
   recentReactions,
@@ -20,6 +21,7 @@ import {
   slackThreads,
   slackPolls,
   reminders,
+  responsibilities,
   workers,
   routeKey,
   type Route,
@@ -460,7 +462,10 @@ test("0016 adds only nullable outbox files and preserves every 0015 column, row 
           dflt_value: null,
           pk: 0,
         });
-      } else expect(after).toEqual(stored);
+      } else expect(after.slice(0, stored.length)).toEqual(stored);
+      // Only 0020 adds columns elsewhere.
+      if (!["outbox", "notes", "reminders", "responsibilities"].includes(name))
+        expect(after).toHaveLength(stored.length);
     }
     expect(db.select().from(outbox).get()?.files).toBeNull();
     const files = [{ mime: "image/png", name: "kept.png", data: "iVBORw0KGgo=" }];
@@ -604,11 +609,16 @@ test("0018 adds only nullable outbox delivery and preserves every 0017 table, co
   const columns = new Map(
     tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
   );
+  // Only the columns 0017 had: 0020 adds memory columns.
   const rows = (sqlite: Database) =>
     tables.map((name) => [
       name,
       sqlite
-        .query(`select * from "${name}"`)
+        .query(
+          `select ${(columns.get(name) as { name: string }[])
+            .map((column) => `"${column.name}"`)
+            .join(",")} from "${name}"`,
+        )
         .all()
         .map((row) => {
           if (name !== "outbox" || typeof row !== "object" || row === null) return row;
@@ -629,7 +639,9 @@ test("0018 adds only nullable outbox delivery and preserves every 0017 table, co
       const stored = columns.get(name);
       assert(stored, `Missing stored columns for ${name}`);
       const after = db.$client.query(`pragma table_info("${name}")`).all();
-      if (name !== "outbox") expect(after).toEqual(stored);
+      if (["notes", "reminders", "responsibilities"].includes(name))
+        expect(after.slice(0, stored.length)).toEqual(stored);
+      else if (name !== "outbox") expect(after).toEqual(stored);
       else {
         expect(after.slice(0, -1)).toEqual(stored);
         expect(after.at(-1)).toMatchObject({
@@ -691,8 +703,18 @@ test("0019 adds only recent_reactions and preserves every 0018 table, column, ro
   const columns = new Map(
     tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
   );
+  // Only the columns 0018 had: 0020 adds memory columns.
   const rows = (sqlite: Database) =>
-    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+    tables.map((name) => [
+      name,
+      sqlite
+        .query(
+          `select ${(columns.get(name) as { name: string }[])
+            .map((column) => `"${column.name}"`)
+            .join(",")} from "${name}"`,
+        )
+        .all(),
+    ]);
   const before = rows(old);
   const ledger = ledgerOf(old);
   old.close();
@@ -705,7 +727,10 @@ test("0019 adds only recent_reactions and preserves every 0018 table, column, ro
     for (const name of tables) {
       const stored = columns.get(name);
       assert(stored, `Missing stored columns for ${name}`);
-      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(stored);
+      const after = db.$client.query(`pragma table_info("${name}")`).all();
+      if (["notes", "reminders", "responsibilities"].includes(name))
+        expect(after.slice(0, stored.length)).toEqual(stored);
+      else expect(after).toEqual(stored);
     }
     const statements = readFileSync(join(repoMigrations, "0019_recent_reactions.sql"), "utf8")
       .split("--> statement-breakpoint")
@@ -733,6 +758,152 @@ test("0019 adds only recent_reactions and preserves every 0018 table, column, ro
     expect(rows(db.$client)).toEqual(before);
     expectLedger(db.$client, ledger, "0019");
   } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0020 adds memory versions that legacy writers still advance, and keeps every 0019 row", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-memory-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0020");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run("insert into notes (dot,text,created_at) values ('jojo','Keep',2)");
+  old.run(
+    "insert into reminders (dot,text,due_at,every_minutes,state,created_at) values ('jojo','Keep',100,5,'scheduled',3)",
+  );
+  old.run(
+    "insert into responsibilities (dot,goal,next_action,status,created_at,updated_at) values ('jojo','Keep','Next','active',4,5)",
+  );
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [
+      name,
+      old.query<{ name: string }, []>(`pragma table_info("${name}")`).all(),
+    ]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [
+      name,
+      sqlite
+        .query(
+          `select ${columns
+            .get(name)
+            ?.map((column) => `"${column.name}"`)
+            .join(",")} from "${name}"`,
+        )
+        .all(),
+    ]);
+  const before = rows(old);
+  const ledger = ledgerOf(old);
+  const legacyUpdate = old.prepare("update notes set text = ? where id = 1");
+  let db = openDatabase(path);
+  try {
+    expect(rows(db.$client)).toEqual(before);
+    expect(tableNames(db.$client)).toEqual(tables);
+    const added = (name: string) =>
+      db.$client
+        .query<{ name: string }, []>(`pragma table_info("${name}")`)
+        .all()
+        .slice(columns.get(name)?.length);
+    expect(added("notes")).toMatchObject([
+      { name: "updated_at", notnull: 0, dflt_value: null },
+      { name: "version", notnull: 1, dflt_value: "1" },
+      { name: "updated_by", notnull: 1, dflt_value: "'dot'" },
+    ]);
+    expect(added("reminders").map((column) => column.name)).toEqual([
+      "updated_at",
+      "version",
+      "updated_by",
+    ]);
+    expect(added("responsibilities").map((column) => column.name)).toEqual([
+      "version",
+      "updated_by",
+    ]);
+    for (const name of tables.filter(
+      (table) => !["notes", "reminders", "responsibilities"].includes(table),
+    ))
+      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(
+        columns.get(name) ?? [],
+      );
+    const triggers = db.$client
+      .query<{ name: string }, []>(
+        "select name from sqlite_master where type='trigger' order by name",
+      )
+      .all();
+    expect(triggers.map((trigger) => trigger.name)).toEqual([
+      "notes_version",
+      "reminders_version",
+      "responsibilities_version",
+    ]);
+    expectLedger(db.$client, ledger, "0020");
+    // Old rows start at version 1, by the dot, unchanged since they were created.
+    expect(db.select().from(notes).get()).toMatchObject({
+      version: 1,
+      updatedBy: "dot",
+      updatedAt: null,
+    });
+    expect(db.select().from(reminders).get()).toMatchObject({ version: 1, updatedBy: "dot" });
+    expect(db.select().from(responsibilities).get()).toMatchObject({ version: 1, updatedAt: 5 });
+
+    // A plugin or daemon from before 0020 writes the old columns only.
+    old.run("insert into notes (dot,text,created_at) values ('jojo','Legacy',6)");
+    expect(db.select().from(notes).all().at(-1)).toMatchObject({
+      text: "Legacy",
+      version: 1,
+      updatedBy: "dot",
+      updatedAt: null,
+    });
+    old.run("update responsibilities set next_action = 'Later', updated_at = 7");
+    old.run("update reminders set due_at = 400");
+    legacyUpdate.run("Changed");
+    expect(db.select().from(responsibilities).get()).toMatchObject({
+      nextAction: "Later",
+      version: 2,
+      updatedBy: "dot",
+    });
+    expect(db.select().from(reminders).get()).toMatchObject({
+      dueAt: 400,
+      version: 2,
+      updatedBy: "scheduler",
+    });
+    const changed = db.select().from(notes).get();
+    expect(changed).toMatchObject({ text: "Changed", version: 2, updatedBy: "dot" });
+    expect(changed?.updatedAt).toBeGreaterThan(Date.now() - 60_000);
+    // A writer that advances the version itself is left as it wrote.
+    db.$client.run(
+      "update notes set text = 'Owner', version = version + 1, updated_by = 'owner', updated_at = 9 where text = 'Changed'",
+    );
+    expect(db.select().from(notes).get()).toMatchObject({
+      version: 3,
+      updatedBy: "owner",
+      updatedAt: 9,
+    });
+    legacyUpdate.run("Dot after owner");
+    expect(db.select().from(notes).get()).toMatchObject({
+      text: "Dot after owner",
+      version: 4,
+      updatedBy: "dot",
+    });
+
+    // Code from before 0020 finds nothing to migrate in the migrated file.
+    migrate(drizzle({ client: db.$client }), { migrationsFolder: migrations });
+    expectLedger(db.$client, ledger, "0020");
+    db.$client.close();
+    db = openDatabase(path);
+    expect(db.select().from(notes).get()).toMatchObject({ text: "Dot after owner", version: 4 });
+    expectLedger(db.$client, ledger, "0020");
+  } finally {
+    old.close();
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });
   }

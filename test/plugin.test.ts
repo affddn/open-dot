@@ -8,16 +8,19 @@ import { Effect } from "effect";
 import { openDatabase } from "../src/db";
 import { createDot, findDot } from "../src/dots";
 import { databasePath, home } from "../src/home";
+import { cancelReminder, editNote, editResponsibility } from "../src/memory";
 import plugin from "../src/plugin";
 import { saveReaction } from "../src/reactions";
 import {
   dots,
   feed,
   hiddenMessages,
+  notes,
   outbox,
   reactions,
   recentReactions,
   reminders,
+  responsibilities,
   workers,
   type Route,
 } from "../src/schema";
@@ -285,6 +288,41 @@ test("an active responsibility stays in memory until it is done", async () => {
   await loaded.call("dot_update", { id: 1, status: "done" });
   expect(await loaded.injected(dot.sessionID)).not.toContain("Ship M3");
   await loaded.cleanup?.();
+});
+
+test("the owner's memory edits reach the dot's next snapshot without a turn, and its later edits win", async () => {
+  const db = openDatabase(databasePath());
+  const loaded = await load(dot.directory);
+  await loaded.call("dot_note", { text: "Likes coffee." });
+  await loaded.call("dot_track", { goal: "Ship M3", next_action: "Write the daemon." });
+  await loaded.call("dot_remind", { text: "Stand up.", at: "2099-01-01T09:00:00Z" });
+  const note = db.select().from(notes).get();
+  const job = db.select().from(responsibilities).get();
+  const alarm = db.select().from(reminders).get();
+  expect(editNote(db, "jojo", note?.id ?? 0, 1, "Likes tea.")).toHaveProperty("saved");
+  expect(
+    editResponsibility(db, "jojo", job?.id ?? 0, 1, { nextAction: "Review the daemon." }),
+  ).toHaveProperty("saved");
+  expect(cancelReminder(db, "jojo", alarm?.id ?? 0, 1)).toEqual({ deleted: true });
+  const memory = await loaded.injected(dot.sessionID);
+  expect(memory).toContain("Likes tea.");
+  expect(memory).not.toContain("Likes coffee.");
+  expect(memory).toContain("Ship M3. Next: Review the daemon.");
+  expect(memory).not.toContain("Stand up.");
+  expect(loaded.turns).toEqual([]);
+  expect(db.select().from(outbox).all()).toEqual([]);
+  // The dot's own update after the owner's advances the version and names the dot.
+  await loaded.call("dot_update", { id: job?.id ?? 0, next_action: "Merge it." });
+  expect(db.select().from(responsibilities).get()).toMatchObject({
+    nextAction: "Merge it.",
+    version: 3,
+    updatedBy: "dot",
+  });
+  expect(editResponsibility(db, "jojo", job?.id ?? 0, 2, { status: "done" })).toMatchObject({
+    conflict: { nextAction: "Merge it.", status: "active" },
+  });
+  await loaded.cleanup?.();
+  db.$client.close();
 });
 
 test("a delegated task waits as an unfinished worker in the dot's memory", async () => {

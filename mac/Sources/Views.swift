@@ -73,16 +73,24 @@ struct ExpandedView: View {
       if !store.loaded {
         centered("Connecting…")
       } else {
-        tabs
+        HStack(spacing: 8) {
+          tabs
+          if !store.showingFeed, store.status == nil, store.selected != nil { modes }
+        }
         if store.showingFeed {
           FeedList(store: store)
         } else if let status = store.status {
           centered(status)
         } else if let name = store.selected, let dot = store.dots.first(where: { $0.name == name }) {
-          Conversation(store: store, name: name)
-            .id(name)
-          if !dot.workers.isEmpty { workers(dot.workers) }
-          composer(name)
+          if store.showingMemory {
+            MemoryView(store: store, name: name)
+              .id("memory-\(name)")
+          } else {
+            Conversation(store: store, name: name)
+              .id(name)
+            if !dot.workers.isEmpty { workers(dot.workers) }
+            composer(name)
+          }
         } else {
           centered("No dots yet. Create one with open-dot create.")
         }
@@ -138,6 +146,18 @@ struct ExpandedView: View {
       }
     }
     .scrollIndicators(.hidden)
+  }
+
+  /// The selected dot's chat, or its notes, responsibilities and reminders.
+  private var modes: some View {
+    Picker("View", selection: Binding { store.showingMemory } set: { store.showMemory($0) }) {
+      Text("Chat").tag(false)
+      Text("Memory").tag(true)
+    }
+    .pickerStyle(.segmented)
+    .labelsHidden()
+    .fixedSize()
+    .accessibilityIdentifier("dot-mode")
   }
 
   private func workers(_ workers: [Dot.Worker]) -> some View {
@@ -1523,7 +1543,7 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
 }
 
 /// Runs an alert while holding the notch open, so it doesn't fold away behind it.
-@MainActor private func runAlert(_ alert: NSAlert, _ store: Store) -> NSApplication.ModalResponse {
+@MainActor func runAlert(_ alert: NSAlert, _ store: Store) -> NSApplication.ModalResponse {
   store.hold()
   defer { store.release() }
   NSApp.activate()

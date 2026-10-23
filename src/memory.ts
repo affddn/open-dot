@@ -1,0 +1,311 @@
+import { and, asc, desc, eq, ne } from "drizzle-orm";
+import type { Db } from "./db";
+import {
+  type Note,
+  notes,
+  type Reminder,
+  reminders,
+  type Responsibility,
+  responsibilities,
+  responsibilityStatuses,
+} from "./schema";
+
+/** The longest note, goal or next action the owner can save, in UTF-16 code units. */
+export const memoryTextLimit = 2000;
+/** The longest repeat interval the owner can set: a year, in minutes. */
+export const maxEveryMinutes = 365 * 24 * 60;
+/** How far ahead the owner can move a reminder. */
+const horizon = 10 * 365 * 24 * 60 * 60_000;
+/** Finished responsibilities shown, most recently changed first, so one can be reopened. */
+const finishedShown = 50;
+
+const meta = (row: {
+  id: number;
+  version: number;
+  createdAt: number;
+  updatedAt: number | null;
+  updatedBy: string;
+}) => ({
+  id: row.id,
+  version: row.version,
+  createdAt: row.createdAt,
+  updatedAt: row.updatedAt ?? row.createdAt,
+  updatedBy: row.updatedBy,
+});
+
+export const noteView = (row: Note) => ({ ...meta(row), text: row.text });
+
+export const responsibilityView = (row: Responsibility) => ({
+  ...meta(row),
+  goal: row.goal,
+  nextAction: row.nextAction,
+  status: row.status,
+});
+
+export const reminderView = (row: Reminder) => ({
+  ...meta(row),
+  text: row.text,
+  dueAt: row.dueAt,
+  everyMinutes: row.everyMinutes,
+  state: row.state,
+});
+
+/** What the dot's memory snapshot draws from, as the notch shows it. */
+export const readMemory = (db: Db, dot: string) => ({
+  notes: db
+    .select()
+    .from(notes)
+    .where(eq(notes.dot, dot))
+    .orderBy(asc(notes.id))
+    .all()
+    .map(noteView),
+  responsibilities: [
+    ...db
+      .select()
+      .from(responsibilities)
+      .where(and(eq(responsibilities.dot, dot), eq(responsibilities.status, "active")))
+      .orderBy(asc(responsibilities.id))
+      .all(),
+    ...db
+      .select()
+      .from(responsibilities)
+      .where(and(eq(responsibilities.dot, dot), ne(responsibilities.status, "active")))
+      .orderBy(desc(responsibilities.updatedAt), desc(responsibilities.id))
+      .limit(finishedShown)
+      .all(),
+  ].map(responsibilityView),
+  reminders: db
+    .select()
+    .from(reminders)
+    .where(and(eq(reminders.dot, dot), eq(reminders.state, "scheduled")))
+    .orderBy(asc(reminders.dueAt), asc(reminders.id))
+    .all()
+    .map(reminderView),
+});
+
+type Invalid = { readonly invalid: string };
+type Fields = Record<string, unknown>;
+
+const object = (body: unknown): body is Fields =>
+  typeof body === "object" && body !== null && !Array.isArray(body);
+
+const onlyKeys = (body: Fields, allowed: readonly string[]) =>
+  Object.keys(body).every((key) => allowed.includes(key));
+
+export const isID = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+
+/** Text the owner typed: not blank, bounded, and no control characters except newline and tab. */
+const memoryText = (value: unknown, name: string): string | Invalid => {
+  if (typeof value !== "string") return { invalid: `${name} must be a string.` };
+  const text = value.trim();
+  if (!text) return { invalid: `${name} can't be blank.` };
+  if (text.length > memoryTextLimit)
+    return { invalid: `${name} must be at most ${memoryTextLimit} characters.` };
+  if (
+    Array.from(text).some((character) => {
+      const code = character.charCodeAt(0);
+      return (code <= 31 && code !== 9 && code !== 10) || (code >= 127 && code <= 159);
+    })
+  )
+    return { invalid: `${name} can't contain control characters.` };
+  return text;
+};
+
+const invalid = (value: unknown): value is Invalid => object(value) && "invalid" in value;
+
+export function parseNote(body: unknown): { text: string } | Invalid {
+  if (!object(body) || !onlyKeys(body, ["text"]) || !("text" in body))
+    return { invalid: "Send {text}." };
+  const text = memoryText(body.text, "text");
+  return invalid(text) ? text : { text };
+}
+
+export function parseNoteEdit(body: unknown): { version: number; text: string } | Invalid {
+  const usage = { invalid: "Send {version, text}." };
+  if (!object(body) || !onlyKeys(body, ["version", "text"])) return usage;
+  const { version } = body;
+  if (!isID(version)) return usage;
+  const text = memoryText(body.text, "text");
+  return invalid(text) ? text : { version, text };
+}
+
+export function parseResponsibilityEdit(body: unknown):
+  | {
+      version: number;
+      change: Partial<Pick<Responsibility, "goal" | "nextAction" | "status">>;
+    }
+  | Invalid {
+  const usage = { invalid: "Send {version} and at least one of goal, nextAction and status." };
+  if (!object(body) || !onlyKeys(body, ["version", "goal", "nextAction", "status"])) return usage;
+  const { version } = body;
+  if (!isID(version) || Object.keys(body).length < 2) return usage;
+  const change: Partial<Pick<Responsibility, "goal" | "nextAction" | "status">> = {};
+  if ("goal" in body) {
+    const goal = memoryText(body.goal, "goal");
+    if (invalid(goal)) return goal;
+    change.goal = goal;
+  }
+  if ("nextAction" in body) {
+    const next = memoryText(body.nextAction, "nextAction");
+    if (invalid(next)) return next;
+    change.nextAction = next;
+  }
+  if ("status" in body) {
+    const wanted = body.status;
+    const status = responsibilityStatuses.find((value) => value === wanted);
+    if (!status) return { invalid: "status must be active, done or dropped." };
+    change.status = status;
+  }
+  return { version, change };
+}
+
+export function parseReminderEdit(
+  body: unknown,
+  now: number,
+): { version: number; change: Partial<Pick<Reminder, "dueAt" | "everyMinutes">> } | Invalid {
+  const usage = { invalid: "Send {version} and at least one of dueAt and everyMinutes." };
+  if (!object(body) || !onlyKeys(body, ["version", "dueAt", "everyMinutes"])) return usage;
+  const { version } = body;
+  if (!isID(version) || Object.keys(body).length < 2) return usage;
+  const change: Partial<Pick<Reminder, "dueAt" | "everyMinutes">> = {};
+  if ("dueAt" in body) {
+    const { dueAt } = body;
+    if (!isID(dueAt)) return { invalid: "dueAt must be a time in milliseconds." };
+    if (dueAt <= now) return { invalid: "dueAt must be in the future." };
+    if (dueAt > now + horizon) return { invalid: "dueAt must be within ten years from now." };
+    change.dueAt = dueAt;
+  }
+  if ("everyMinutes" in body) {
+    const every = body.everyMinutes;
+    if (every === null) change.everyMinutes = null;
+    else if (isID(every) && every <= maxEveryMinutes) change.everyMinutes = every;
+    else
+      return {
+        invalid: `everyMinutes must be null, or whole minutes from 1 to ${maxEveryMinutes}.`,
+      };
+  }
+  return { version, change };
+}
+
+/**
+ * Where an owner's change landed. "conflict" means the item changed since the version the owner
+ * saw, or a reminder is no longer scheduled, so nothing was saved and `current` is what it is now.
+ * "missing" means this dot has no such item, for example because it was deleted.
+ */
+export type Outcome<T> =
+  | { readonly saved: T }
+  | { readonly deleted: true }
+  | { readonly conflict: T }
+  | { readonly missing: true };
+
+const missing = { missing: true } as const;
+const deleted = { deleted: true } as const;
+const owner = (version: number) => ({
+  version: version + 1,
+  updatedAt: Date.now(),
+  updatedBy: "owner" as const,
+});
+
+export const addNote = (db: Db, dot: string, text: string) => {
+  const now = Date.now();
+  return noteView(
+    db
+      .insert(notes)
+      .values({ dot, text, createdAt: now, updatedAt: now, updatedBy: "owner" })
+      .returning()
+      .get(),
+  );
+};
+
+const noteKey = (dot: string, id: number) => and(eq(notes.id, id), eq(notes.dot, dot));
+
+/** Changes the note only if it's still at `version`, in one statement. */
+export const editNote = (db: Db, dot: string, id: number, version: number, text: string) =>
+  db.transaction((tx): Outcome<ReturnType<typeof noteView>> => {
+    const saved = tx
+      .update(notes)
+      .set({ text, ...owner(version) })
+      .where(and(noteKey(dot, id), eq(notes.version, version)))
+      .returning()
+      .get();
+    if (saved) return { saved: noteView(saved) };
+    const current = tx.select().from(notes).where(noteKey(dot, id)).get();
+    return current ? { conflict: noteView(current) } : missing;
+  });
+
+export const deleteNote = (db: Db, dot: string, id: number, version: number) =>
+  db.transaction((tx): Outcome<ReturnType<typeof noteView>> => {
+    const removed = tx
+      .delete(notes)
+      .where(and(noteKey(dot, id), eq(notes.version, version)))
+      .returning({ id: notes.id })
+      .get();
+    if (removed) return deleted;
+    const current = tx.select().from(notes).where(noteKey(dot, id)).get();
+    return current ? { conflict: noteView(current) } : missing;
+  });
+
+const responsibilityKey = (dot: string, id: number) =>
+  and(eq(responsibilities.id, id), eq(responsibilities.dot, dot));
+
+export const editResponsibility = (
+  db: Db,
+  dot: string,
+  id: number,
+  version: number,
+  change: Partial<Pick<Responsibility, "goal" | "nextAction" | "status">>,
+) =>
+  db.transaction((tx): Outcome<ReturnType<typeof responsibilityView>> => {
+    const saved = tx
+      .update(responsibilities)
+      .set({ ...change, ...owner(version) })
+      .where(and(responsibilityKey(dot, id), eq(responsibilities.version, version)))
+      .returning()
+      .get();
+    if (saved) return { saved: responsibilityView(saved) };
+    const current = tx.select().from(responsibilities).where(responsibilityKey(dot, id)).get();
+    return current ? { conflict: responsibilityView(current) } : missing;
+  });
+
+const reminderKey = (dot: string, id: number) => and(eq(reminders.id, id), eq(reminders.dot, dot));
+
+/**
+ * Changes a scheduled reminder only if it's still at `version`. The daemon claims a due reminder
+ * only at the version it read, so a stale claim can't send the old time or undo this change.
+ */
+export const editReminder = (
+  db: Db,
+  dot: string,
+  id: number,
+  version: number,
+  change: Partial<Pick<Reminder, "dueAt" | "everyMinutes">>,
+) =>
+  db.transaction((tx): Outcome<ReturnType<typeof reminderView>> => {
+    const saved = tx
+      .update(reminders)
+      .set({ ...change, ...owner(version) })
+      .where(
+        and(reminderKey(dot, id), eq(reminders.version, version), eq(reminders.state, "scheduled")),
+      )
+      .returning()
+      .get();
+    if (saved) return { saved: reminderView(saved) };
+    const current = tx.select().from(reminders).where(reminderKey(dot, id)).get();
+    return current ? { conflict: reminderView(current) } : missing;
+  });
+
+/** Deletes a scheduled reminder at `version`, as `dot_cancel` does, so it never fires. */
+export const cancelReminder = (db: Db, dot: string, id: number, version: number) =>
+  db.transaction((tx): Outcome<ReturnType<typeof reminderView>> => {
+    const removed = tx
+      .delete(reminders)
+      .where(
+        and(reminderKey(dot, id), eq(reminders.version, version), eq(reminders.state, "scheduled")),
+      )
+      .returning({ id: reminders.id })
+      .get();
+    if (removed) return deleted;
+    const current = tx.select().from(reminders).where(reminderKey(dot, id)).get();
+    return current ? { conflict: reminderView(current) } : missing;
+  });

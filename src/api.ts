@@ -4,6 +4,20 @@ import { Effect, type Layer } from "effect";
 import type { Db } from "./db";
 import { findDot, listDots } from "./dots";
 import { dismiss, dismissAll, handedOffFeed, unreadFeed } from "./feed";
+import {
+  addNote,
+  cancelReminder,
+  deleteNote,
+  editNote,
+  editReminder,
+  editResponsibility,
+  type Outcome,
+  parseNote,
+  parseNoteEdit,
+  parseReminderEdit,
+  parseResponsibilityEdit,
+  readMemory,
+} from "./memory";
 import { type Attachment, OpenCode, type Entry, type OpenCodeError } from "./opencode";
 import {
   currentReactions,
@@ -589,6 +603,92 @@ const feedRoute = (db: Db, request: Request, path: string[]) => {
   return error(404, "Not found");
 };
 
+const memoryBodyLimit = 64 * 1024;
+const positive = /^[1-9]\d{0,15}$/;
+
+const answer = <T>(outcome: Outcome<T>, key: string) => {
+  if ("saved" in outcome) return Response.json({ [key]: outcome.saved });
+  if ("deleted" in outcome) return new Response(null, { status: 204 });
+  if ("conflict" in outcome)
+    return Response.json(
+      {
+        error:
+          "This changed since you loaded it, or is no longer scheduled, so nothing was saved. This is its current value.",
+        current: outcome.conflict,
+      },
+      { status: 409 },
+    );
+  return error(404, "There's no such item for this dot. It may have been deleted.");
+};
+
+/**
+ * The owner's view and edits of a dot's notes, responsibilities and reminders. Every item is
+ * scoped to the named dot, and every change needs the version the owner saw. Nothing here starts
+ * a turn: the dot sees the result in its next memory snapshot. OpenCode isn't needed.
+ */
+const memoryRoute = async (db: Db, request: Request, path: string[]) => {
+  const [, name = "", , kind, rawID, ...extra] = path;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(name);
+  } catch {
+    return error(400, "Bad dot name.");
+  }
+  const dot = findDot(db, decoded);
+  if (!dot) return error(404, `There's no dot named "${name}".`);
+  const { method } = request;
+  if (extra.length) return error(404, "Not found");
+  if (kind === undefined)
+    return method === "GET" ? Response.json(readMemory(db, dot.name)) : error(404, "Not found");
+  if (kind !== "notes" && kind !== "responsibilities" && kind !== "reminders")
+    return error(404, "Not found");
+  const body = async () => {
+    const value = await messageBody(request, memoryBodyLimit).catch(() => undefined);
+    return value instanceof Response ? value : { read: value };
+  };
+  if (rawID === undefined) {
+    if (kind !== "notes" || method !== "POST") return error(404, "Not found");
+    const input = await body();
+    if (input instanceof Response) return input;
+    const note = parseNote(input.read);
+    if ("invalid" in note) return error(400, note.invalid);
+    return Response.json({ note: addNote(db, dot.name, note.text) }, { status: 201 });
+  }
+  if (!positive.test(rawID) || !Number.isSafeInteger(Number(rawID)))
+    return error(404, "There's no such item for this dot.");
+  const id = Number(rawID);
+  if (method === "DELETE" && kind !== "responsibilities") {
+    const params = [...new URL(request.url).searchParams];
+    const [key, value = ""] = params[0] ?? [];
+    if (params.length !== 1 || key !== "version" || !positive.test(value))
+      return error(400, "Send ?version=<the version you saw>.");
+    const version = Number(value);
+    if (!Number.isSafeInteger(version)) return error(400, "Send ?version=<the version you saw>.");
+    return kind === "notes"
+      ? answer(deleteNote(db, dot.name, id, version), "note")
+      : answer(cancelReminder(db, dot.name, id, version), "reminder");
+  }
+  if (method !== "PATCH") return error(404, "Not found");
+  const input = await body();
+  if (input instanceof Response) return input;
+  if (kind === "notes") {
+    const edit = parseNoteEdit(input.read);
+    if ("invalid" in edit) return error(400, edit.invalid);
+    return answer(editNote(db, dot.name, id, edit.version, edit.text), "note");
+  }
+  if (kind === "responsibilities") {
+    const edit = parseResponsibilityEdit(input.read);
+    if ("invalid" in edit) return error(400, edit.invalid);
+    return answer(
+      editResponsibility(db, dot.name, id, edit.version, edit.change),
+      "responsibility",
+    );
+  }
+  const edit = parseReminderEdit(input.read, Date.now());
+  if ("invalid" in edit) return error(400, edit.invalid);
+  return answer(editReminder(db, dot.name, id, edit.version, edit.change), "reminder");
+};
+
 const route = (
   db: Db,
   request: Request,
@@ -653,6 +753,11 @@ export const api =
       return Promise.resolve(error(401, "Unauthorized"));
     const path = new URL(request.url).pathname.split("/").filter(Boolean);
     if (path[0] === "feed") return Promise.resolve(feedRoute(db, request, path.slice(1)));
+    if (path[0] === "dots" && path[2] === "memory")
+      return memoryRoute(db, request, path).catch((cause) => {
+        console.error(`Memory: ${cause instanceof Error ? cause.message : String(cause)}`);
+        return error(500, "Couldn't read or save the dot's memory.");
+      });
     return Effect.runPromise(
       route(db, request, path).pipe(
         Effect.provide(layer),

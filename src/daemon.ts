@@ -38,11 +38,16 @@ export const enqueue = (
 const nextOccurrence = (dueAt: number, every: number, now: number) =>
   dueAt + (Math.floor((now - dueAt) / every) + 1) * every;
 
-/** Moves each due reminder into the outbox, and moves a repeating one to its next occurrence. */
+/**
+ * Moves each due reminder into the outbox, and moves a repeating one to its next occurrence.
+ * Each claim needs the version it read, so a reminder the owner or dot changed or cancelled since
+ * is neither sent from the stale read nor overwritten; the next tick reads it again.
+ */
 export function claimDue(db: Db, now: number) {
   const due = db
     .select({
       id: reminders.id,
+      version: reminders.version,
       text: reminders.text,
       dueAt: reminders.dueAt,
       everyMinutes: reminders.everyMinutes,
@@ -59,12 +64,20 @@ export function claimDue(db: Db, now: number) {
       const every = reminder.everyMinutes ? reminder.everyMinutes * 60_000 : undefined;
       const claimed = tx
         .update(reminders)
-        .set(every ? { dueAt: nextOccurrence(reminder.dueAt, every, now) } : { state: "sent" })
+        .set({
+          ...(every
+            ? { dueAt: nextOccurrence(reminder.dueAt, every, now) }
+            : { state: "sent" as const }),
+          version: reminder.version + 1,
+          updatedAt: now,
+          updatedBy: "scheduler",
+        })
         .where(
           and(
             eq(reminders.id, reminder.id),
             eq(reminders.state, "scheduled"),
             eq(reminders.dueAt, reminder.dueAt),
+            eq(reminders.version, reminder.version),
           ),
         )
         .returning({ id: reminders.id })

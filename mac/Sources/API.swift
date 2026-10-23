@@ -95,6 +95,77 @@ struct FeedItem: Decodable, Equatable, Identifiable {
   let handedTo: [String]?
 }
 
+/// Who last changed a memory item, how it's shown, and when. Each change needs the version seen.
+struct MemoryNote: Decodable, Equatable, Identifiable {
+  let id: Int
+  let version: Int
+  let updatedAt: Double
+  let updatedBy: String
+  let text: String
+}
+
+struct MemoryResponsibility: Decodable, Equatable, Identifiable {
+  let id: Int
+  let version: Int
+  let updatedAt: Double
+  let updatedBy: String
+  let goal: String
+  let nextAction: String
+  let status: String
+}
+
+struct MemoryReminder: Decodable, Equatable, Identifiable {
+  let id: Int
+  let version: Int
+  let updatedAt: Double
+  let updatedBy: String
+  let text: String
+  let dueAt: Double
+  let everyMinutes: Int?
+  /// "scheduled", or "sent" once a one-off reminder went off.
+  let state: String
+}
+
+struct Memory: Decodable, Equatable {
+  var notes: [MemoryNote]
+  var responsibilities: [MemoryResponsibility]
+  var reminders: [MemoryReminder]
+}
+
+enum MemoryKind: String {
+  case note = "notes"
+  case responsibility = "responsibilities"
+  case reminder = "reminders"
+}
+
+struct MemoryKey: Hashable {
+  let kind: MemoryKind
+  let id: Int
+}
+
+enum MemoryItem: Equatable {
+  case note(MemoryNote)
+  case responsibility(MemoryResponsibility)
+  case reminder(MemoryReminder)
+
+  var key: MemoryKey {
+    switch self {
+    case .note(let note): MemoryKey(kind: .note, id: note.id)
+    case .responsibility(let item): MemoryKey(kind: .responsibility, id: item.id)
+    case .reminder(let reminder): MemoryKey(kind: .reminder, id: reminder.id)
+    }
+  }
+}
+
+/// How the daemon answered a memory change. A conflict carries the item's current value, and
+/// `gone` means the dot has no such item any more. Nothing is ever retried on its own.
+enum MemoryOutcome: Equatable {
+  case saved(MemoryItem)
+  case deleted
+  case conflict(MemoryItem, String)
+  case gone(String)
+}
+
 enum APIError: Error {
   case unreachable
   case lost
@@ -193,9 +264,74 @@ enum APIError: Error {
     return (result.dismissed, result.missing)
   }
 
+  func memory(_ dot: String) async throws -> Memory {
+    try decode(Memory.self, await send("GET", "/dots/\(escape(dot))/memory"))
+  }
+
+  /// Adds the owner's note. Never retried on its own.
+  func addNote(_ dot: String, text: String) async throws -> MemoryNote {
+    struct Body: Decodable { let note: MemoryNote }
+    let body = try JSONSerialization.data(withJSONObject: ["text": text])
+    return try decode(Body.self, await send("POST", "/dots/\(escape(dot))/memory/notes", body: body)).note
+  }
+
+  /// Changes one item, with a JSON body that names the version the owner saw, or deletes or cancels
+  /// it at that version when `body` is nil. Never retried on its own.
+  func changeMemory(_ dot: String, _ key: MemoryKey, version: Int, body: Data?) async throws -> MemoryOutcome {
+    let path = "/dots/\(escape(dot))/memory/\(key.kind.rawValue)/\(key.id)"
+    let status: Int
+    let data: Data
+    if let body {
+      (status, data) = try await exchange("PATCH", path, body: body)
+    } else {
+      (status, data) = try await exchange("DELETE", "\(path)?version=\(version)")
+    }
+    struct Failure: Decodable { let error: String }
+    let message = (try? JSONDecoder().decode(Failure.self, from: data))?.error ?? HTTPURLResponse.localizedString(forStatusCode: status)
+    switch status {
+    case 204 where body == nil: return .deleted
+    case 200 where body != nil: return .saved(try item(key, data, conflict: false))
+    case 409: return .conflict(try item(key, data, conflict: true), message)
+    case 404: return .gone(message)
+    default: throw APIError.server(message)
+    }
+  }
+
+  /// The saved item, or a conflict's current value, which must be the item that was changed.
+  private func item(_ key: MemoryKey, _ data: Data, conflict: Bool) throws -> MemoryItem {
+    struct Notes: Decodable { let note: MemoryNote?; let current: MemoryNote? }
+    struct Responsibilities: Decodable { let responsibility: MemoryResponsibility?; let current: MemoryResponsibility? }
+    struct Reminders: Decodable { let reminder: MemoryReminder?; let current: MemoryReminder? }
+    let decoder = JSONDecoder()
+    let item: MemoryItem?
+    switch key.kind {
+    case .note:
+      let body = try? decoder.decode(Notes.self, from: data)
+      item = (conflict ? body?.current : body?.note).map(MemoryItem.note)
+    case .responsibility:
+      let body = try? decoder.decode(Responsibilities.self, from: data)
+      item = (conflict ? body?.current : body?.responsibility).map(MemoryItem.responsibility)
+    case .reminder:
+      let body = try? decoder.decode(Reminders.self, from: data)
+      item = (conflict ? body?.current : body?.reminder).map(MemoryItem.reminder)
+    }
+    guard let item, item.key == key else { throw APIError.server("Unexpected response from the open-dot daemon") }
+    return item
+  }
+
   // The daemon picks a new port and token on every start, so a failed connection or a 401
   // drops the cached endpoint and the next request reads api.json again.
   private func send(_ method: String, _ path: String, body: Data? = nil) async throws -> Data {
+    let (status, data) = try await exchange(method, path, body: body)
+    guard (200..<300).contains(status) else {
+      struct Failure: Decodable { let error: String }
+      let text = (try? JSONDecoder().decode(Failure.self, from: data))?.error
+      throw APIError.server(text ?? HTTPURLResponse.localizedString(forStatusCode: status))
+    }
+    return data
+  }
+
+  private func exchange(_ method: String, _ path: String, body: Data? = nil) async throws -> (Int, Data) {
     guard let endpoint = endpoint ?? load(), let url = URL(string: endpoint.url + path) else {
       throw APIError.unreachable
     }
@@ -219,12 +355,7 @@ enum APIError: Error {
     }
     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
     if status == 401 { self.endpoint = nil }
-    guard (200..<300).contains(status) else {
-      struct Failure: Decodable { let error: String }
-      let text = (try? JSONDecoder().decode(Failure.self, from: data))?.error
-      throw APIError.server(text ?? HTTPURLResponse.localizedString(forStatusCode: status))
-    }
-    return data
+    return (status, data)
   }
 
   private func load() -> Endpoint? {

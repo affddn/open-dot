@@ -14,6 +14,24 @@ export const dots = sqliteTable("dots", {
 
 export type Dot = typeof dots.$inferSelect;
 
+/**
+ * Who last changed a note, responsibility or reminder: the dot, the owner in the notch, or the
+ * daemon's schedule moving or sending a reminder.
+ */
+export const memoryActors = ["dot", "owner", "scheduler"] as const;
+
+/**
+ * Each note, responsibility and reminder carries a version for the owner's optimistic edits.
+ * Only the owner's API and the daemon's schedule advance it themselves. A database trigger
+ * (migration 0020) advances it, stamps the time and records the dot for any other update, so a
+ * running plugin from before the migration still invalidates the owner's stale edits.
+ * A null `updated_at` on a note or reminder means unchanged since `created_at`.
+ */
+const versioned = () => ({
+  version: integer().notNull().default(1),
+  updatedBy: text("updated_by", { enum: memoryActors }).notNull().default("dot"),
+});
+
 export const reminders = sqliteTable("reminders", {
   id: integer().primaryKey({ autoIncrement: true }),
   dot: text()
@@ -27,7 +45,11 @@ export const reminders = sqliteTable("reminders", {
   // The original Slack destination for the persisted reminder notice.
   route: text({ mode: "json" }).$type<Route>(),
   createdAt: integer("created_at").notNull(),
+  updatedAt: integer("updated_at"),
+  ...versioned(),
 });
+
+export type Reminder = typeof reminders.$inferSelect;
 
 /**
  * Where the dot's answer to a message goes in Slack: a thread in the owner's DM with the shared
@@ -201,7 +223,13 @@ export const notes = sqliteTable("notes", {
     .references(() => dots.name),
   text: text().notNull(),
   createdAt: integer("created_at").notNull(),
+  updatedAt: integer("updated_at"),
+  ...versioned(),
 });
+
+export type Note = typeof notes.$inferSelect;
+
+export const responsibilityStatuses = ["active", "done", "dropped"] as const;
 
 /** Ongoing goals a dot owns, with the next thing it plans to do about each. */
 export const responsibilities = sqliteTable("responsibilities", {
@@ -211,10 +239,13 @@ export const responsibilities = sqliteTable("responsibilities", {
     .references(() => dots.name),
   goal: text().notNull(),
   nextAction: text("next_action").notNull(),
-  status: text({ enum: ["active", "done", "dropped"] }).notNull(),
+  status: text({ enum: responsibilityStatuses }).notNull(),
   createdAt: integer("created_at").notNull(),
   updatedAt: integer("updated_at").notNull(),
+  ...versioned(),
 });
+
+export type Responsibility = typeof responsibilities.$inferSelect;
 
 /** Work a dot handed to a separate OpenCode session. */
 export const workers = sqliteTable("workers", {
