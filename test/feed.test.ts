@@ -1,6 +1,16 @@
 import { beforeEach, expect, test } from "bun:test";
 import { type Db, openDatabase } from "../src/db";
-import { collect, dismiss, github, type Item, linear, type Source, unreadFeed } from "../src/feed";
+import { eq } from "drizzle-orm";
+import {
+  collect,
+  dismiss,
+  dismissAll,
+  github,
+  type Item,
+  linear,
+  type Source,
+  unreadFeed,
+} from "../src/feed";
 import { feed } from "../src/schema";
 
 let db: Db;
@@ -85,6 +95,33 @@ test("dismissing hides an item and marks it read at the source once", async () =
   source.listed = [item("a", 50)];
   await collect(db, source, 500);
   expect(shown()).toEqual(["a"]);
+});
+
+test("clearing several marks each read at the source on the next pass, like single dismissals", async () => {
+  const { source, marked } = fakeSource([item("a", 10), item("b", 20), item("h", 5)]);
+  await collect(db, source, 100);
+  const id = (sourceID: string) =>
+    db
+      .select()
+      .from(feed)
+      .all()
+      .find((row) => row.sourceID === sourceID)?.id ?? 0;
+  db.update(feed)
+    .set({ state: "handed-off" })
+    .where(eq(feed.id, id("h")))
+    .run();
+
+  expect(dismissAll(db, [id("a"), id("b"), id("h"), 999])).toEqual({
+    dismissed: [id("a"), id("b"), id("h")],
+    missing: [999],
+  });
+  // Nothing is marked read at the source until the daemon's next pass.
+  expect(marked).toEqual([]);
+  source.listed = [item("a", 10), item("b", 20), item("h", 5), item("c", 30)];
+  await collect(db, source, 200);
+  expect(marked).toEqual(["a", "b"]);
+  expect([state("a"), state("b"), state("h")]).toEqual(["cleared", "cleared", "handed-off"]);
+  expect(shown()).toEqual(["c"]);
 });
 
 test("activity after a dismissal brings the item back instead of marking it read", async () => {

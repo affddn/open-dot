@@ -439,53 +439,80 @@ struct FeedList: View {
     } else if let status = store.feedStatus {
       Text(status).foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
     } else if items.isEmpty && store.handedOff.isEmpty {
-      Text("Nothing needs you right now.").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+      Text(store.feedRemaining > 0 ? "More unread items will appear on refresh." : "Nothing needs you right now.")
+        .foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
     } else {
-      GeometryReader { viewport in
-        ScrollViewReader { proxy in
-          ScrollView {
-            VStack(spacing: 6) {
-              handed
-              ForEach(items) { item in row(item, dismiss: { store.dismissFeed(item) }) }
-              Color.clear.frame(height: 1).id("end").background {
-                GeometryReader { end in
-                  Color.clear.onChange(of: end.frame(in: .named("feed")).minY <= viewport.size.height + 8, initial: true) {
-                    atBottom = $1
-                    if $1 { unseen = 0 }
-                  }
+      VStack(spacing: 6) {
+        if !items.isEmpty { clearAll }
+        list(items)
+      }
+    }
+  }
+
+  /// Dismisses the unread items shown, like their own dismiss buttons. Handed-off items stay.
+  private var clearAll: some View {
+    HStack {
+      if store.feedRemaining > 0 {
+        Text("\(store.feed.count) shown · at least \(store.feedRemaining) more")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+      Spacer()
+      Button("Clear all") { store.clearFeed() }
+        .buttonStyle(.plain)
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(.secondary)
+        .help("Dismiss every unread item shown")
+        .accessibilityLabel("Clear all unread")
+        .accessibilityIdentifier("feed-clear-all")
+    }
+  }
+
+  private func list(_ items: [FeedItem]) -> some View {
+    GeometryReader { viewport in
+      ScrollViewReader { proxy in
+        ScrollView {
+          VStack(spacing: 6) {
+            handed
+            ForEach(items) { item in row(item, dismiss: { store.dismissFeed(item) }) }
+            Color.clear.frame(height: 1).id("end").background {
+              GeometryReader { end in
+                Color.clear.onChange(of: end.frame(in: .named("feed")).minY <= viewport.size.height + 8, initial: true) {
+                  atBottom = $1
+                  if $1 { unseen = 0 }
                 }
               }
             }
           }
-          .coordinateSpace(name: "feed")
-          .scrollIndicators(.never)
-          .onAppear { proxy.scrollTo("end", anchor: .bottom) }
-          .onChange(of: items.map(\.id)) { old, new in
-            if atBottom {
-              proxy.scrollTo("end", anchor: .bottom)
-            } else {
-              unseen += Set(new).subtracting(old).count
-            }
+        }
+        .coordinateSpace(name: "feed")
+        .scrollIndicators(.never)
+        .onAppear { proxy.scrollTo("end", anchor: .bottom) }
+        .onChange(of: items.map(\.id)) { old, new in
+          if atBottom {
+            proxy.scrollTo("end", anchor: .bottom)
+          } else {
+            unseen += Set(new).subtracting(old).count
           }
-          .overlay(alignment: .bottom) {
-            if unseen > 0 {
-              Button { withAnimation { proxy.scrollTo("end", anchor: .bottom) } } label: {
-                Text("\(unseen) new")
-                  .font(.caption.weight(.semibold))
-                  .padding(.horizontal, 10)
-                  .padding(.vertical, 4)
-                  .background(Capsule().fill(messageBlue))
-              }
-              .buttonStyle(.plain)
-              .padding(.bottom, 6)
-              .accessibilityIdentifier("feed-new")
+        }
+        .overlay(alignment: .bottom) {
+          if unseen > 0 {
+            Button { withAnimation { proxy.scrollTo("end", anchor: .bottom) } } label: {
+              Text("\(unseen) new")
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(messageBlue))
             }
+            .buttonStyle(.plain)
+            .padding(.bottom, 6)
+            .accessibilityIdentifier("feed-new")
           }
         }
       }
-      .accessibilityElement(children: .contain)
-      .accessibilityIdentifier("feed-list")
     }
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("feed-list")
   }
 
   private func row(_ item: FeedItem, dismiss: (() -> Void)? = nil) -> some View {

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import { Schema } from "effect";
 import type { Db } from "./db";
 import { feed, type FeedItem } from "./schema";
@@ -94,16 +94,33 @@ export const handedOffFeed = (db: Db) =>
     .toReversed();
 
 /**
- * Hides an item now, and the daemon marks it read at its source on its next pass.
- * False when there's no such item. Dismissing it again changes nothing.
+ * Hides unread items now, and the daemon marks each read at its source on its next pass. Each
+ * known ID is dismissed, though only an unread item changes; dismissing it again or one handed off
+ * changes nothing. Missing lists IDs with no item. All or none is saved.
  */
-export function dismiss(db: Db, id: number) {
-  db.update(feed)
-    .set({ state: "dismissed" })
-    .where(and(eq(feed.id, id), eq(feed.state, "unread")))
-    .run();
-  return db.select({ id: feed.id }).from(feed).where(eq(feed.id, id)).get() !== undefined;
+export function dismissAll(db: Db, ids: readonly number[]) {
+  return db.transaction((tx) => {
+    tx.update(feed)
+      .set({ state: "dismissed" })
+      .where(and(inArray(feed.id, [...ids]), eq(feed.state, "unread")))
+      .run();
+    const known = new Set(
+      tx
+        .select({ id: feed.id })
+        .from(feed)
+        .where(inArray(feed.id, [...ids]))
+        .all()
+        .map((row) => row.id),
+    );
+    return {
+      dismissed: ids.filter((id) => known.has(id)),
+      missing: ids.filter((id) => !known.has(id)),
+    };
+  });
 }
+
+/** Dismisses one item. False when there's no such item. */
+export const dismiss = (db: Db, id: number) => dismissAll(db, [id]).dismissed.length === 1;
 
 /**
  * A command's trimmed output, or undefined when it fails, isn't installed or takes over 10 seconds,

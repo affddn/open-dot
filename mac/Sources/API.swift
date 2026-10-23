@@ -175,14 +175,22 @@ enum APIError: Error {
     return try await send("GET", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/attachments/\(key.index)\(pin)")
   }
 
-  func feed() async throws -> (items: [FeedItem], handedOff: [FeedItem]) {
-    struct Body: Decodable { let items: [FeedItem]; let handedOff: [FeedItem]? }
+  func feed() async throws -> (items: [FeedItem], handedOff: [FeedItem], remaining: Int) {
+    struct Body: Decodable { let items: [FeedItem]; let handedOff: [FeedItem]?; let remaining: Int? }
     let body = try decode(Body.self, await send("GET", "/feed"))
-    return (body.items, body.handedOff ?? [])
+    return (body.items, body.handedOff ?? [], body.remaining ?? 0)
   }
 
   func dismissFeed(_ id: Int) async throws {
     _ = try await send("POST", "/feed/\(id)/dismiss")
+  }
+
+  /// Dismisses exactly these feed items in one request. Never retried on its own.
+  func dismissFeed(_ ids: [Int]) async throws -> (dismissed: [Int], missing: [Int]) {
+    struct Body: Decodable { let dismissed: [Int]; let missing: [Int] }
+    let body = try JSONSerialization.data(withJSONObject: ["ids": ids])
+    let result = try decode(Body.self, await send("POST", "/feed/dismiss", body: body))
+    return (result.dismissed, result.missing)
   }
 
   // The daemon picks a new port and token on every start, so a failed connection or a 401

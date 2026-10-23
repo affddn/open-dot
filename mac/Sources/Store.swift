@@ -30,6 +30,76 @@ struct Pending: Identifiable {
   var error: String?
 }
 
+/// The unread feed as shown, with the owner's dismissals laid over the daemon's polls. A dismissed
+/// item hides at once. It stays hidden until a poll begun after its dismissal succeeded, so a poll
+/// already in flight can't bring it back. A failed one comes back with its error, and a poll begun
+/// before the failure can't take it away again. Only the newest poll counts.
+struct FeedState {
+  private var allItems: [FeedItem] = []
+  var items: [FeedItem] { Array(allItems.prefix(1000)) }
+  var overflowCount: Int { max(0, allItems.count - 1000) }
+  var errors: [Int: String] = [:]
+  private var hiding: Set<Int> = []
+  private var done: Set<Int> = []
+  /// Failed dismissals put back, with the event count when they were.
+  private var restored: [Int: (item: FeedItem, at: Int)] = [:]
+  private var events = 0
+  private var polls = 0
+
+  struct Poll {
+    fileprivate let number: Int
+    fileprivate let at: Int
+    fileprivate let settled: Set<Int>
+  }
+
+  /// Hides these items and clears their errors while their dismissal is sent.
+  mutating func dismiss(_ ids: [Int]) {
+    hiding.formUnion(ids)
+    allItems.removeAll { ids.contains($0.id) }
+    for id in ids {
+      errors[id] = nil
+      restored[id] = nil
+    }
+  }
+
+  /// What the daemon answered: the IDs it dismissed. Every other one comes back with its error.
+  mutating func finish(_ sent: [FeedItem], dismissed: Set<Int>, error: (Int) -> String) {
+    events += 1
+    for item in sent {
+      if dismissed.contains(item.id) {
+        done.insert(item.id)
+        continue
+      }
+      hiding.remove(item.id)
+      restored[item.id] = (item, events)
+      errors[item.id] = error(item.id)
+      if !allItems.contains(where: { $0.id == item.id }) { allItems.append(item) }
+    }
+    allItems.sort { $0.time < $1.time }
+  }
+
+  mutating func startPoll() -> Poll {
+    polls += 1
+    return Poll(number: polls, at: events, settled: done)
+  }
+
+  func isCurrent(_ poll: Poll) -> Bool { poll.number == polls }
+
+  /// Shows a poll's unread items. False when a newer poll has started, so this one is dropped.
+  mutating func apply(_ poll: Poll, _ listed: [FeedItem]) -> Bool {
+    guard isCurrent(poll) else { return false }
+    hiding.subtract(poll.settled)
+    done.subtract(poll.settled)
+    restored = restored.filter { $0.value.at > poll.at }
+    var next = listed.filter { !hiding.contains($0.id) }
+    for (id, entry) in restored where !hiding.contains(id) && !next.contains(where: { $0.id == id }) {
+      next.append(entry.item)
+    }
+    allItems = next.sorted { $0.time < $1.time }
+    return true
+  }
+}
+
 @MainActor @Observable final class Store {
   var dots: [Dot] = []
   var status: String?
@@ -45,13 +115,19 @@ struct Pending: Identifiable {
   var replyTargets: [String: MessageQuote] = [:]
   var sending: Set<String> = []
   var expanded = false
-  var feed: [FeedItem] = []
+  var feedState = FeedState()
+  var feed: [FeedItem] { feedState.items }
+  private var sourceFeedRemaining = 0
+  var feedRemaining: Int { max(sourceFeedRemaining, feedState.overflowCount) }
   var handedOff: [FeedItem] = []
   /// The feed item being replied to, the dots it goes to in the order picked, and the prompt.
   var replying: FeedItem?
   var replyDots: [String] = []
   var replyDraft = ""
-  var feedErrors: [Int: String] = [:]
+  var feedErrors: [Int: String] {
+    get { feedState.errors }
+    set { feedState.errors = newValue }
+  }
   var feedStatus: String?
   var showingFeed = false
   var thumbnails: [AttachmentKey: NSImage] = [:]
@@ -83,8 +159,6 @@ struct Pending: Identifiable {
   private var newest: [String: Double] = [:]
   private var feedSeen: Double?
   private var feedNewest: Double = 0
-  @ObservationIgnored private var dismissing: Set<Int> = []
-  @ObservationIgnored private var dismissed: Set<Int> = []
   @ObservationIgnored private var loading: Set<AttachmentKey> = []
   @ObservationIgnored private var opening: Set<AttachmentKey> = []
   @ObservationIgnored private let api = API()
@@ -596,20 +670,36 @@ struct Pending: Identifiable {
   }
 
   func dismissFeed(_ item: FeedItem) {
-    dismissing.insert(item.id)
-    feed.removeAll { $0.id == item.id }
-    feedErrors[item.id] = nil
+    feedState.dismiss([item.id])
     Task {
       do {
         try await api.dismissFeed(item.id)
-        dismissed.insert(item.id)
+        feedState.finish([item], dismissed: [item.id]) { _ in "" }
       } catch {
-        dismissing.remove(item.id)
-        if !feed.contains(where: { $0.id == item.id }) {
-          feed.append(item)
-          feed.sort { $0.time < $1.time }
+        let message = Self.describeDismissal(error)
+        feedState.finish([item], dismissed: []) { _ in message }
+      }
+    }
+  }
+
+  /// Dismisses exactly the unread items shown now, in one request. Items that arrive meanwhile
+  /// stay. Each one that isn't dismissed comes back with its error, and none is sent again on its own.
+  func clearFeed() {
+    let shown = feed
+    guard !shown.isEmpty else { return }
+    let ids = shown.map(\.id)
+    feedState.dismiss(ids)
+    Task {
+      do {
+        let result = try await api.dismissFeed(ids)
+        let missing = Set(result.missing)
+        feedState.finish(shown, dismissed: Set(result.dismissed)) {
+          missing.contains($0) ? "There's no such feed item." : "The daemon didn't confirm this one."
         }
-        feedErrors[item.id] = Self.describe(error)
+        if feedRemaining > 0 { await refreshFeed() }
+      } catch {
+        let message = Self.describeDismissal(error)
+        feedState.finish(shown, dismissed: []) { _ in message }
       }
     }
   }
@@ -692,22 +782,19 @@ struct Pending: Identifiable {
   }
 
   private func refreshFeed() async {
-    // A dismissed item stays hidden until a poll that started after its dismiss succeeded,
-    // so a poll already in flight can't bring it back.
-    let settled = dismissed
-    let items: [FeedItem]
+    let poll = feedState.startPoll()
+    let result: (items: [FeedItem], handedOff: [FeedItem], remaining: Int)
     do {
-      let result = try await api.feed()
-      items = result.items
-      handedOff = result.handedOff
+      result = try await api.feed()
     } catch {
+      guard feedState.isCurrent(poll) else { return }
       feedStatus = Self.describe(error)
       return
     }
+    guard feedState.apply(poll, result.items) else { return }
+    handedOff = result.handedOff
+    sourceFeedRemaining = result.remaining
     feedStatus = nil
-    dismissing.subtract(settled)
-    dismissed.subtract(settled)
-    feed = items.filter { !dismissing.contains($0.id) }
     feedNewest = feed.map(\.time).max() ?? 0
     if feedSeen == nil || (expanded && showingFeed) { feedSeen = feedNewest }
   }
@@ -751,6 +838,11 @@ struct Pending: Identifiable {
 
   private static func describe(_ error: Error) -> String {
     (error as? APIError)?.message ?? error.localizedDescription
+  }
+
+  private static func describeDismissal(_ error: Error) -> String {
+    if case .lost = error as? APIError { return "No response from the open-dot daemon. It may have been dismissed anyway." }
+    return describe(error)
   }
 }
 

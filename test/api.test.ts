@@ -413,6 +413,124 @@ test("the feed lists unread items, and dismissing one hides it", async () => {
   expect((await call("/feed/x/dismiss", { method: "POST" })).status).toBe(404);
 });
 
+test("Clear all dismisses exactly the shown IDs, after checking the whole request", async () => {
+  const at = {
+    source: "github",
+    reason: "Mentioned",
+    context: "acme/app",
+    url: null,
+    createdAt: 0,
+  } as const;
+  const [a, b, handed] = db
+    .insert(feed)
+    .values([
+      { ...at, sourceID: "a", title: "A", updatedAt: 10, state: "unread" },
+      { ...at, sourceID: "b", title: "B", updatedAt: 20, state: "unread" },
+      { ...at, sourceID: "h", title: "H", updatedAt: 5, state: "handed-off", handedTo: ["jojo"] },
+    ])
+    .returning()
+    .all()
+    .map((row) => row.id);
+  const shown = { items: [a, b] };
+  const states = () =>
+    db
+      .select()
+      .from(feed)
+      .all()
+      .map((row) => [row.title, row.state]);
+  const before = states();
+  const clear = (body: string, headers?: Record<string, string>) =>
+    call("/feed/dismiss", { method: "POST", body, ...(headers ? { headers } : {}) });
+
+  expect(
+    (await clear(JSON.stringify({ ids: shown.items }), { authorization: "Bearer x" })).status,
+  ).toBe(401);
+  for (const body of [
+    "",
+    "not json",
+    "[1]",
+    "{}",
+    JSON.stringify({ ids: [] }),
+    JSON.stringify({ ids: [a, "2"] }),
+    JSON.stringify({ ids: [a, 0] }),
+    JSON.stringify({ ids: [a, 1.5] }),
+    JSON.stringify({ ids: [a], all: true }),
+    JSON.stringify({ ids: [a, a] }),
+  ])
+    expect((await clear(body)).status).toBe(400);
+  const many = Array.from({ length: 1001 }, (_, index) => index + 1);
+  expect((await clear(JSON.stringify({ ids: many }))).status).toBe(413);
+  expect((await clear(JSON.stringify({ ids: [a], pad: "x".repeat(70_000) }))).status).toBe(413);
+  // A storage failure saves none of them.
+  db.$client.run(
+    `create trigger refuse before update on feed when new.id = ${b} begin select raise(abort, 'disk full'); end`,
+  );
+  const failed = await clear(JSON.stringify({ ids: [a, b] }));
+  expect(failed.status).toBe(500);
+  expect(await failed.json()).toEqual({
+    error: "Couldn't save the dismissals, so nothing was cleared.",
+  });
+  db.$client.run("drop trigger refuse");
+  expect(states()).toEqual(before);
+
+  // An item that arrived after the notch's read stays; the handed-off one is unchanged.
+  db.insert(feed)
+    .values({ ...at, sourceID: "c", title: "Later", updatedAt: 30, state: "unread" })
+    .run();
+  const response = await clear(JSON.stringify({ ids: [b, 999_999, a, handed] }));
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ dismissed: [b, a, handed], missing: [999_999] });
+  expect(states()).toEqual([
+    ["A", "dismissed"],
+    ["B", "dismissed"],
+    ["H", "handed-off"],
+    ["Later", "unread"],
+  ]);
+  const listed = (await (await call("/feed")).json()) as {
+    items: { title: string }[];
+    handedOff: { title: string; handedTo: string[] }[];
+  };
+  expect(listed.items.map((item) => item.title)).toEqual(["Later"]);
+  expect(listed.handedOff).toMatchObject([{ title: "H", handedTo: ["jojo"] }]);
+  // Single dismissal still answers as before.
+  const later = db.select().from(feed).where(eq(feed.title, "Later")).get();
+  expect((await call(`/feed/${later?.id}/dismiss`, { method: "POST" })).status).toBe(204);
+});
+
+test("every displayed feed snapshot fits one Clear all and later pages survive", async () => {
+  for (let index = 0; index < 1001; index++)
+    db.insert(feed)
+      .values({
+        source: "github",
+        sourceID: `capacity-${index}`,
+        reason: "Mentioned",
+        context: "test",
+        title: `Item ${index}`,
+        createdAt: 0,
+        updatedAt: index,
+        state: "unread",
+      })
+      .run();
+  const snapshot = (await (await call("/feed")).json()) as {
+    items: { id: number; title: string }[];
+    remaining: number;
+  };
+  expect(snapshot.items).toHaveLength(1000);
+  expect(snapshot.remaining).toBe(1);
+  expect(snapshot.items[0]?.title).toBe("Item 0");
+  expect(snapshot.items.at(-1)?.title).toBe("Item 999");
+  const ids = snapshot.items.map((item) => item.id);
+  const response = await call("/feed/dismiss", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ dismissed: ids, missing: [] });
+  const next = (await (await call("/feed")).json()) as typeof snapshot;
+  expect(next.items.map((item) => item.title)).toEqual(["Item 1000"]);
+  expect(next.remaining).toBe(0);
+});
+
 test("posting a message queues it for the daemon to deliver", async () => {
   const response = await call("/dots/jojo/messages", {
     method: "POST",

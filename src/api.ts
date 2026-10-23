@@ -3,7 +3,7 @@ import { and, eq, inArray, isNotNull, isNull, ne, sql } from "drizzle-orm";
 import { Effect, type Layer } from "effect";
 import type { Db } from "./db";
 import { findDot, listDots } from "./dots";
-import { dismiss, handedOffFeed, unreadFeed } from "./feed";
+import { dismiss, dismissAll, handedOffFeed, unreadFeed } from "./feed";
 import { type Attachment, OpenCode, type Entry, type OpenCodeError } from "./opencode";
 import {
   currentReactions,
@@ -531,13 +531,51 @@ const card = ({ id, source, reason, title, context, url, updatedAt, handedTo }: 
   handedTo,
 });
 
+// Every item in a shown snapshot fits one Clear all request.
+const clearLimit = 1000;
+
+const isFeedID = (id: unknown): id is number =>
+  typeof id === "number" && Number.isSafeInteger(id) && id > 0;
+
+/**
+ * Dismisses exactly the unread items the notch showed when the owner chose Clear all, never every
+ * unread item, so ones that arrived since stay. Each ID is answered as a single dismiss would be.
+ */
+const dismissShown = async (db: Db, request: Request) => {
+  const body = await messageBody(request, 64 * 1024).catch(() => undefined);
+  if (body instanceof Response) return body;
+  const ids =
+    typeof body === "object" &&
+    body !== null &&
+    !Array.isArray(body) &&
+    Object.keys(body).length === 1 &&
+    "ids" in body
+      ? body.ids
+      : undefined;
+  const valid: unknown[] = Array.isArray(ids) ? ids : [];
+  if (!valid.length || !valid.every(isFeedID))
+    return error(400, "Send {ids}, the feed item IDs shown.");
+  if (valid.length > clearLimit) return error(413, `Clear at most ${clearLimit} items at once.`);
+  if (new Set(valid).size !== valid.length) return error(400, "Name each feed item once.");
+  try {
+    return Response.json(dismissAll(db, valid));
+  } catch (cause) {
+    console.error(`Clear all: ${cause instanceof Error ? cause.message : String(cause)}`);
+    return error(500, "Couldn't save the dismissals, so nothing was cleared.");
+  }
+};
+
 const feedRoute = (db: Db, request: Request, path: string[]) => {
   if (path.length === 0 && request.method === "GET") {
+    const unread = unreadFeed(db);
     return Response.json({
-      items: unreadFeed(db).map(card),
+      items: unread.slice(0, clearLimit).map(card),
+      remaining: Math.max(0, unread.length - clearLimit),
       handedOff: handedOffFeed(db).map(card),
     });
   }
+  if (path.length === 1 && path[0] === "dismiss" && request.method === "POST")
+    return dismissShown(db, request);
   const [id, action] = path;
   if (
     path.length === 2 &&
