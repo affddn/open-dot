@@ -13,9 +13,12 @@ import {
   reminders,
   responsibilities,
   routeKey,
+  type Supervision,
+  supervisions,
   type Worker,
   workers,
 } from "./schema";
+import { canSend, hasSupervisions, type SupervisionEvent, supervisionNotice } from "./supervise";
 import { queueReport } from "./slack-agents";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -170,12 +173,27 @@ Act on it now if you can, then keep its next action current with dot_update.`,
 
 /**
  * Sends the message only after OpenCode confirms its saved ID is absent. A lost outcome stays
- * pending and is looked up again on the next tick, never sent blindly.
+ * pending and is looked up again on the next tick, never sent blindly. A dot_send whose binding
+ * no longer allows it is cancelled instead, unless OpenCode already admitted it.
  */
 export const deliver = (db: Db, message: Message) =>
   Effect.gen(function* () {
     const opencode = yield* OpenCode;
     const ref = { sessionID: message.sessionID, messageID: message.messageID };
+    const allowed = () =>
+      message.supervision === null ||
+      canSend(db, message.supervision, message.fromDot, message.sessionID);
+    const cancel = () => {
+      db.update(outbox)
+        .set({ state: "cancelled" })
+        .where(and(eq(outbox.id, message.id), eq(outbox.state, "pending")))
+        .run();
+    };
+    // Never started, so surely never admitted.
+    if (message.startedAt === null && !allowed()) {
+      cancel();
+      return;
+    }
     const delivery =
       message.delivery === "auto"
         ? yield* followUp(message.sessionID)
@@ -188,6 +206,11 @@ export const deliver = (db: Db, message: Message) =>
       .where(eq(outbox.id, message.id))
       .run();
     if (!(yield* opencode.messageExists(ref))) {
+      // Checked again just before admission, after the lookup's await.
+      if (!allowed()) {
+        cancel();
+        return;
+      }
       yield* opencode.prompt({
         ...ref,
         text: message.text,
@@ -213,11 +236,13 @@ const followUp = (sessionID: string) =>
       : ("steer" as const);
   });
 
-/** True when a message is waiting to be sent or a worker is unfinished. */
+/** True when a message is waiting to be sent, a worker is unfinished or a session is supervised. */
 export const hasWork = (db: Db) =>
   db.select({ id: outbox.id }).from(outbox).where(eq(outbox.state, "pending")).get() !==
     undefined ||
-  db.select({ id: workers.id }).from(workers).where(ne(workers.state, "done")).get() !== undefined;
+  db.select({ id: workers.id }).from(workers).where(ne(workers.state, "done")).get() !==
+    undefined ||
+  hasSupervisions(db);
 
 export const deliverAll = (db: Db) =>
   Effect.gen(function* () {
@@ -226,7 +251,10 @@ export const deliverAll = (db: Db) =>
       .select()
       .from(outbox)
       .where(
-        or(eq(outbox.state, "pending"), and(isNotNull(outbox.startedAt), isNull(outbox.turnEnd))),
+        or(
+          eq(outbox.state, "pending"),
+          and(eq(outbox.state, "sent"), isNotNull(outbox.startedAt), isNull(outbox.turnEnd)),
+        ),
       )
       .orderBy(asc(outbox.id))
       .all();
@@ -452,5 +480,150 @@ export const advanceWorkers = (db: Db) =>
     );
   });
 
-/** One pass of the daemon's OpenCode work: advance workers, then send what they queued. */
-export const step = (db: Db) => Effect.andThen(advanceWorkers(db), deliverAll(db));
+/**
+ * Ends the binding when OpenCode says its session is gone, and tells the dot once. A failed
+ * lookup changes nothing.
+ */
+const checkSession = (db: Db, binding: Supervision, dotSessionID: string) =>
+  Effect.gen(function* () {
+    if ((yield* (yield* OpenCode).sessionDirectory(binding.sessionID)) !== undefined) return true;
+    db.transaction(
+      (tx) => {
+        const ended = tx
+          .update(supervisions)
+          .set({ state: "ended", endedAt: Date.now(), endReason: "deleted" })
+          .where(and(eq(supervisions.id, binding.id), eq(supervisions.state, "active")))
+          .returning()
+          .get();
+        if (ended) enqueue(tx, dotSessionID, supervisionNotice(ended, { kind: "deleted" }));
+      },
+      { behavior: "immediate" },
+    );
+    return false;
+  });
+
+/**
+ * Reports what changed in one supervised session since the last pass. The binding's cursor and
+ * every notice are saved in one transaction, so each event is reported once across restarts, and
+ * a binding revoked meanwhile reports nothing.
+ */
+const watchOne = (
+  db: Db,
+  binding: Supervision,
+  dotSessionID: string,
+  active: ReadonlySet<string>,
+) =>
+  Effect.gen(function* () {
+    if (!(yield* checkSession(db, binding, dotSessionID))) return;
+    const opencode = yield* OpenCode;
+    const since = binding.seenAt ?? binding.activatedAt ?? binding.createdAt;
+    const ends = yield* opencode.turnsSince(binding.sessionID, since);
+    const waiting = yield* opencode.waiting(binding.sessionID);
+    const busy = active.has(binding.sessionID);
+    const now = Date.now();
+    db.transaction(
+      (tx) => {
+        const current = tx
+          .select()
+          .from(supervisions)
+          .where(and(eq(supervisions.id, binding.id), eq(supervisions.state, "active")))
+          .get();
+        if (!current) return;
+        const seen = current.seenAt ?? since;
+        // IDs saved at `seen` mean an event set it, so other turn ends at that same time are new;
+        // none means activation set it, so they may predate the binding and are skipped.
+        const atSeen = new Set(current.seenIDs);
+        const fresh = [
+          ...new Map(
+            ends
+              .filter(
+                (end) =>
+                  end.time > seen || (end.time === seen && atSeen.size > 0 && !atSeen.has(end.id)),
+              )
+              .map((end) => [end.id, end]),
+          ).values(),
+        ];
+        const newest = Math.max(seen, ...fresh.map((end) => end.time));
+        const seenIDs = [
+          ...(newest === seen ? current.seenIDs : []),
+          ...fresh.filter((end) => end.time === newest).map((end) => end.id),
+        ];
+        // Kept after an answer, so an ID seen again is never reported twice.
+        const told = new Set(current.waitingOn);
+        const unseen = [
+          ...new Map(
+            waiting
+              .filter((item) => !told.has(`${item.kind}:${item.id}`))
+              .map((item) => [`${item.kind}:${item.id}`, item]),
+          ),
+        ];
+        // A turn that ended since the last pass starts a new busy spell.
+        const restarted = fresh.length > 0;
+        const busySince = busy
+          ? restarted || current.busySince === null
+            ? now
+            : current.busySince
+          : null;
+        let busyReported = busy && !restarted && current.busyReported;
+        const events: SupervisionEvent[] = [
+          ...fresh.map((end) => ({ kind: "turn" as const, end })),
+          ...unseen.map(([, item]) => ({ kind: "waiting" as const, waiting: item })),
+        ];
+        if (
+          busySince !== null &&
+          !busyReported &&
+          now - busySince >= current.busyMinutes * 60_000
+        ) {
+          events.push({ kind: "busy", since: busySince });
+          busyReported = true;
+        }
+        tx.update(supervisions)
+          .set({
+            seenAt: newest,
+            seenIDs,
+            waitingOn: [...current.waitingOn, ...unseen.map(([key]) => key)],
+            busySince,
+            busyReported,
+          })
+          .where(eq(supervisions.id, current.id))
+          .run();
+        for (const event of events) enqueue(tx, dotSessionID, supervisionNotice(current, event));
+      },
+      { behavior: "immediate" },
+    );
+  });
+
+/** One pass over every active binding whose dot is ready. One failing session doesn't stop the rest. */
+export const superviseAll = (db: Db) =>
+  Effect.gen(function* () {
+    const bound = db
+      .select({ binding: supervisions, dotSessionID: dots.sessionID })
+      .from(supervisions)
+      .innerJoin(dots, eq(supervisions.dot, dots.name))
+      .where(and(eq(supervisions.state, "active"), eq(dots.sessionState, "ready")))
+      .orderBy(asc(supervisions.id))
+      .all();
+    if (bound.length === 0) return;
+    const active = yield* (yield* OpenCode).activeSessions;
+    yield* Effect.forEach(
+      bound,
+      ({ binding, dotSessionID }) =>
+        watchOne(db, binding, dotSessionID, active).pipe(
+          Effect.catch((error) =>
+            Effect.sync(() => console.error(`Supervision #${binding.id}: ${error.message}`)),
+          ),
+        ),
+      { discard: true },
+    );
+  });
+
+/** One pass of the daemon's OpenCode work: advance workers and supervisions, then send what they queued. */
+export const step = (db: Db) =>
+  advanceWorkers(db).pipe(
+    Effect.andThen(
+      superviseAll(db).pipe(
+        Effect.catch((error) => Effect.sync(() => console.error(`Supervision: ${error.message}`))),
+      ),
+    ),
+    Effect.andThen(deliverAll(db)),
+  );

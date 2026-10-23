@@ -22,6 +22,7 @@ import {
   slackPolls,
   reminders,
   responsibilities,
+  supervisions,
   workers,
   routeKey,
   type Route,
@@ -643,8 +644,9 @@ test("0018 adds only nullable outbox delivery and preserves every 0017 table, co
         expect(after.slice(0, stored.length)).toEqual(stored);
       else if (name !== "outbox") expect(after).toEqual(stored);
       else {
-        expect(after.slice(0, -1)).toEqual(stored);
-        expect(after.at(-1)).toMatchObject({
+        // 0022 then adds the supervision.
+        expect(after.slice(0, stored.length)).toEqual(stored);
+        expect(after[stored.length]).toMatchObject({
           name: "delivery",
           type: expect.stringMatching(/^text$/i),
           notnull: 0,
@@ -728,7 +730,8 @@ test("0019 adds only recent_reactions and preserves every 0018 table, column, ro
       const stored = columns.get(name);
       assert(stored, `Missing stored columns for ${name}`);
       const after = db.$client.query(`pragma table_info("${name}")`).all();
-      if (["notes", "reminders", "responsibilities"].includes(name))
+      // 0020 to 0022 append columns to these.
+      if (["notes", "reminders", "responsibilities", "outbox"].includes(name))
         expect(after.slice(0, stored.length)).toEqual(stored);
       else expect(after).toEqual(stored);
     }
@@ -809,7 +812,8 @@ test("0020 adds memory versions that legacy writers still advance, and keeps eve
   let db = openDatabase(path);
   try {
     expect(rows(db.$client)).toEqual(before);
-    expect(tableNames(db.$client)).toEqual(tables);
+    // 0022 then adds supervisions.
+    expect(tableNames(db.$client).filter((name) => name !== "supervisions")).toEqual(tables);
     const added = (name: string) =>
       db.$client
         .query<{ name: string }, []>(`pragma table_info("${name}")`)
@@ -832,8 +836,9 @@ test("0020 adds memory versions that legacy writers still advance, and keeps eve
       "schedule",
       "next_run_at",
     ]);
+    expect(added("outbox").map((column) => column.name)).toEqual(["supervision"]);
     for (const name of tables.filter(
-      (table) => !["notes", "reminders", "responsibilities"].includes(table),
+      (table) => !["notes", "reminders", "responsibilities", "outbox"].includes(table),
     ))
       expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(
         columns.get(name) ?? [],
@@ -965,7 +970,8 @@ test("0021 adds a nullable schedule that legacy status writers pause, and keeps 
   let db = openDatabase(path);
   try {
     expect(rows(db.$client)).toEqual(before);
-    expect(tableNames(db.$client)).toEqual(tables);
+    // 0022 then adds supervisions and outbox.supervision.
+    expect(tableNames(db.$client).filter((name) => name !== "supervisions")).toEqual(tables);
     expect(
       db.$client
         .query<{ name: string }, []>(`pragma table_info("responsibilities")`)
@@ -976,9 +982,9 @@ test("0021 adds a nullable schedule that legacy status writers pause, and keeps 
       { name: "next_run_at", notnull: 0, dflt_value: null },
     ]);
     for (const name of tables.filter((table) => table !== "responsibilities"))
-      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(
-        columns.get(name) ?? [],
-      );
+      expect(
+        db.$client.query(`pragma table_info("${name}")`).all().slice(0, columns.get(name)?.length),
+      ).toEqual(columns.get(name) ?? []);
     // 0020's version triggers stay exactly as they were, beside the new pause trigger.
     expect(
       triggerSQL(db.$client).filter((trigger) => trigger.name !== "responsibilities_pause"),
@@ -1013,6 +1019,81 @@ test("0021 adds a nullable schedule that legacy status writers pause, and keeps 
     expectLedger(db.$client, ledger, "0021");
   } finally {
     old.close();
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0022 adds supervisions and a nullable outbox.supervision, and keeps every 0021 row", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-supervision-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0022");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run(
+    "insert into outbox (session_id,message_id,text,state,created_at,started_at) values ('ses_jojo','msg_1','Hi','sent',2,3)",
+  );
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+  const before = rows(old);
+  const ledger = ledgerOf(old);
+  const triggers = triggerSQL(old);
+  old.close();
+  let db = openDatabase(path);
+  try {
+    expect(tableNames(db.$client)).toEqual([...tables, "supervisions"].toSorted());
+    for (const name of tables) {
+      const after = db.$client.query(`pragma table_info("${name}")`).all();
+      expect(after.slice(0, columns.get(name)?.length)).toEqual(columns.get(name) ?? []);
+      if (name !== "outbox") expect(after).toHaveLength(columns.get(name)?.length ?? 0);
+    }
+    expect(
+      db.$client.query(`pragma table_info("outbox")`).all().slice(columns.get("outbox")?.length),
+    ).toMatchObject([{ name: "supervision", notnull: 0, dflt_value: null }]);
+    expect(
+      rows(db.$client).map(([name, items]) =>
+        name === "outbox"
+          ? [
+              name,
+              (items as Record<string, unknown>[]).map(({ supervision: _added, ...rest }) => rest),
+            ]
+          : [name, items],
+      ),
+    ).toEqual(before);
+    expect(db.select().from(outbox).get()).toMatchObject({ messageID: "msg_1", supervision: null });
+    expect(triggerSQL(db.$client)).toEqual(triggers);
+    expectLedger(db.$client, ledger, "0022");
+
+    // At most one open binding per dot and session; ended ones don't count.
+    const insert = (state: string) =>
+      db.$client.run(
+        `insert into supervisions (dot,session_id,directory,mode,state,busy_minutes,created_at) values ('jojo','ses_owner','/w','watch','${state}',30,1)`,
+      );
+    insert("ended");
+    insert("active");
+    insert("ended");
+    expect(() => insert("requested")).toThrow();
+    expect(db.select().from(supervisions).all()).toMatchObject([
+      { state: "ended", waitingOn: [], busyReported: false },
+      { state: "active" },
+      { state: "ended" },
+    ]);
+    db.$client.close();
+    db = openDatabase(path);
+    expectLedger(db.$client, ledger, "0022");
+  } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });
   }

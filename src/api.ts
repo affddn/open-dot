@@ -28,6 +28,7 @@ import {
   saveReaction,
 } from "./reactions";
 import { quoted, quoteText, replyPrompt } from "./replies";
+import { approveBinding, endBinding, openSupervisions, supervisionView } from "./supervise";
 import {
   type Dot,
   feed,
@@ -622,6 +623,37 @@ const answer = <T>(outcome: Outcome<T>, key: string) => {
 };
 
 /**
+ * The owner approves a dot's request to supervise a session with POST .../<id>/approve, and
+ * declines or revokes one with DELETE .../<id>. Both start no turn.
+ */
+const supervisionRoute = (
+  db: Db,
+  dot: string,
+  method: string,
+  rawID: string | undefined,
+  extra: string[],
+) => {
+  if (rawID === undefined || !positive.test(rawID) || !Number.isSafeInteger(Number(rawID)))
+    return error(404, "There's no such binding for this dot.");
+  const approve = extra.length === 1 && extra[0] === "approve" && method === "POST";
+  if (!approve && !(extra.length === 0 && method === "DELETE")) return error(404, "Not found");
+  const id = Number(rawID);
+  const change = approve ? approveBinding(db, id, dot) : endBinding(db, id, "owner", dot);
+  if ("saved" in change) return Response.json({ supervision: supervisionView(change.saved) });
+  if ("conflict" in change)
+    return Response.json(
+      {
+        error: approve
+          ? "This binding isn't waiting for approval any more, so nothing changed."
+          : "This binding already ended.",
+        current: supervisionView(change.conflict),
+      },
+      { status: 409 },
+    );
+  return error(404, "There's no such binding for this dot.");
+};
+
+/**
  * The owner's view and edits of a dot's notes, responsibilities and reminders. Every item is
  * scoped to the named dot, and every change needs the version the owner saw. Nothing here starts
  * a turn: the dot sees the result in its next memory snapshot. OpenCode isn't needed.
@@ -637,9 +669,15 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
   const dot = findDot(db, decoded);
   if (!dot) return error(404, `There's no dot named "${name}".`);
   const { method } = request;
+  if (kind === "supervisions") return supervisionRoute(db, dot.name, method, rawID, extra);
   if (extra.length) return error(404, "Not found");
   if (kind === undefined)
-    return method === "GET" ? Response.json(readMemory(db, dot.name)) : error(404, "Not found");
+    return method === "GET"
+      ? Response.json({
+          ...readMemory(db, dot.name),
+          supervisions: openSupervisions(db, dot.name).map(supervisionView),
+        })
+      : error(404, "Not found");
   if (kind !== "notes" && kind !== "responsibilities" && kind !== "reminders")
     return error(404, "Not found");
   const body = async () => {

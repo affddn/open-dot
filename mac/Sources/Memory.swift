@@ -102,6 +102,8 @@ struct MemoryState {
   var drafts: [MemoryKey: MemoryDraft] = [:]
   var rejected: [MemoryKey: MemoryDraft] = [:]
   var noteDraft = ""
+  /// Supervisions being approved or ended.
+  var supervising: Set<Int> = []
   private(set) var saving: Set<MemoryKey> = []
   private(set) var adding = false
   private var writes = 0
@@ -216,15 +218,27 @@ struct MemoryState {
   }
 }
 
-/// "Updated 5m ago by jojo", "by you" or "by its schedule".
-func memoryChange(_ updatedAt: Double, by actor: String, dot: String, now: Date = Date()) -> String {
-  let seconds = max(0, now.timeIntervalSince1970 - updatedAt / 1000)
-  let ago = seconds < 60 ? "just now"
+/// "just now", "5m ago", "2h ago" or "3d ago", for a time in milliseconds.
+func ago(_ time: Double, now: Date = Date()) -> String {
+  let seconds = max(0, now.timeIntervalSince1970 - time / 1000)
+  return seconds < 60 ? "just now"
     : seconds < 3600 ? "\(Int(seconds / 60))m ago"
     : seconds < 86400 ? "\(Int(seconds / 3600))h ago"
     : "\(Int(seconds / 86400))d ago"
+}
+
+/// "Updated 5m ago by jojo", "by you" or "by its schedule".
+func memoryChange(_ updatedAt: Double, by actor: String, dot: String, now: Date = Date()) -> String {
   let who = actor == "owner" ? "you" : actor == "scheduler" ? "its schedule" : actor == "dot" ? dot : actor
-  return "Updated \(ago) by \(who)"
+  return "Updated \(ago(updatedAt, now: now)) by \(who)"
+}
+
+/// When a supervision was asked for or created, and when the owner made it active if that was later.
+func supervisionTimes(_ binding: Supervision, now: Date = Date()) -> String {
+  guard binding.state == "active" else { return "Requested \(ago(binding.createdAt, now: now))" }
+  let created = "Created \(ago(binding.createdAt, now: now))"
+  guard let activated = binding.activatedAt, activated != binding.createdAt else { return created }
+  return "\(created), approved \(ago(activated, now: now))"
 }
 
 /// A dot's notes, responsibilities and reminders. Changes start no turn: the dot sees them in its
@@ -257,6 +271,11 @@ struct MemoryView: View {
           section("Scheduled reminders") {
             if memory.reminders.isEmpty { empty }
             ForEach(memory.reminders) { MemoryRow(store: store, dot: name, item: .reminder($0)) }
+          }
+          section("Supervised sessions") {
+            let bindings = memory.supervisions ?? []
+            if bindings.isEmpty { empty }
+            ForEach(bindings) { SupervisionRow(store: store, dot: name, binding: $0) }
           }
         } else if state?.readError == nil {
           Text("Loading…").foregroundStyle(.secondary)
@@ -466,5 +485,62 @@ struct MemoryRow: View {
     }
     guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
     store.removeMemory(dot, item)
+  }
+}
+
+/// A session the dot supervises or asks to. Approving and ending both ask first; neither starts a turn.
+struct SupervisionRow: View {
+  let store: Store
+  let dot: String
+  let binding: Supervision
+
+  var body: some View {
+    let busy = store.memories[dot]?.supervising.contains(binding.id) == true
+    VStack(alignment: .leading, spacing: 4) {
+      Text(verbatim: binding.sessionID).font(.callout.monospaced()).textSelection(.enabled)
+      Text(verbatim: binding.directory).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+      Text(verbatim: "\(binding.state == "requested" ? "Waiting for you" : "Active"), \(binding.modeTitle), busy alert after \(binding.busyMinutes) min")
+        .font(.caption)
+      HStack(spacing: 10) {
+        Text(verbatim: supervisionTimes(binding)).font(.caption2).foregroundStyle(.tertiary)
+          .accessibilityIdentifier("supervision-times-\(binding.id)")
+        Spacer()
+        if busy {
+          Text("Saving…").font(.caption2).foregroundStyle(.secondary)
+        } else {
+          if binding.state == "requested" {
+            Button("Approve…") { confirm(approve: true) }
+              .accessibilityIdentifier("supervision-approve-\(binding.id)")
+          }
+          Button(binding.state == "requested" ? "Decline…" : "Revoke…") { confirm(approve: false) }
+            .accessibilityIdentifier("supervision-end-\(binding.id)")
+        }
+      }
+      .buttonStyle(.plain)
+      .font(.caption2.weight(.semibold))
+    }
+    .padding(8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.05)))
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("memory-supervision-\(binding.id)")
+  }
+
+  /// Asks first, with Cancel as the default for Return and Escape.
+  private func confirm(approve: Bool) {
+    let alert = NSAlert()
+    if approve {
+      alert.messageText = "Let \(dot) \(binding.modeTitle) this session?"
+      alert.informativeText = "\(binding.sessionID) in \(binding.directory). \(dot) will hear when it finishes a turn, fails, waits for a permission or question, or runs over \(binding.busyMinutes) minutes\(binding.mode == "send" ? ", and may write messages into it" : "")."
+      alert.addButton(withTitle: "Cancel")
+      alert.addButton(withTitle: "Approve")
+    } else {
+      alert.messageText = binding.state == "requested" ? "Decline this request?" : "Stop \(dot) supervising this session?"
+      alert.informativeText = "\(binding.sessionID) in \(binding.directory). Only you can bind it again."
+      alert.addButton(withTitle: "Cancel")
+      alert.addButton(withTitle: binding.state == "requested" ? "Decline" : "Revoke").hasDestructiveAction = true
+    }
+    guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
+    store.changeSupervision(dot, binding, approve: approve)
   }
 }

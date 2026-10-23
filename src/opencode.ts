@@ -124,6 +124,22 @@ export interface Approval {
   readonly resources: readonly string[];
 }
 
+/** A turn that ended in a supervised session, with the last text its assistant wrote. */
+export interface TurnEnd {
+  readonly id: string;
+  readonly outcome: "succeeded" | "failed" | "interrupted";
+  readonly time: number;
+  readonly text: string | undefined;
+  readonly error: string | undefined;
+}
+
+/** A permission request or a question a session waits on its user for. */
+export interface Waiting {
+  readonly id: string;
+  readonly kind: "permission" | "question";
+  readonly summary: string;
+}
+
 /** A file attached to a user message. OpenCode keeps its bytes inline, as base64. */
 export interface Attachment {
   readonly mime: string;
@@ -206,6 +222,20 @@ export class OpenCode extends Context.Service<
       limit: number,
     ) => Effect.Effect<readonly Entry[], OpenCodeError>;
     readonly message: (ref: MessageRef) => Effect.Effect<Entry | undefined, OpenCodeError>;
+    /** The session's directory, or undefined once OpenCode says the session doesn't exist. */
+    readonly sessionDirectory: (
+      sessionID: string,
+    ) => Effect.Effect<string | undefined, OpenCodeError>;
+    /**
+     * Every turn that ended at or after `since`, in milliseconds, oldest first, read page by page
+     * down to that time, however many there are.
+     */
+    readonly turnsSince: (
+      sessionID: string,
+      since: number,
+    ) => Effect.Effect<readonly TurnEnd[], OpenCodeError>;
+    /** Every permission request and question the session waits on. */
+    readonly waiting: (sessionID: string) => Effect.Effect<readonly Waiting[], OpenCodeError>;
   }
 >()("open-dot/OpenCode") {
   static readonly layer = Layer.effect(
@@ -234,6 +264,39 @@ export class OpenCode extends Context.Service<
           ).pipe(Layer.provide(FetchHttpClient.layer)),
         ),
       );
+
+      /**
+       * Visits a session's items of one type newest first, page by page, until `visit` returns
+       * false or the history ends. A cursor OpenCode hands back twice fails rather than loops.
+       */
+      const newestFirst = (
+        sessionID: string,
+        type: "idle" | "assistant",
+        visit: (item: SessionMessage.Info) => boolean,
+      ) =>
+        Effect.gen(function* () {
+          const id = Session.ID.make(sessionID);
+          const limit = 50;
+          const cursors = new Set<string>();
+          let cursor: string | undefined;
+          for (;;) {
+            const page = yield* client.message.list(
+              cursor
+                ? { sessionID: id, cursor, limit, type }
+                : { sessionID: id, order: "desc", limit, type },
+            );
+            for (const item of page.data) if (!visit(item)) return;
+            const next = page.cursor.next;
+            if (page.data.length < limit || next === undefined) return;
+            // Failing ends the walk here.
+            if (cursors.has(next))
+              yield* new OpenCodeError({
+                message: `OpenCode returned the same history page of ${sessionID} twice`,
+              });
+            cursors.add(next);
+            cursor = next;
+          }
+        });
 
       return {
         sessionExists: (sessionID) =>
@@ -338,6 +401,73 @@ export class OpenCode extends Context.Service<
               Effect.catchTag("MessageNotFoundError", () => Effect.succeed(undefined)),
               Effect.mapError(failed(`Could not read message ${messageID}`)),
             ),
+        sessionDirectory: (sessionID) =>
+          client.session.get({ sessionID: Session.ID.make(sessionID) }).pipe(
+            Effect.map((session): string | undefined => session.location.directory),
+            Effect.catchTag("SessionNotFoundError", () => Effect.succeed(undefined)),
+            Effect.mapError(failed(`Could not look up session ${sessionID}`)),
+          ),
+        turnsSince: (sessionID, since) =>
+          Effect.gen(function* () {
+            // Every turn end at or after `since`, newest first, and the time of the one before them.
+            const ends: Omit<TurnEnd, "text">[] = [];
+            let before = Number.NEGATIVE_INFINITY;
+            yield* newestFirst(sessionID, "idle", (item) => {
+              if (item.type !== "idle") return true;
+              const time = DateTime.toEpochMillis(item.time.created);
+              if (time < since) {
+                before = time;
+                return false;
+              }
+              ends.push({ id: item.id, outcome: item.outcome, time, error: item.error?.message });
+              return true;
+            });
+            const oldest = ends.at(-1);
+            if (!oldest) return [];
+            // Replies are matched to turns by time, and a reply in the same millisecond as a turn
+            // end may belong to the turn before or after it. So a turn's reply is the newest text
+            // strictly between its own end and the one before, and a turn with any text exactly at
+            // its own end gets none, since that text may be its real final reply. A tie at the
+            // lower end only matters when nothing lies strictly inside, which already gives none.
+            const replies: Entry[] = [];
+            yield* newestFirst(sessionID, "assistant", (item) => {
+              const [reply] = entry(item);
+              if (!reply?.text) return true;
+              if (reply.time < before) return false;
+              replies.push(reply);
+              // The oldest turn's reply is settled, so nothing older is needed.
+              return !(reply.time > before && reply.time < oldest.time);
+            });
+            const texts = new Map<string, string>();
+            ends.forEach((end, index) => {
+              const lower = ends[index + 1]?.time ?? before;
+              if (replies.some((reply) => reply.time === end.time)) return;
+              const reply = replies.find((item) => item.time > lower && item.time < end.time);
+              if (reply) texts.set(end.id, reply.text);
+            });
+            return ends.map((end) => ({ ...end, text: texts.get(end.id) })).toReversed();
+          }).pipe(Effect.mapError(failed(`Could not read session ${sessionID}`))),
+        waiting: (sessionID) =>
+          Effect.all([
+            client.permission.list({ sessionID: Session.ID.make(sessionID) }),
+            client.session.form.list({ sessionID }),
+          ]).pipe(
+            Effect.map(([permissions, forms]): Waiting[] => [
+              ...permissions.map((request) => ({
+                id: request.id,
+                kind: "permission" as const,
+                summary: `${request.action}: ${request.resources.join(", ")}`,
+              })),
+              ...forms.map((form) => ({
+                id: form.id,
+                kind: "question" as const,
+                summary: [form.title, ...form.fields.map((field) => field.description ?? "")]
+                  .filter((part) => part !== "")
+                  .join("\n"),
+              })),
+            ]),
+            Effect.mapError(failed(`Could not list what ${sessionID} waits on`)),
+          ),
       };
     }),
   );

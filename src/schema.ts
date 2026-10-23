@@ -1,4 +1,12 @@
-import { integer, primaryKey, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
+import {
+  integer,
+  primaryKey,
+  sqliteTable,
+  text,
+  unique,
+  uniqueIndex,
+} from "drizzle-orm/sqlite-core";
 import type { Attachment } from "./opencode";
 import type { Schedule } from "./schedule";
 
@@ -127,8 +135,8 @@ export const outbox = sqliteTable("outbox", {
   messageID: text("message_id").notNull().unique(),
   text: text().notNull(),
   files: text({ mode: "json" }).$type<readonly Attachment[]>(),
-  state: text({ enum: ["pending", "sent"] }).notNull(),
-  // The dot that wrote a dot_message. Null for reminders and worker reports.
+  state: text({ enum: ["pending", "sent", "cancelled"] }).notNull(),
+  // The dot that wrote a dot_message or dot_send. Null for reminders and worker reports.
   fromDot: text("from_dot"),
   // Typed by the owner in the notch app, as opposed to a notice from open-dot.
   fromOwner: integer("from_owner", { mode: "boolean" }).notNull().default(false),
@@ -145,7 +153,56 @@ export const outbox = sqliteTable("outbox", {
   startedAt: integer("started_at"),
   turnEnd: text("turn_end"),
   createdAt: integer("created_at").notNull(),
+  // The supervision binding a dot_send needs. The daemon checks that it still allows sending just
+  // before admission, and "cancelled" a row whose binding ended first: it's never sent.
+  supervision: integer(),
 });
+
+/**
+ * A dot's binding to an OpenCode session its owner started. Only the owner makes one active, with
+ * `open-dot watch` or in the notch; a dot can only ask ("requested") or let its own go. The daemon
+ * reports each turn end, permission or question and long busy spell once, after activation.
+ */
+export const supervisions = sqliteTable(
+  "supervisions",
+  {
+    id: integer().primaryKey({ autoIncrement: true }),
+    dot: text()
+      .notNull()
+      .references(() => dots.name),
+    sessionID: text("session_id").notNull(),
+    // The session's directory, as OpenCode reported it when the binding was made or requested.
+    directory: text().notNull(),
+    // "send" also lets the dot queue or steer messages into the session.
+    mode: text({ enum: ["watch", "send"] }).notNull(),
+    state: text({ enum: ["requested", "active", "ended"] }).notNull(),
+    // The owner declined or revoked it, the dot let it go, or OpenCode deleted the session.
+    endReason: text("end_reason", { enum: ["declined", "revoked", "unwatched", "deleted"] }),
+    busyMinutes: integer("busy_minutes").notNull(),
+    createdAt: integer("created_at").notNull(),
+    activatedAt: integer("activated_at"),
+    endedAt: integer("ended_at"),
+    // The creation time of the newest turn end reported, and the IDs of those reported at exactly
+    // that time, so another turn end at the same time is still reported once. Activation sets the
+    // time with no IDs, and then only later turn ends count: earlier history is never reported,
+    // and turns that end while the daemon is down are.
+    seenAt: integer("seen_at"),
+    seenIDs: text("seen_ids", { mode: "json" }).$type<string[]>().notNull().default([]),
+    // Every permission and question already reported, as "permission:<id>" or "question:<id>".
+    // Kept after they're answered, so none is ever reported twice.
+    waitingOn: text("waiting_on", { mode: "json" }).$type<string[]>().notNull().default([]),
+    // When the daemon first saw the current busy spell, and whether it reported it.
+    busySince: integer("busy_since"),
+    busyReported: integer("busy_reported", { mode: "boolean" }).notNull().default(false),
+  },
+  (table) => [
+    uniqueIndex("supervisions_open")
+      .on(table.dot, table.sessionID)
+      .where(sql`${table.state} != 'ended'`),
+  ],
+);
+
+export type Supervision = typeof supervisions.$inferSelect;
 
 export interface FeedSnapshot {
   readonly prompt: string;

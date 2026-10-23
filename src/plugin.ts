@@ -24,8 +24,20 @@ import {
   reminders,
   responsibilities,
   routeKey,
+  type Supervision,
+  supervisions,
   workers,
 } from "./schema";
+import {
+  dataJSON,
+  defaultBusyMinutes,
+  describeMode,
+  endBinding,
+  openSupervisions,
+  saveBinding,
+  sentByDot,
+  sessionIDPattern,
+} from "./supervise";
 
 const text = (description: string) => Schema.String.annotate({ description });
 const id = (description: string) => Schema.Int.annotate({ description });
@@ -128,6 +140,11 @@ const when = (reminder: { dueAt: number; everyMinutes: number | null }) =>
   new Date(reminder.dueAt).toString() +
   (reminder.everyMinutes ? ` (every ${reminder.everyMinutes} minutes)` : "");
 
+const supervisionLine = (binding: Supervision) =>
+  binding.state === "active"
+    ? `- #${binding.id} active since ${new Date(binding.activatedAt ?? binding.createdAt).toString()}, ${describeMode(binding.mode)}: session ${binding.sessionID} in ${dataJSON(binding.directory)}; busy alert after ${binding.busyMinutes} minutes`
+    : `- #${binding.id} requested, ${describeMode(binding.mode)}: session ${binding.sessionID} in ${dataJSON(binding.directory)}; nothing is watched until your owner approves it in the notch's Memory view or with \`open-dot watch approve ${binding.id}\``;
+
 function memory(db: Db, dot: string) {
   const saved = db.select().from(notes).where(eq(notes.dot, dot)).orderBy(asc(notes.id)).all();
   const scheduled = db
@@ -149,6 +166,7 @@ function memory(db: Db, dot: string) {
     .orderBy(asc(workers.id))
     .all();
   const others = db.select().from(dots).where(ne(dots.name, dot)).orderBy(asc(dots.name)).all();
+  const supervised = openSupervisions(db, dot);
   return `<system-reminder>
 # open-dot memory, as of now (replaces any earlier memory in this conversation)
 
@@ -168,6 +186,9 @@ ${list(scheduled.map((reminder) => `- #${reminder.id} at ${when(reminder)}: ${re
 
 ## Other dots (dot_message writes to one; their messages arrive here)
 ${list(others.map((other) => `- ${other.name}${other.purpose ? `: ${other.purpose}` : ""}`))}
+
+## Supervised sessions (only your owner makes one active; dot_watch asks them, dot_unwatch lets one go, dot_send writes into a watch-and-send one)
+${list(supervised.map(supervisionLine))}
 </system-reminder>`;
 }
 
@@ -536,6 +557,138 @@ export default Plugin.define({
         input: Schema.Struct({}),
         options: { codemode: false },
         execute: async () => ({ content: feedText(unreadFeed(db)) }),
+      });
+      editor.add({
+        name: "dot_watch",
+        description:
+          "Ask your owner to let you supervise an OpenCode session they started, by its ses_ ID. This only saves a request: nothing is watched until your owner approves it in the notch or with `open-dot watch approve <id>`. Once active, you hear once when the session finishes a turn, fails, waits for a permission or question, or stays busy too long. With send, you can also write into it with dot_send.",
+        input: Schema.Struct({
+          session_id: text("The session's ID, starting with ses_"),
+          send: Schema.optionalKey(
+            Schema.Boolean.annotate({
+              description: "Also ask to write into the session with dot_send. Omit to only watch",
+            }),
+          ),
+          busy_minutes: Schema.optionalKey(
+            id(
+              `Tell you when one turn runs longer than this, from 1 to 10080. Default ${defaultBusyMinutes}`,
+            ),
+          ),
+        }),
+        options: { codemode: false },
+        execute: async (input, call) => {
+          if (!bound(call.sessionID))
+            throw new Error(`Only ${name}'s own conversation can ask to watch a session.`);
+          if (!sessionIDPattern.test(input.session_id))
+            throw new Error(`${input.session_id} isn't a session ID.`);
+          let directory: string;
+          try {
+            const session = await context.session.get({
+              sessionID: input.session_id,
+            });
+            directory = session.location.directory;
+          } catch (error) {
+            // Only OpenCode's typed answer means the session doesn't exist.
+            throw new Error(
+              typeof error === "object" &&
+                error !== null &&
+                Reflect.get(error, "_tag") === "SessionNotFoundError"
+                ? `OpenCode has no session ${input.session_id}. Nothing was saved.`
+                : `Couldn't look up session ${input.session_id} in OpenCode, so nothing was saved: ${error instanceof Error ? error.message : String(error)}`,
+              { cause: error },
+            );
+          }
+          if (!bound(call.sessionID)) throw new Error("The dot's conversation changed.");
+          const saved = saveBinding(
+            db,
+            {
+              dot: name,
+              sessionID: input.session_id,
+              directory,
+              mode: input.send ? "send" : "watch",
+              busyMinutes: input.busy_minutes ?? defaultBusyMinutes,
+            },
+            "requested",
+          );
+          if (typeof saved === "string") throw new Error(saved);
+          return {
+            content: `Saved request #${saved.id} to ${describeMode(saved.mode)} session ${saved.sessionID} in ${dataJSON(saved.directory)}. It is not active: ask your owner to approve it in the notch's Memory view or with \`open-dot watch approve ${saved.id}\`. Nothing is watched until then.`,
+          };
+        },
+      });
+      editor.add({
+        name: "dot_unwatch",
+        description:
+          "Stop supervising a session, or withdraw a request to, by its binding number. Only your owner can start it again.",
+        input: Schema.Struct({ id: id("The binding number from your memory") }),
+        options: { codemode: false },
+        execute: async (input, call) => {
+          if (!bound(call.sessionID))
+            throw new Error(`Only ${name}'s own conversation can stop supervising a session.`);
+          const ended = endBinding(db, input.id, "dot", name);
+          if ("missing" in ended) throw new Error(`You have no binding #${input.id}.`);
+          if ("conflict" in ended) throw new Error(`Binding #${input.id} already ended.`);
+          return { content: `Binding #${input.id} ended. You no longer hear from that session.` };
+        },
+      });
+      editor.add({
+        name: "dot_send",
+        description: `Write a message into a session your owner lets you watch and send to. It is labelled as coming from you, not your owner, and never answers that session's permission requests or questions or interrupts it. It counts toward your ${messagesPerHour} messages an hour.`,
+        input: Schema.Struct({
+          id: id("The watch-and-send binding number from your memory"),
+          text: text("The message. That session can't see this conversation"),
+          steer: Schema.optionalKey(
+            Schema.Boolean.annotate({
+              description:
+                "Join the turn it is running at its next step, without interrupting it. Omit to queue the message until the turn ends",
+            }),
+          ),
+        }),
+        options: { codemode: false },
+        execute: async (input, call) => {
+          if (!bound(call.sessionID))
+            throw new Error(`Only ${name}'s own conversation can write into a supervised session.`);
+          const now = Date.now();
+          const queued = db.transaction(
+            (tx) => {
+              const binding = tx
+                .select()
+                .from(supervisions)
+                .where(and(eq(supervisions.id, input.id), eq(supervisions.dot, name)))
+                .get();
+              if (binding?.state !== "active")
+                return `You have no active binding #${input.id}. Your owner approves bindings.`;
+              if (binding.mode !== "send")
+                return `Binding #${input.id} is watch only. Your owner decides whether you may send.`;
+              const sent = tx
+                .select({ n: count() })
+                .from(outbox)
+                .where(and(eq(outbox.fromDot, name), gt(outbox.createdAt, now - hour)))
+                .get();
+              if ((sent?.n ?? 0) >= messagesPerHour)
+                return `You've sent ${messagesPerHour} messages in the last hour. Wait, or ask your owner.`;
+              tx.insert(outbox)
+                .values({
+                  sessionID: binding.sessionID,
+                  messageID: SessionMessage.ID.create(),
+                  text: sentByDot(name, input.text),
+                  state: "pending",
+                  fromDot: name,
+                  supervision: binding.id,
+                  // "auto" steers only into a running turn with no queued input ahead.
+                  delivery: input.steer ? "auto" : null,
+                  createdAt: now,
+                })
+                .run();
+              return binding;
+            },
+            { behavior: "immediate" },
+          );
+          if (typeof queued === "string") throw new Error(queued);
+          return {
+            content: `Your message to session ${queued.sessionID} is queued${input.steer ? " to join its running turn" : ""}. It isn't delivered yet, and it is dropped if your owner ends binding #${queued.id} first.`,
+          };
+        },
       });
     });
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { randomBytes } from "node:crypto";
 import { renameSync, rmSync, writeFileSync } from "node:fs";
+import { eq } from "drizzle-orm";
 import { Effect, Schedule } from "effect";
 import { api } from "./api";
 import { claimDue, hasWork, step } from "./daemon";
@@ -9,9 +10,17 @@ import { createDot, ensureSession, findDot, listDots, pickDot } from "./dots";
 import { collect, github, linear } from "./feed";
 import { apiPath, databasePath } from "./home";
 import { OpenCode } from "./opencode";
-import { slackApps } from "./schema";
+import { slackApps, type Supervision, supervisions } from "./schema";
 import { sharedNotices, slackChat, slackClient, slackFeed } from "./slack";
 import { slackAgents } from "./slack-agents";
+import {
+  approveBinding,
+  defaultBusyMinutes,
+  describeMode,
+  endBinding,
+  saveBinding,
+  sessionIDPattern,
+} from "./supervise";
 import {
   attachApp,
   configItem,
@@ -39,7 +48,12 @@ const usage = `Usage:
                                      Adopt an app whose creation had no clear answer
   open-dot slack status [name]       Show each dot's Slack app and what to do next
   open-dot slack notices enable|disable
-                                     Turn on or off the shared app's one note to others who DM it`;
+                                     Turn on or off the shared app's one note to others who DM it
+  open-dot watch add <name> <session ID> [--send] [--busy-minutes N]
+                                     Let a dot supervise a session you started, once you confirm
+  open-dot watch list [name]         List requested and active supervisions
+  open-dot watch approve <id>        Approve a dot's request to supervise a session, once you confirm
+  open-dot watch revoke <id>         End a supervision or decline a request`;
 
 const [command, ...args] = process.argv.slice(2);
 if (command === "backup" || command === "restore") {
@@ -159,6 +173,79 @@ const slackCommand = (sub: string | undefined, name: string | undefined, rest: s
   return fail(usage);
 };
 
+const describeBinding = (binding: Supervision) =>
+  `#${binding.id}\t${binding.dot}\t${binding.state}\t${describeMode(binding.mode)}\t${binding.sessionID}\t${binding.directory}\tbusy alert after ${binding.busyMinutes} min`;
+
+/**
+ * Asks the owner at a terminal. A binding needs a person's yes, so a script or a dot's shell
+ * without a terminal can't make one.
+ */
+const confirmed = (question: string) =>
+  process.stdin.isTTY && /^y(es)?$/i.test(prompt(`${question} [y/N]`)?.trim() ?? "");
+
+const noTerminal =
+  "Run this in a terminal: a supervision needs you to confirm it. Nothing changed.";
+
+const watchCommand = (sub: string | undefined, rest: string[]) => {
+  if (sub === "list")
+    return Effect.sync(() => {
+      const open = db
+        .select()
+        .from(supervisions)
+        .all()
+        .filter((row) => row.state !== "ended" && (!rest[0] || row.dot === rest[0]));
+      if (open.length === 0) return console.log("No dot supervises a session.");
+      for (const binding of open) console.log(describeBinding(binding));
+    });
+  const id = Number(rest[0]);
+  if ((sub === "approve" || sub === "revoke") && rest.length === 1 && Number.isSafeInteger(id)) {
+    if (sub === "revoke")
+      return Effect.suspend(() => {
+        const ended = endBinding(db, id, "owner");
+        if ("missing" in ended) return fail(`There's no supervision #${id}.`);
+        if ("conflict" in ended) return fail(`Supervision #${id} already ended.`);
+        return Effect.sync(() => console.log(`Ended ${describeBinding(ended.saved)}`));
+      });
+    return Effect.suspend(() => {
+      const request = db.select().from(supervisions).where(eq(supervisions.id, id)).get();
+      if (request?.state !== "requested")
+        return fail(`There's no supervision request #${id} waiting for approval.`);
+      if (!process.stdin.isTTY) return fail(noTerminal);
+      if (
+        !confirmed(
+          `Let ${request.dot} ${describeMode(request.mode)} session ${request.sessionID} in ${request.directory}?`,
+        )
+      )
+        return Effect.sync(() => console.log("Nothing changed."));
+      const approved = approveBinding(db, id);
+      if (!("saved" in approved)) return fail(`Request #${id} changed meanwhile. Nothing changed.`);
+      return Effect.sync(() => console.log(`Active: ${describeBinding(approved.saved)}`));
+    });
+  }
+  const [dot, sessionID, ...flags] = rest;
+  const busyAt = flags.indexOf("--busy-minutes");
+  const busyMinutes = busyAt < 0 ? defaultBusyMinutes : Number(flags[busyAt + 1]);
+  const known = flags.every(
+    (flag, at) =>
+      flag === "--send" || flag === "--busy-minutes" || (busyAt >= 0 && at === busyAt + 1),
+  );
+  if (sub !== "add" || !dot || !sessionID || !known || (busyAt >= 0 && !flags[busyAt + 1]))
+    return fail(usage);
+  if (!sessionIDPattern.test(sessionID)) return fail(`${sessionID} isn't a session ID.`);
+  if (!findDot(db, dot)) return fail(`No dot named "${dot}".`);
+  if (!process.stdin.isTTY) return fail(noTerminal);
+  return Effect.gen(function* () {
+    const directory = yield* (yield* OpenCode).sessionDirectory(sessionID);
+    if (directory === undefined) return yield* fail(`OpenCode has no session ${sessionID}.`);
+    const mode = flags.includes("--send") ? ("send" as const) : ("watch" as const);
+    if (!confirmed(`Let ${dot} ${describeMode(mode)} session ${sessionID} in ${directory}?`))
+      return yield* Effect.sync(() => console.log("Nothing changed."));
+    const saved = saveBinding(db, { dot, sessionID, directory, mode, busyMinutes }, "active");
+    if (typeof saved === "string") return yield* fail(saved);
+    return yield* Effect.sync(() => console.log(`Active: ${describeBinding(saved)}`));
+  }).pipe(Effect.provide(OpenCode.layer));
+};
+
 const open = (name: string | undefined) =>
   Effect.gen(function* () {
     const dot = yield* ensureSession(db, yield* pickDot(db, name));
@@ -267,7 +354,9 @@ const program =
           ? daemon
           : command === "slack"
             ? slackCommand(args[0], args[1], args.slice(2))
-            : Effect.sync(() => console.log(usage));
+            : command === "watch"
+              ? watchCommand(args[0], args.slice(1))
+              : Effect.sync(() => console.log(usage));
 
 await Effect.runPromise(
   program.pipe(

@@ -30,6 +30,17 @@ A responsibility can have a schedule: every N minutes, or daily or weekly at a l
 
 Keep `bun src/cli.ts daemon` running. It delivers due reminders, starts and watches workers, and brings their reports back into the dot's conversation. It also collects your feed: unread GitHub and Linear review requests, mentions and assignments, GitHub activity on threads you opened or commented on, and Slack mentions and DMs, from the last 24 hours, which a dot can read with `dot_feed`.
 
+A dot can also supervise a session you started yourself, for example in a TUI on some repository. Copy the session's `ses_` ID and run:
+
+```sh
+bun src/cli.ts watch add jojo ses_0123abcd           # watch only
+bun src/cli.ts watch add jojo ses_0123abcd --send    # watch, and let jojo write into it
+bun src/cli.ts watch list
+bun src/cli.ts watch revoke 3
+```
+
+Each command that creates a binding shows the session's directory and asks you to confirm, so it needs a terminal. A dot can ask with `dot_watch`, but that only saves a request: approve it with `bun src/cli.ts watch approve <id>` or in the notch's Memory view, where you can also decline or revoke one. Once active, the dot hears once each time the session finishes a turn, with a short excerpt of its last reply, fails, waits for a permission or a question, or stays busy longer than 30 minutes (`--busy-minutes` changes this). Turns that ended before the binding are never reported, and every one that ends while the daemon is stopped is reported when it starts. A permission or question is reported once, even if it shows up again later. Everything from the session reaches the dot as data, not instructions. With `--send`, the dot can queue a message into the session with `dot_send`, or steer it into the running turn, labelled as coming from the dot. It never answers the session's permissions or questions and never interrupts it. A binding ends when you revoke it, when the dot lets it go, or when the session is deleted in OpenCode; a message the dot queued but the daemon hadn't sent is dropped.
+
 The feed uses your `gh` login, so the daemon needs `gh` on its `PATH`. For Linear, create a personal API key under Settings → Security & access, then save it in the Keychain, where the daemon finds it within a minute:
 
 ```sh

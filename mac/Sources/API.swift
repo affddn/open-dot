@@ -153,10 +153,28 @@ struct MemoryReminder: Decodable, Equatable, Identifiable {
   let state: String
 }
 
+/// A dot's binding to a session the owner started. A "requested" one waits for the owner's approval;
+/// an "active" one is watched. The directory is what OpenCode reported for the session.
+struct Supervision: Decodable, Equatable, Identifiable {
+  let id: Int
+  let sessionID: String
+  let directory: String
+  /// "watch", or "send" to also let the dot write into the session.
+  let mode: String
+  let state: String
+  let busyMinutes: Int
+  let createdAt: Double
+  let activatedAt: Double?
+
+  var modeTitle: String { mode == "send" ? "watch and send" : "watch only" }
+}
+
 struct Memory: Decodable, Equatable {
   var notes: [MemoryNote]
   var responsibilities: [MemoryResponsibility]
   var reminders: [MemoryReminder]
+  /// Requested and active supervisions. Older daemons send none.
+  var supervisions: [Supervision]? = nil
 }
 
 enum MemoryKind: String {
@@ -293,6 +311,14 @@ enum APIError: Error {
 
   func memory(_ dot: String) async throws -> Memory {
     try decode(Memory.self, await send("GET", "/dots/\(escape(dot))/memory"))
+  }
+
+  /// Approves a dot's request to supervise a session, or ends a binding. Never retried on its own.
+  func changeSupervision(_ dot: String, _ id: Int, approve: Bool) async throws -> Supervision {
+    struct Body: Decodable { let supervision: Supervision }
+    let path = "/dots/\(escape(dot))/memory/supervisions/\(id)"
+    let data = approve ? try await send("POST", "\(path)/approve") : try await send("DELETE", path)
+    return try decode(Body.self, data).supervision
   }
 
   /// Adds the owner's note. Never retried on its own.

@@ -8,6 +8,8 @@ import {
   OpenCodeError,
   type SessionInput,
   type Turn,
+  type TurnEnd,
+  type Waiting,
 } from "../src/opencode";
 
 const broken = (message: string) => Effect.fail(new OpenCodeError({ message }));
@@ -36,6 +38,11 @@ export function fakeOpenCode() {
     onRecent: () => {},
     onPrompt: (_messageID: string) => {},
     approvals: new Map<string, Approval>(),
+    // Supervised sessions: each one's directory, turn ends and what it waits on.
+    directories: new Map<string, string>(),
+    ends: new Map<string, TurnEnd[]>(),
+    waiting: new Map<string, Waiting[]>(),
+    superviseFailure: false,
     history: new Map<string, Entry[]>(),
     create: "ok" as "ok" | "fail",
     prompt: "ok" as "ok" | "fail" | "lost",
@@ -100,6 +107,24 @@ export function fakeOpenCode() {
               state.onMessage();
               return item;
             }),
+      ),
+    sessionDirectory: (sessionID) =>
+      Effect.suspend(() =>
+        state.superviseFailure
+          ? broken("session lookup failed")
+          : Effect.succeed(state.directories.get(sessionID)),
+      ),
+    turnsSince: (sessionID, since) =>
+      Effect.suspend(() =>
+        state.superviseFailure
+          ? broken("history unavailable")
+          : Effect.succeed((state.ends.get(sessionID) ?? []).filter((end) => end.time >= since)),
+      ),
+    waiting: (sessionID) =>
+      Effect.suspend(() =>
+        state.superviseFailure
+          ? broken("requests unavailable")
+          : Effect.succeed(state.waiting.get(sessionID) ?? []),
       ),
   });
 

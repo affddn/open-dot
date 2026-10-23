@@ -745,6 +745,23 @@ struct FeedState {
     }
   }
 
+  /// Approves or ends a supervision the owner confirmed, then reads the memory again. A failed or
+  /// unanswered change says so and is never sent again on its own.
+  func changeSupervision(_ name: String, _ binding: Supervision, approve: Bool) {
+    guard memories[name, default: MemoryState()].supervising.insert(binding.id).inserted else { return }
+    memories[name]?.notice = nil
+    Task {
+      do {
+        _ = try await api.changeSupervision(name, binding.id, approve: approve)
+      } catch {
+        let message = Self.describeMemory(error, approve ? "Not approved" : "Not ended", unknown: "It may have changed; the next refresh shows what the daemon has.")
+        memories[name, default: MemoryState()].notice = message
+      }
+      memories[name]?.supervising.remove(binding.id)
+      await refreshMemory(name)
+    }
+  }
+
   /// Sends the edit at the version the owner started from. Nothing changed closes the editor.
   func saveMemory(_ name: String, _ key: MemoryKey) {
     guard let draft = memories[name]?.drafts[key] else { return }
