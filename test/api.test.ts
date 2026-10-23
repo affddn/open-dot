@@ -98,6 +98,363 @@ type ConversationPage = {
 };
 const readPage = async (response: Response) => (await response.json()) as ConversationPage;
 
+test("latest cache shares slow reads and serves the last page without waiting for refresh", async () => {
+  let now = 0;
+  let reads = 0;
+  let release = Promise.withResolvers<void>();
+  const oc = await Effect.runPromise(Effect.provide(OpenCode, fake.layer));
+  const layer = Layer.succeed(OpenCode, {
+    ...oc,
+    messagePage: () =>
+      Effect.promise(async () => {
+        reads++;
+        await release.promise;
+        return { entries: [entry(`msg_${reads}`, "assistant", "placeholder")], next: undefined };
+      }),
+  });
+  const handler = api(db, "secret", layer, undefined, () => now);
+  const request = () =>
+    handler(
+      new Request("http://localhost/dots/jojo/messages", {
+        headers: { authorization: "Bearer secret" },
+      }),
+    );
+  const first = Array.from({ length: 8 }, request);
+  await Bun.sleep(10);
+  expect(reads).toBe(1);
+  release.resolve();
+  expect((await Promise.all(first)).map((response) => response.status)).toEqual(Array(8).fill(200));
+  release = Promise.withResolvers<void>();
+  now = 2_001;
+  const stale = await readPage(await request());
+  expect(stale.messages.map((message) => message.id)).toEqual(["msg_1"]);
+  expect(reads).toBe(2);
+  for (let index = 0; index < 8; index++) expect((await request()).status).toBe(200);
+  expect(reads).toBe(2);
+  release.resolve();
+  await Bun.sleep(10);
+  expect((await readPage(await request())).messages[0]?.id).toBe("msg_2");
+});
+
+test("cached entries still read current hiding, reactions and native pending sends", async () => {
+  fake.state.history.set("ses_jojo", [entry("msg_owner", "user", "placeholder")]);
+  let reads = 0;
+  fake.state.onRecent = () => {
+    reads++;
+  };
+  const handler = api(db, "secret", fake.layer);
+  const request = () =>
+    handler(
+      new Request("http://localhost/dots/jojo/messages", {
+        headers: { authorization: "Bearer secret" },
+      }),
+    );
+  await request();
+  db.insert(hiddenMessages)
+    .values({ dot: "jojo", sessionID: "ses_jojo", messageID: "msg_owner", hiddenAt: 1 })
+    .run();
+  for (const id of ["msg_owner", "msg_pending"])
+    db.insert(outbox)
+      .values({
+        sessionID: "ses_jojo",
+        messageID: id,
+        text: "placeholder",
+        fromOwner: true,
+        state: "pending",
+        delivery: "auto",
+        createdAt: 0,
+      })
+      .run();
+  db.insert(reactions)
+    .values({
+      dot: "jojo",
+      sessionID: "ses_jojo",
+      messageID: "msg_owner",
+      actor: "dot",
+      emoji: "👍",
+      excerpt: "placeholder",
+      updatedAt: 1,
+    })
+    .run();
+  expect(await (await request()).json()).toMatchObject({
+    messages: [{ id: "msg_owner", hidden: true, reactions: [{ actor: "dot", emoji: "👍" }] }],
+    pending: [{ id: "msg_pending", status: "sending" }],
+  });
+  expect(reads).toBe(1);
+});
+
+test("background cache prewarms, backs off invisible dots and failure, and exposes stale errors", async () => {
+  let now = 0;
+  let reads = 0;
+  let broken = false;
+  const oc = await Effect.runPromise(Effect.provide(OpenCode, fake.layer));
+  const handler = api(
+    db,
+    "secret",
+    Layer.succeed(OpenCode, {
+      ...oc,
+      messagePage: () =>
+        Effect.suspend(() => {
+          reads++;
+          return broken
+            ? Effect.fail(new OpenCodeError({ message: "unavailable" }))
+            : Effect.succeed({
+                entries: [entry("msg_1", "assistant", "placeholder")],
+                next: undefined,
+              });
+        }),
+    }),
+    undefined,
+    () => now,
+  );
+  await handler.refresh();
+  expect(reads).toBe(2);
+  now = 29_999;
+  await handler.refresh();
+  expect(reads).toBe(2);
+  now = 30_000;
+  broken = true;
+  await handler.refresh();
+  expect(reads).toBe(4);
+  const request = () =>
+    handler(
+      new Request("http://localhost/dots/jojo/messages", {
+        headers: { authorization: "Bearer secret" },
+      }),
+    );
+  expect(await (await request()).json()).toMatchObject({
+    messages: [{ id: "msg_1" }],
+    refreshError: expect.any(String),
+  });
+  handler.invalidate("ses_jojo");
+  now = 31_999;
+  await handler.refresh();
+  expect(reads).toBe(4);
+  now = 32_000;
+  await handler.refresh();
+  expect(reads).toBe(6);
+  now = 35_999;
+  await handler.refresh();
+  expect(reads).toBe(6);
+  now = 36_000;
+  broken = false;
+  await handler.refresh();
+  expect(reads).toBe(8);
+  expect(await (await request()).json()).not.toHaveProperty("refreshError");
+});
+
+test("rebind during a shared cache fill returns 409 and never caches the old conversation", async () => {
+  const release = Promise.withResolvers<void>();
+  const oc = await Effect.runPromise(Effect.provide(OpenCode, fake.layer));
+  const handler = api(
+    db,
+    "secret",
+    Layer.succeed(OpenCode, {
+      ...oc,
+      messagePage: (sessionID) =>
+        Effect.promise(async () => {
+          if (sessionID === "ses_jojo") await release.promise;
+          return {
+            entries: [
+              entry(sessionID === "ses_jojo" ? "msg_old" : "msg_new", "assistant", "placeholder"),
+            ],
+            next: undefined,
+          };
+        }),
+    }),
+  );
+  const request = () =>
+    handler(
+      new Request("http://localhost/dots/jojo/messages", {
+        headers: { authorization: "Bearer secret" },
+      }),
+    );
+  const pending = request();
+  await Bun.sleep(10);
+  db.update(dots).set({ sessionID: "ses_new" }).where(eq(dots.name, "jojo")).run();
+  const newer = request();
+  await handler.refresh();
+  release.resolve();
+  expect((await pending).status).toBe(409);
+  expect((await readPage(await newer)).messages.map((message) => message.id)).toEqual(["msg_new"]);
+});
+
+test("warm pages remain immediate during failed and stalled rediscovery", async () => {
+  let now = 0;
+  let broken = false;
+  let discovery: "ok" | "failed" | "stalled" = "ok";
+  let discoveries = 0;
+  const gate = Promise.withResolvers<void>();
+  const oc = await Effect.runPromise(Effect.provide(OpenCode, fake.layer));
+  const service = {
+    ...oc,
+    messagePage: () =>
+      broken
+        ? Effect.fail(new OpenCodeError({ message: "unavailable" }))
+        : Effect.succeed({
+            entries: [entry("msg_1", "assistant", "placeholder")],
+            next: undefined,
+          }),
+  };
+  const layer = Layer.effect(
+    OpenCode,
+    Effect.suspend(() => {
+      discoveries++;
+      if (discovery === "failed")
+        return Effect.fail(new OpenCodeError({ message: "discovery failed" }));
+      if (discovery === "stalled")
+        return Effect.promise(async () => {
+          await gate.promise;
+          return service;
+        });
+      return Effect.succeed(service);
+    }),
+  );
+  const handler = api(db, "secret", layer, undefined, () => now);
+  const request = () =>
+    handler(
+      new Request("http://localhost/dots/jojo/messages", {
+        headers: { authorization: "Bearer secret" },
+      }),
+    );
+  expect((await request()).status).toBe(200);
+  broken = true;
+  now = 2_001;
+  await handler.refresh();
+  discovery = "failed";
+  const before = discoveries;
+  expect((await request()).status).toBe(200);
+  expect(discoveries).toBe(before);
+  now = 4_002;
+  await handler.refresh();
+  expect((await request()).status).toBe(200);
+  discovery = "stalled";
+  now = 30_000;
+  const refresh = handler.refresh();
+  await Bun.sleep(10);
+  try {
+    const response = await Promise.race([request(), Bun.sleep(500).then(() => undefined)]);
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      messages: [{ id: "msg_1" }],
+      refreshError: expect.any(String),
+    });
+  } finally {
+    gate.resolve();
+    await refresh;
+  }
+});
+
+test("cold discovery is inside the latest read deadline", async () => {
+  const gate = Promise.withResolvers<void>();
+  const oc = await Effect.runPromise(Effect.provide(OpenCode, fake.layer));
+  const layer = Layer.effect(
+    OpenCode,
+    Effect.promise(async () => {
+      await gate.promise;
+      return oc;
+    }),
+  );
+  const handler = api(db, "secret", layer);
+  const start = performance.now();
+  try {
+    const response = await handler(
+      new Request("http://localhost/dots/jojo/messages", {
+        headers: { authorization: "Bearer secret" },
+      }),
+    );
+    expect(response.status).toBe(503);
+    expect(performance.now() - start).toBeGreaterThanOrEqual(19_900);
+    expect(performance.now() - start).toBeLessThan(22_000);
+  } finally {
+    gate.resolve();
+    await handler.refresh();
+  }
+}, 25_000);
+
+test("mixed page sizes share active reads without a replacement queue and retain failure backoff", async () => {
+  let now = 0;
+  let reads = 0;
+  let broken = false;
+  const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+  const oc = await Effect.runPromise(Effect.provide(OpenCode, fake.layer));
+  const handler = api(
+    db,
+    "secret",
+    Layer.succeed(OpenCode, {
+      ...oc,
+      messagePage: (_session, limit) =>
+        Effect.suspend(() => {
+          const read = reads++;
+          if (broken) return Effect.fail(new OpenCodeError({ message: "unavailable" }));
+          return Effect.promise(async () => {
+            await gates[read]?.promise;
+            return {
+              entries: Array.from({ length: limit }, (_, index) =>
+                entry(`msg_${index}`, "assistant", "placeholder"),
+              ),
+              next: undefined,
+            };
+          });
+        }),
+    }),
+    undefined,
+    () => now,
+  );
+  const request = (limit: number) =>
+    handler(
+      new Request(`http://localhost/dots/jojo/messages?limit=${limit}`, {
+        headers: { authorization: "Bearer secret" },
+      }),
+    );
+  const limits = [20, 50, 20, 50, 20, 50];
+  const pending = limits.map(request);
+  await Bun.sleep(10);
+  expect(reads).toBe(1);
+  gates[0]?.resolve();
+  await Bun.sleep(10);
+  expect(reads).toBe(2);
+  gates[1]?.resolve();
+  const responses = await Promise.all(pending);
+  expect(
+    await Promise.all(
+      responses.map(async (response) => (await readPage(response)).messages.length),
+    ),
+  ).toEqual(limits);
+  expect(reads).toBe(2);
+  now = 2_001;
+  broken = true;
+  await request(50);
+  await Bun.sleep(10);
+  expect(reads).toBe(3);
+  for (const limit of [20, 50, 20, 50]) expect((await request(limit)).status).toBe(503);
+  expect(reads).toBe(3);
+});
+
+test("text invalidation coalesces and a cached poll cycle makes no upstream reads", async () => {
+  let now = 0;
+  let reads = 0;
+  fake.state.onRecent = () => {
+    reads++;
+  };
+  const handler = api(db, "secret", fake.layer, undefined, () => now);
+  const request = (name: string) =>
+    handler(
+      new Request(`http://localhost/dots/${name}/messages`, {
+        headers: { authorization: "Bearer secret" },
+      }),
+    );
+  await Promise.all([request("jojo"), request("polnareff")]);
+  expect(reads).toBe(2);
+  now = 1_000;
+  await Promise.all([request("jojo"), request("polnareff"), request("jojo")]);
+  expect(reads).toBe(2);
+  for (let count = 0; count < 10; count++) handler.invalidate("ses_jojo");
+  now = 1_500;
+  await handler.refresh();
+  expect(reads).toBe(3);
+});
+
 test("conversation pages walk projection order without gaps, including hidden and tool-only items", async () => {
   const history = Array.from({ length: 65 }, (_, index) =>
     entry(`msg_${65 - index}`, "assistant", `Reply ${index}`),

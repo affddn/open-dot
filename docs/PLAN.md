@@ -130,6 +130,14 @@ The TUI plugin imports no backend code: no `@opencode/client` and no Drizzle. op
 
 Its sidebar shows up to 10 workers per dot: all running workers first, newest by creation time, then the most recently finished within 24 hours. More than 10 running workers all remain visible, with no finished rows. A muted `… N more` row opens a selector for all of that dot's recent workers; a selection opens the same details as a worker row. The sidebar still refreshes every two seconds and skips unchanged snapshots.
 
+## Conversation reads
+
+The daemon keeps the latest conversation page per dot in memory, bound to its session and requested page size. It prewarms ready dots after startup. A warm read returns without waiting for OpenCode; a cold read shares the one refresh already in flight. Refreshes take at most 20 seconds. Requests reuse the public client instead of rediscovering the service each time. The cache keeps upstream text and attachment metadata, never image bytes. Every response rereads local outbox provenance, pending sends, hidden state and reactions, and checks the session binding again. Older cursor pages still read OpenCode directly.
+
+The background loop checks each second without waiting for another dot's read. A recently viewed dot refreshes two seconds after its last successful read; other dots wait 30 seconds. The existing Slack text-event subscription invalidates a page when a text part ends, with a short delay for a recently viewed dot. No extra event subscription or Slack call is made for chat caching. A disconnected stream, or one inactive because no Slack app is active, relies on the background fallback. Failures back off from two to 30 seconds and keep the last good page with a refresh error. A rebound session never reuses the former session's page. No conversation cache is written to disk.
+
+The notch serializes latest-page reads per dot, coalescing overlapping triggers into one follow-up read instead of discarding every slow answer. It shows loading before the first page and an error with Retry on failure, keeping any messages already shown. A non-visible dot is swept every 30 seconds independently of the five-second feed poll. Decode failures log only the response type, field path and failure kind, not payload values. Mutation and per-message reconciliation guards still apply.
+
 ## Verified OpenCode behavior
 
 These were checked live against OpenCode 2.1.1 and shape the code:

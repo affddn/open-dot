@@ -356,19 +356,24 @@ const list = Effect.sync(() => {
 });
 
 /** Serves the notch app's API on a fresh port and token, then saves both where only the owner can read them. */
+const apiToken = randomBytes(32).toString("hex");
+const notchAPI = api(db, apiToken, OpenCode.layer);
 const serve = Effect.sync(() => {
-  const token = randomBytes(32).toString("hex");
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch: api(db, token, OpenCode.layer),
+    fetch: notchAPI,
   });
   const temporary = `${apiPath()}.${process.pid}`;
   rmSync(temporary, { force: true });
-  writeFileSync(temporary, JSON.stringify({ url: `http://127.0.0.1:${server.port}`, token }), {
-    mode: 0o600,
-    flag: "wx",
-  });
+  writeFileSync(
+    temporary,
+    JSON.stringify({ url: `http://127.0.0.1:${server.port}`, token: apiToken }),
+    {
+      mode: 0o600,
+      flag: "wx",
+    },
+  );
   renameSync(temporary, apiPath());
   console.log(`open-dot API on http://127.0.0.1:${server.port}`);
 });
@@ -380,7 +385,9 @@ const sources = [github(), linear(), slackFeed(slack)];
 const converse = slackChat(db, slack, OpenCode.layer);
 
 /** Each dot's own Slack app: its connection, the owner's mentions and DMs, and the replies. */
-const agents = slackAgents(db, OpenCode.layer);
+const agents = slackAgents(db, OpenCode.layer, undefined, (event) => {
+  if (event.type === "ended") notchAPI.invalidate(event.sessionID);
+});
 
 const logged = (part: string, run: () => Promise<void>) =>
   Effect.promise(() =>
@@ -412,6 +419,12 @@ const daemon = Effect.sync(() => console.log(`open-dot daemon watching ${databas
     Effect.all(
       [
         daemonLoops(db, OpenCode.layer),
+        Effect.repeat(
+          Effect.sync(() => {
+            void notchAPI.refresh();
+          }),
+          Schedule.spaced("1 second"),
+        ),
         Effect.repeat(converse, Schedule.spaced("3 seconds")),
         Effect.repeat(agents.tick, Schedule.spaced("3 seconds")),
         // Only while a dot's own app is active; it only keeps text for the tick to stream.

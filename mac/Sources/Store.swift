@@ -320,7 +320,21 @@ struct MessageWindow: Equatable {
   @ObservationIgnored var onRelease: () -> Void = {}
   @ObservationIgnored private var exporting: Set<MessageKey> = []
   @ObservationIgnored private var sharing: ShareDelegate?
-  @ObservationIgnored private var messageReads: [String: Int] = [:]
+  /// Each dot's one latest-page read chain, and the dots asked for another read after it.
+  @ObservationIgnored private var messageRefreshes: [String: Task<Void, Never>] = [:]
+  @ObservationIgnored private var queuedRefreshes: Set<String> = []
+  @ObservationIgnored private var sweeping: Task<Void, Never>?
+  @ObservationIgnored private var lastSweep: ContinuousClock.Instant?
+  private static let sweepInterval = Duration.seconds(30)
+  /// Why each dot's last latest-page read failed, or that the daemon served it stale. Cleared by the
+  /// next answer without an error.
+  var messageErrors: [String: String] = [:]
+  /// Dots whose Retry is running.
+  var retrying: Set<String> = []
+  /// The daemon reads of the latest page and of one message. Tests replace them.
+  @ObservationIgnored var latestPage: @MainActor (String) async throws -> MessagePage = { _ in throw APIError.unreachable }
+  @ObservationIgnored var oneMessage: @MainActor (MessageKey, String) async throws -> Message = { _, _ in throw APIError.unreachable }
+  @ObservationIgnored var saveReaction: @MainActor (MessageKey, String?) async throws -> (reaction: Reaction, recent: [String]?) = { _, _ in throw APIError.unreachable }
   private var seen: [String: Double] = [:]
   private var newest: [String: Double] = [:]
   private var feedSeen: Double?
@@ -328,6 +342,13 @@ struct MessageWindow: Equatable {
   @ObservationIgnored private var loading: Set<AttachmentKey> = []
   @ObservationIgnored private var opening: Set<AttachmentKey> = []
   @ObservationIgnored private let api = API()
+
+  init() {
+    let api = self.api
+    latestPage = { try await api.messages($0) }
+    oneMessage = { try await api.message($0, session: $1) }
+    saveReaction = { try await api.react($0, emoji: $1) }
+  }
 
   var showsIndicator: Bool { dotsBusy || dotsUnread || feedUnread }
 
@@ -356,14 +377,33 @@ struct MessageWindow: Equatable {
         try? await Task.sleep(for: .seconds(1))
       }
     }
-    // The dot list carries no message times, so other dots' messages are swept slowly
-    // to light the unread indicator.
     Task {
       while true {
         await refreshFeed()
-        for dot in dots where !visible(dot.name) { await refreshMessages(dot.name) }
+        sweepMessages()
         try? await Task.sleep(for: .seconds(5))
       }
+    }
+  }
+
+  /// The dot list carries no message times, so other dots' messages are swept slowly to light the
+  /// unread indicator: every 30 seconds, apart from the feed, so slow reads don't hold it back.
+  private func sweepMessages() {
+    let now = ContinuousClock.now
+    guard sweeping == nil, lastSweep.map({ now - $0 >= Self.sweepInterval }) ?? true else { return }
+    lastSweep = now
+    sweeping = Task {
+      for dot in dots where !visible(dot.name) { await refreshMessages(dot.name) }
+      sweeping = nil
+    }
+  }
+
+  /// Reads the latest page again at the owner's request. Messages already shown stay meanwhile.
+  func retryMessages(_ name: String) {
+    guard retrying.insert(name).inserted else { return }
+    Task {
+      await refreshMessages(name)
+      retrying.remove(name)
     }
   }
 
@@ -696,7 +736,7 @@ struct MessageWindow: Equatable {
         }
       }
       do {
-        let (confirmed, recent) = try await api.react(key, emoji: next)
+        let (confirmed, recent) = try await saveReaction(key, next)
         guard confirmed.dot == key.dot, confirmed.messageID == key.message,
           confirmed.actor == "owner", confirmed.emoji == next, confirmed.sessionID == message.sessionID else {
           reactionErrors[key] = "Reaction outcome unknown: unexpected response. Refreshing saved state."
@@ -1241,17 +1281,43 @@ struct MessageWindow: Equatable {
     if feedSeen == nil || (expanded && showingFeed) { feedSeen = feedNewest }
   }
 
-  private func refreshMessages(_ name: String) async {
+  /// Runs at most one latest-page read per dot. A trigger while one runs asks for one more read after
+  /// it and waits for that, so overlapping triggers share reads instead of discarding each other's.
+  func refreshMessages(_ name: String) async {
+    if let running = messageRefreshes[name] {
+      queuedRefreshes.insert(name)
+      await running.value
+      return
+    }
+    let chain = Task {
+      repeat {
+        queuedRefreshes.remove(name)
+        await readLatest(name)
+      } while queuedRefreshes.contains(name)
+      messageRefreshes[name] = nil
+    }
+    messageRefreshes[name] = chain
+    await chain.value
+  }
+
+  private func readLatest(_ name: String) async {
     let epoch = writeEpoch[name, default: 0]
     let recentEpoch = recentWrites
-    messageReads[name, default: 0] += 1
-    let read = messageReads[name]
-    guard let result = try? await api.messages(name) else { return }
+    let result: MessagePage
+    do {
+      result = try await latestPage(name)
+    } catch {
+      let reason = Self.describeRead(error)
+      if messageErrors[name] != reason { messageErrors[name] = reason }
+      return
+    }
+    // The daemon served its last page because reading OpenCode again failed.
+    if messageErrors[name] != result.refreshError { messageErrors[name] = result.refreshError }
     let list = result.messages
     let statuses = result.statuses
     let recent = result.recentEmojis
-    // Discard polls begun before/during a write, and older overlapping reads.
-    guard epoch == writeEpoch[name, default: 0], read == messageReads[name],
+    // Discard polls begun before or during a write.
+    guard epoch == writeEpoch[name, default: 0],
       !reacting.contains(where: { $0.dot == name }), !hiding.contains(where: { $0.dot == name }) else { return }
     var window = conversations[name] ?? MessageWindow()
     if window.sessionID != result.sessionID { pruneThumbnails(name, reset: true) }
@@ -1284,7 +1350,7 @@ struct MessageWindow: Equatable {
     messageRechecks[key] = recheck
     let epoch = writeEpoch[key.dot, default: 0]
     defer { reconciling.remove(key) }
-    guard let message = try? await api.message(key, session: session),
+    guard let message = try? await oneMessage(key, session),
       message.id == key.message, message.sessionID == session,
       epoch == writeEpoch[key.dot, default: 0], messageRechecks[key] == recheck,
       var window = conversations[key.dot], window.sessionID == session else { return }
@@ -1348,6 +1414,16 @@ struct MessageWindow: Equatable {
 
   private static func describe(_ error: Error) -> String {
     (error as? APIError)?.message ?? error.localizedDescription
+  }
+
+  /// Why a read failed: a timeout, an answer that didn't decode, a refusal such as a 503, or no daemon.
+  private static func describeRead(_ error: Error) -> String {
+    switch error as? APIError {
+    case .lost?: "The open-dot daemon didn't answer in time."
+    case .server(let text)?: text
+    case .unreachable?: APIError.unreachable.message
+    case nil: error.localizedDescription
+    }
   }
 
   private static func describeDismissal(_ error: Error) -> String {

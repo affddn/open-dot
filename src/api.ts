@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { SessionMessage } from "@opencode/client/effect";
 import { and, desc, eq, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
-import { Effect, type Layer } from "effect";
+import { type Context, Effect, Layer, Result } from "effect";
 import { avatarRevision, readAvatar } from "./avatar";
 import { stopWorker } from "./daemon";
 import type { Db } from "./db";
@@ -31,7 +31,7 @@ import {
   parseResponsibilityEdit,
   readMemory,
 } from "./memory";
-import { type Attachment, OpenCode, type Entry, type OpenCodeError } from "./opencode";
+import { type Attachment, OpenCode, type Entry, OpenCodeError } from "./opencode";
 import {
   currentReactions,
   isReactionEmoji,
@@ -430,7 +430,50 @@ const decodeCursor = (token: string, value: string): string[] | undefined => {
   }
 };
 
-const conversation = (db: Db, dot: Dot, request: Request, token: string) =>
+interface ConversationPage {
+  entries: Entry[];
+  next: string | undefined;
+}
+
+const readConversation = (db: Db, dot: Dot, limit: number, cursor?: string) =>
+  Effect.gen(function* () {
+    const oc = yield* OpenCode;
+    let next = cursor;
+    let visible = 0;
+    const entries: Entry[] = [];
+    const visited = new Set<string>();
+    for (let reads = 0; reads < 10; reads++) {
+      if (next) visited.add(next);
+      const page = yield* oc.messagePage(dot.sessionID, limit - visible, next);
+      if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+      // Attachments are loaded separately; never retain their base64 bytes in the latest cache.
+      entries.unshift(
+        ...page.entries.map((entry) => ({
+          ...entry,
+          files: entry.files.map((file) => ({ ...file, data: "" })),
+        })),
+      );
+      visible += visibleMessages(db, dot, page.entries).length;
+      next = page.next;
+      if (next && visited.has(next)) return error(502, "History cursor did not advance.");
+      if (!next || visible >= limit) break;
+    }
+    return { entries, next };
+  });
+
+type LatestConversation = (
+  dot: Dot,
+  limit: number,
+) => Effect.Effect<(ConversationPage & { refreshError?: string }) | Response, OpenCodeError>;
+
+const conversation = (
+  db: Db,
+  dot: Dot,
+  request: Request,
+  token: string,
+  latest: LatestConversation,
+  layer: Layer.Layer<OpenCode, OpenCodeError>,
+) =>
   Effect.gen(function* () {
     const query = new URL(request.url).searchParams;
     const limit = query.get("limit") ?? String(pageSize);
@@ -448,28 +491,21 @@ const conversation = (db: Db, dot: Dot, request: Request, token: string) =>
       return error(400, "Invalid conversation cursor. Refresh.");
     if (dot.sessionState !== "ready" || (cursor && cursor[1] !== dot.sessionID))
       return error(409, "The dot's conversation changed. Refresh.");
-    const oc = yield* OpenCode;
-    let next = cursor?.[2];
-    let messages: ReturnType<typeof visibleMessages> = [];
-    const entries: Entry[] = [];
-    const visited = new Set<string>();
-    for (let reads = 0; reads < 10; reads++) {
-      if (next) visited.add(next);
-      const page = yield* oc.messagePage(dot.sessionID, Number(limit) - messages.length, next);
-      if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
-      entries.unshift(...page.entries);
-      messages = [...visibleMessages(db, dot, page.entries), ...messages];
-      next = page.next;
-      if (next && visited.has(next)) return error(502, "History cursor did not advance.");
-      if (!next || messages.length >= Number(limit)) break;
-    }
+    const page = yield* cursor
+      ? readConversation(db, dot, Number(limit), cursor[2]).pipe(Effect.provide(layer))
+      : latest(dot, Number(limit));
+    if (page instanceof Response)
+      return new Response(page.clone().body, { status: page.status, headers: page.headers });
+    if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+    const { entries, next } = page;
     return Response.json({
-      messages,
+      messages: visibleMessages(db, dot, entries),
       sessionID: dot.sessionID,
       next: next ? encodeCursor(token, dot, next) : null,
       pending: pendingSends(db, dot, entries),
       // The owner's, across every dot: the menu's second row.
       recentEmojis: recentEmojis(db),
+      ...("refreshError" in page ? { refreshError: page.refreshError } : {}),
     });
   });
 
@@ -1061,7 +1097,6 @@ const route = (
   db: Db,
   request: Request,
   path: string[],
-  token: string,
 ): Effect.Effect<Response, OpenCodeError, OpenCode> => {
   const [root, name, rest, ...extra] = path;
   if (root !== "dots") return Effect.succeed(error(404, "Not found"));
@@ -1078,7 +1113,6 @@ const route = (
   const dot = findDot(db, decoded);
   if (!dot) return Effect.succeed(error(404, `There's no dot named "${name}".`));
   if (rest === "messages" && extra.length === 0) {
-    if (request.method === "GET") return conversation(db, dot, request, token);
     if (request.method === "POST") return send(db, dot, request);
   }
   const [id, part, index, ...more] = extra;
@@ -1309,9 +1343,142 @@ const requestRoute = (db: Db, request: Request, path: string[], run: Run): Promi
  * account can read from api.json, so other local users and web pages can't call it.
  * The feed doesn't need OpenCode, so it works while OpenCode is down.
  */
-export const api =
-  (db: Db, token: string, layer: Layer.Layer<OpenCode, OpenCodeError>, run: Run = spawnRun) =>
-  (request: Request): Promise<Response> => {
+export const api = (
+  db: Db,
+  token: string,
+  layer: Layer.Layer<OpenCode, OpenCodeError>,
+  run: Run = spawnRun,
+  now: () => number = Date.now,
+) => {
+  interface Cached {
+    sessionID: string;
+    limit: number;
+    page?: ConversationPage;
+    flight?: Promise<ConversationPage | Response>;
+    due: number;
+    viewed: number;
+    updated: number;
+    failures: number;
+    revision: number;
+    refreshError?: string;
+  }
+  const pages = new Map<string, Cached>();
+  let connection: Promise<Context.Context<OpenCode>> | undefined;
+  const connected = () =>
+    (connection ??= Effect.runPromise(
+      Effect.result(Effect.provide(Effect.context<OpenCode>(), layer)),
+    )
+      .then((result) => {
+        if (Result.isFailure(result)) throw result.failure;
+        return result.success;
+      })
+      .catch((cause) => {
+        connection = undefined;
+        throw cause;
+      }));
+  const sharedLayer = Layer.effectContext(
+    Effect.tryPromise({
+      try: connected,
+      catch: (cause) =>
+        cause instanceof OpenCodeError
+          ? cause
+          : new OpenCodeError({ message: "OpenCode is unavailable. Retry." }),
+    }),
+  );
+  const refresh = (dot: Dot, cached: Cached): Promise<ConversationPage | Response> => {
+    if (cached.flight) return cached.flight;
+    const revision = cached.revision;
+    cached.flight = (async () => {
+      try {
+        const page = await Effect.runPromise(
+          readConversation(db, dot, cached.limit).pipe(
+            Effect.provide(sharedLayer),
+            Effect.timeoutOrElse({
+              duration: "20 seconds",
+              orElse: () =>
+                Effect.fail(new OpenCodeError({ message: "Message refresh timed out. Retry." })),
+            }),
+          ),
+        );
+        if (page instanceof Response) {
+          cached.due = now() + 5_000;
+          cached.refreshError = "Couldn't refresh messages. Retry.";
+          return page;
+        }
+        cached.page = page;
+        cached.updated = now();
+        cached.failures = 0;
+        delete cached.refreshError;
+        cached.due = now() + (now() - cached.viewed < 5_000 ? 2_000 : 30_000);
+        if (cached.revision !== revision && now() - cached.viewed < 5_000) cached.due = now() + 500;
+        return page;
+      } catch {
+        connection = undefined;
+        cached.failures++;
+        cached.due = now() + Math.min(30_000, 2_000 * 2 ** Math.min(cached.failures - 1, 4));
+        cached.refreshError = "Couldn't refresh messages from OpenCode. Retry.";
+        throw new OpenCodeError({ message: cached.refreshError });
+      } finally {
+        delete cached.flight;
+      }
+    })();
+    return cached.flight;
+  };
+  const current = (dot: Dot, limit: number) => {
+    let cached = pages.get(dot.name);
+    if (!cached || cached.sessionID !== dot.sessionID || cached.limit !== limit) {
+      if (cached?.flight) return undefined;
+      const failed =
+        cached?.sessionID === dot.sessionID && cached.failures > 0 ? cached : undefined;
+      cached = {
+        sessionID: dot.sessionID,
+        limit,
+        due: failed?.due ?? 0,
+        viewed: -Infinity,
+        updated: -Infinity,
+        failures: failed?.failures ?? 0,
+        revision: 0,
+        ...(failed?.refreshError ? { refreshError: failed.refreshError } : {}),
+      };
+      pages.set(dot.name, cached);
+    }
+    return cached;
+  };
+  const latest: LatestConversation = (dot, limit) =>
+    Effect.tryPromise({
+      try: async (signal) => {
+        let cached = current(dot, limit);
+        while (!cached) {
+          await pages.get(dot.name)?.flight?.catch(() => {});
+          if (signal.aborted)
+            throw new OpenCodeError({ message: "Message read timed out. Retry." });
+          if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+          cached = current(dot, limit);
+        }
+        if (now() - cached.viewed >= 5_000 && cached.failures === 0)
+          cached.due = Math.min(cached.due, Math.max(now(), cached.updated + 2_000));
+        cached.viewed = now();
+        if (cached.page) {
+          if (now() >= cached.due) void refresh(dot, cached).catch(() => {});
+          return {
+            ...cached.page,
+            ...(cached.refreshError ? { refreshError: cached.refreshError } : {}),
+          };
+        }
+        if (!cached.flight && now() < cached.due)
+          throw new OpenCodeError({
+            message: cached.refreshError ?? "Messages are unavailable. Retry.",
+          });
+        return refresh(dot, cached);
+      },
+      catch: () => new OpenCodeError({ message: "Couldn't load messages from OpenCode. Retry." }),
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: "20 seconds",
+        orElse: () => Effect.fail(new OpenCodeError({ message: "Message read timed out. Retry." })),
+      }),
+    );
+  const handler = (request: Request): Promise<Response> => {
     if (request.headers.get("authorization") !== `Bearer ${token}`)
       return Promise.resolve(error(401, "Unauthorized"));
     const path = new URL(request.url).pathname.split("/").filter(Boolean);
@@ -1333,10 +1500,52 @@ export const api =
         return error(500, "Couldn't read or save the dot's memory.");
       });
     if (path[0] !== "dots") return Promise.resolve(error(404, "Not found"));
+    if (path.length === 3 && path[2] === "messages" && request.method === "GET") {
+      let name: string;
+      try {
+        name = decodeURIComponent(path[1] ?? "");
+      } catch {
+        return Promise.resolve(error(400, "Bad dot name."));
+      }
+      const dot = findDot(db, name);
+      if (!dot) return Promise.resolve(error(404, `There's no dot named "${path[1]}".`));
+      return Effect.runPromise(
+        conversation(db, dot, request, token, latest, sharedLayer).pipe(
+          Effect.catch((failure) => Effect.succeed(error(503, failure.message))),
+        ),
+      );
+    }
     return Effect.runPromise(
-      route(db, request, path, token).pipe(
-        Effect.provide(layer),
+      route(db, request, path).pipe(
+        Effect.provide(sharedLayer),
         Effect.catch((failure) => Effect.succeed(error(503, failure.message))),
       ),
     );
   };
+  return Object.assign(handler, {
+    refresh: async () => {
+      const dots = listDots(db).filter((dot) => dot.sessionState === "ready");
+      const names = new Set(dots.map((dot) => dot.name));
+      for (const [name, cached] of pages)
+        if (!names.has(name) && !cached.flight) pages.delete(name);
+      await Promise.all(
+        dots.map(async (dot) => {
+          const previous = pages.get(dot.name);
+          const cached = current(
+            dot,
+            previous?.sessionID === dot.sessionID ? previous.limit : pageSize,
+          );
+          if (cached && now() >= cached.due) await refresh(dot, cached).catch(() => {});
+        }),
+      );
+    },
+    invalidate: (sessionID: string) => {
+      for (const cached of pages.values()) {
+        if (cached.sessionID === sessionID && cached.failures === 0) {
+          cached.revision++;
+          cached.due = Math.min(cached.due, now() + (now() - cached.viewed < 5_000 ? 500 : 30_000));
+        }
+      }
+    },
+  });
+};

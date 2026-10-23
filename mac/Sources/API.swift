@@ -227,6 +227,8 @@ struct MessagePage: Decodable {
   let next: String?
   let pending: [Status]?
   let recentEmojis: [String]?
+  /// Set when the daemon served its last page because reading OpenCode again failed.
+  var refreshError: String? = nil
   var statuses: [String: String] {
     Dictionary((pending ?? []).map { ($0.id, $0.status) }) { first, _ in first }
   }
@@ -723,11 +725,43 @@ enum APIError: Error {
   }
 
   private func decode<T: Decodable>(_ type: T.Type, _ data: Data) throws -> T {
+    try Self.decode(type, data)
+  }
+
+  /// Decodes a daemon answer. A failure is logged with only the type, the field path and the kind of
+  /// failure, never a value, since answers carry message text.
+  nonisolated static func decode<T: Decodable>(_ type: T.Type, _ data: Data, log: (String) -> Void = API.log) throws -> T {
     do {
       return try JSONDecoder().decode(type, from: data)
+    } catch let error as DecodingError {
+      log("open-dot-notch: couldn't decode \(T.self) at \(fieldPath(error))")
+      throw APIError.server("Unexpected response from the open-dot daemon")
     } catch {
+      log("open-dot-notch: couldn't decode \(T.self)")
       throw APIError.server("Unexpected response from the open-dot daemon")
     }
+  }
+
+  /// Where and how decoding failed, such as `messages[2].time (typeMismatch)`. A debug description
+  /// can quote the value, so it's left out.
+  nonisolated static func fieldPath(_ error: DecodingError) -> String {
+    let found: (path: [any CodingKey], kind: String) = switch error {
+    case .typeMismatch(_, let context): (context.codingPath, "typeMismatch")
+    case .valueNotFound(_, let context): (context.codingPath, "valueNotFound")
+    case .keyNotFound(let key, let context): (context.codingPath + [key], "keyNotFound")
+    case .dataCorrupted(let context): (context.codingPath, "dataCorrupted")
+    @unknown default: ([], "unknown")
+    }
+    var text = ""
+    for key in found.path {
+      if let index = key.intValue { text += "[\(index)]" } else { text += text.isEmpty ? key.stringValue : ".\(key.stringValue)" }
+    }
+    return "\(text.isEmpty ? "<root>" : text) (\(found.kind))"
+  }
+
+  /// To stderr, which launchd writes to notch.log.
+  nonisolated static func log(_ line: String) {
+    FileHandle.standardError.write(Data("\(Date().ISO8601Format()) \(line)\n".utf8))
   }
 
   private func escape(_ name: String) -> String {

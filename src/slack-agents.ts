@@ -255,6 +255,7 @@ export function slackAgents(
   db: Db,
   layer: Layer.Layer<OpenCode, OpenCodeError>,
   deps: Agents = realAgents,
+  onText: (event: TextEvent) => void = () => {},
 ) {
   const lives = new Map<string, Live>();
   const problems = new Map<string, string>();
@@ -1287,7 +1288,12 @@ ${context.join("\n")}
               while (anyActive()) yield* Effect.sleep(pause);
             }),
           ),
-          Stream.runForEach((event) => Effect.sync(() => take(event))),
+          Stream.runForEach((event) =>
+            Effect.sync(() => {
+              take(event);
+              onText(event);
+            }),
+          ),
         );
         note("text events");
       }).pipe(

@@ -1,0 +1,235 @@
+{
+  "messages": [
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [],
+      "time": 1792783670190,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [
+        {
+          "index": 0,
+          "mime": "image/png",
+          "name": "placeholder"
+        }
+      ],
+      "time": 1792783895526,
+      "reactions": [],
+      "kind": "owner"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": ["dot_placeholder"],
+      "attachments": [],
+      "time": 1792783993458,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [],
+      "time": 1792784013839,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": ["dot_placeholder"],
+      "attachments": [],
+      "time": 1792788350902,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [],
+      "time": 1792788472991,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [],
+      "time": 1792789648618,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": ["dot_placeholder"],
+      "attachments": [],
+      "time": 1792789704057,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [],
+      "time": 1792789721443,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [],
+      "time": 1792790087825,
+      "reactions": [],
+      "kind": "peer",
+      "peer": "placeholder"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": ["dot_placeholder"],
+      "attachments": [],
+      "time": 1792790111879,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [],
+      "time": 1792790122895,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [],
+      "time": 1792792587007,
+      "reactions": [],
+      "kind": "owner"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [],
+      "time": 1792792594689,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [],
+      "time": 1792792655426,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": ["dot_placeholder"],
+      "attachments": [],
+      "time": 1792793437701,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [],
+      "time": 1792793473618,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [],
+      "time": 1792793516046,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": ["dot_placeholder"],
+      "attachments": [],
+      "time": 1792793549747,
+      "reactions": [],
+      "kind": "dot"
+    },
+    {
+      "id": "placeholder",
+      "sessionID": "placeholder",
+      "hidden": false,
+      "text": "placeholder",
+      "tools": [],
+      "attachments": [],
+      "time": 1792793565854,
+      "reactions": [],
+      "kind": "dot"
+    }
+  ],
+  "sessionID": "placeholder",
+  "next": "placeholder",
+  "pending": [],
+  "recentEmojis": ["placeholder", "placeholder", "placeholder", "placeholder", "placeholder"]
+}

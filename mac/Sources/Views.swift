@@ -545,6 +545,49 @@ struct Conversation: View {
   @State private var anchor: String?
 
   var body: some View {
+    // Until the first page arrives, say so, or why it didn't, instead of an empty chat.
+    if store.conversations[name] == nil && (store.pending[name] ?? []).isEmpty {
+      VStack(spacing: 8) {
+        if let error = store.messageErrors[name] {
+          Text("Messages didn't load.").font(.callout)
+          Text(error).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+          retry
+        } else {
+          ProgressView().controlSize(.small)
+          Text("Loading messages…").font(.caption).foregroundStyle(.secondary)
+        }
+      }
+      .padding()
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+      .accessibilityElement(children: .contain)
+      .accessibilityIdentifier("messages-loading")
+    } else {
+      list
+        .overlay(alignment: .top) {
+          if let error = store.messageErrors[name] {
+            HStack(spacing: 6) {
+              Text(error).font(.caption).lineLimit(2)
+              retry
+            }
+            .padding(6)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            .padding(.top, 4)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("messages-refresh-error")
+          }
+        }
+    }
+  }
+
+  @ViewBuilder private var retry: some View {
+    if store.retrying.contains(name) {
+      ProgressView().controlSize(.small)
+    } else {
+      Button("Retry") { store.retryMessages(name) }.accessibilityIdentifier("messages-retry")
+    }
+  }
+
+  @ViewBuilder private var list: some View {
     // Messages deleted in the notch stay in the store, so pending sends still match their IDs.
     let window = store.conversations[name] ?? MessageWindow()
     let messages = window.items.filter { $0.hidden != true }
