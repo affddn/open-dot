@@ -9,11 +9,10 @@ import {
   responsibilities,
   responsibilityStatuses,
 } from "./schema";
+import { maxEveryMinutes, nextRunAfter } from "./schedule";
 
 /** The longest note, goal or next action the owner can save, in UTF-16 code units. */
 export const memoryTextLimit = 2000;
-/** The longest repeat interval the owner can set: a year, in minutes. */
-export const maxEveryMinutes = 365 * 24 * 60;
 /** How far ahead the owner can move a reminder. */
 const horizon = 10 * 365 * 24 * 60 * 60_000;
 /** Finished responsibilities shown, most recently changed first, so one can be reopened. */
@@ -40,6 +39,8 @@ export const responsibilityView = (row: Responsibility) => ({
   goal: row.goal,
   nextAction: row.nextAction,
   status: row.status,
+  schedule: row.schedule,
+  nextRunAt: row.nextRunAt,
 });
 
 export const reminderView = (row: Reminder) => ({
@@ -256,17 +257,28 @@ export const editResponsibility = (
   version: number,
   change: Partial<Pick<Responsibility, "goal" | "nextAction" | "status">>,
 ) =>
-  db.transaction((tx): Outcome<ReturnType<typeof responsibilityView>> => {
-    const saved = tx
-      .update(responsibilities)
-      .set({ ...change, ...owner(version) })
-      .where(and(responsibilityKey(dot, id), eq(responsibilities.version, version)))
-      .returning()
-      .get();
-    if (saved) return { saved: responsibilityView(saved) };
-    const current = tx.select().from(responsibilities).where(responsibilityKey(dot, id)).get();
-    return current ? { conflict: responsibilityView(current) } : missing;
-  });
+  db.transaction(
+    (tx): Outcome<ReturnType<typeof responsibilityView>> => {
+      const current = tx.select().from(responsibilities).where(responsibilityKey(dot, id)).get();
+      if (!current) return missing;
+      if (current.version !== version) return { conflict: responsibilityView(current) };
+      // A status change pauses or resumes the schedule in the same statement.
+      const nextRunAt =
+        change.status === undefined
+          ? {}
+          : { nextRunAt: nextRunAfter(current, { ...current, ...change }, Date.now()) };
+      const saved = tx
+        .update(responsibilities)
+        .set({ ...change, ...nextRunAt, ...owner(version) })
+        .where(and(responsibilityKey(dot, id), eq(responsibilities.version, version)))
+        .returning()
+        .get();
+      return saved
+        ? { saved: responsibilityView(saved) }
+        : { conflict: responsibilityView(current) };
+    },
+    { behavior: "immediate" },
+  );
 
 const reminderKey = (dot: string, id: number) => and(eq(reminders.id, id), eq(reminders.dot, dot));
 

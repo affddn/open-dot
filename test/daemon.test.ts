@@ -1,4 +1,4 @@
-import { beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +7,17 @@ import { Effect } from "effect";
 import { claimDue, step } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
 import { worktreeDirectory } from "../src/home";
-import { dots, outbox, reminders, workers, slack, slackEvents, type Route } from "../src/schema";
+import { editResponsibility } from "../src/memory";
+import {
+  dots,
+  outbox,
+  reminders,
+  responsibilities,
+  workers,
+  slack,
+  slackEvents,
+  type Route,
+} from "../src/schema";
 import { fakeOpenCode } from "./fake-opencode";
 
 let db: Db;
@@ -310,4 +320,244 @@ test("a worker in a git repo gets its own worktree, and one that can't get a who
 
   delete process.env.OPEN_DOT_HOME;
   rmSync(temp, { recursive: true, force: true });
+});
+
+const minute = 60_000;
+const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+afterEach(() => {
+  process.env.TZ = timeZone;
+});
+
+const track = (values: Partial<typeof responsibilities.$inferInsert> = {}) =>
+  db
+    .insert(responsibilities)
+    .values({
+      dot: "jojo",
+      goal: "Keep the inbox at zero",
+      nextAction: "Triage new mail",
+      status: "active",
+      schedule: { kind: "interval", everyMinutes: 10 },
+      nextRunAt: minute,
+      createdAt: 0,
+      updatedAt: 0,
+      ...values,
+    })
+    .returning()
+    .get();
+const job = (id: number) =>
+  db.select().from(responsibilities).where(eq(responsibilities.id, id)).get();
+
+test("a scheduled responsibility wakes its dot with its goal and next action, once after downtime", async () => {
+  const item = track();
+  await tick(35 * minute);
+  await tick(36 * minute);
+  expect(fake.state.texts).toEqual([
+    {
+      sessionID: "ses_jojo",
+      text: expect.stringMatching(
+        /^Scheduled run of responsibility #1 \(every 10 minutes\)[^]*Goal: Keep the inbox at zero\nNext action: Triage new mail/,
+      ),
+    },
+  ]);
+  expect(job(item.id)).toMatchObject({
+    nextRunAt: 41 * minute,
+    version: 2,
+    updatedBy: "scheduler",
+  });
+  // The wake carries the next action as it is at that run.
+  db.update(responsibilities).set({ nextAction: "Archive newsletters" }).run();
+  await tick(41 * minute);
+  expect(fake.state.texts.map((sent) => sent.text)[1]).toContain(
+    "Next action: Archive newsletters",
+  );
+  expect(messages()).toHaveLength(2);
+});
+
+test("a restart between due and delivered, or a lost admission, sends each run once", async () => {
+  const path = join(mkdtempSync(join(tmpdir(), "open-dot-schedule-")), "schedule.db");
+  db.$client.close();
+  db = openDatabase(path);
+  db.insert(dots)
+    .values({
+      name: "jojo",
+      directory: "/dots/jojo",
+      sessionID: "ses_jojo",
+      sessionState: "ready",
+      createdAt: 0,
+    })
+    .run();
+  track();
+  // The claim commits its next run and outbox row together, then the daemon stops.
+  claimDue(db, 35 * minute);
+  db.$client.close();
+  db = openDatabase(path);
+  claimDue(db, 35 * minute);
+  expect(messages()).toHaveLength(1);
+  const [saved] = messages();
+  fake.state.prompt = "lost";
+  await tick(35 * minute);
+  db.$client.close();
+  db = openDatabase(path);
+  fake.state.prompt = "ok";
+  await tick(36 * minute);
+  expect(fake.state.prompted).toEqual([saved?.messageID ?? "missing"]);
+  expect(messages()).toMatchObject([{ state: "sent" }]);
+  db.$client.close();
+});
+
+test("done or dropped pauses a schedule, and active resumes it after now without catching up", async () => {
+  const now = Date.now();
+  const item = track({ nextRunAt: now - minute });
+  const done = editResponsibility(db, "jojo", item.id, 1, { status: "done" });
+  expect(done).toMatchObject({ saved: { status: "done", nextRunAt: null, version: 2 } });
+  await tick(now + 60 * minute);
+  expect(messages()).toEqual([]);
+  expect(job(item.id)?.nextRunAt).toBeNull();
+  const resumed = editResponsibility(db, "jojo", item.id, 2, { status: "active" });
+  expect(resumed).toMatchObject({ saved: { status: "active", version: 3, updatedBy: "owner" } });
+  // The owner's change advanced the version once: the pause trigger did nothing more.
+  expect(job(item.id)).toMatchObject({ version: 3, updatedBy: "owner" });
+  const next = job(item.id)?.nextRunAt ?? 0;
+  expect(next).toBeGreaterThan(now);
+  expect(next).toBeLessThanOrEqual(Date.now() + 10 * minute);
+  await tick(next - 1);
+  expect(messages()).toEqual([]);
+
+  // A plugin from before the schedule drops it and reopens it with plain SQL.
+  db.$client.run("update responsibilities set status = 'dropped' where id = ?", [item.id]);
+  expect(job(item.id)?.nextRunAt).toBeNull();
+  await tick(next + 60 * minute);
+  db.$client.run("update responsibilities set status = 'active' where id = ?", [item.id]);
+  expect(job(item.id)?.nextRunAt).toBeNull();
+  // The daemon arms it from now, and sends nothing for the paused time.
+  await tick(next + 61 * minute);
+  expect(job(item.id)).toMatchObject({ nextRunAt: next + 71 * minute, updatedBy: "scheduler" });
+  expect(messages()).toEqual([]);
+  await tick(next + 71 * minute);
+  expect(messages()).toHaveLength(1);
+});
+
+test("only ready dots are woken, and a responsibility without a schedule never is", async () => {
+  db.update(dots).set({ sessionState: "creating" }).run();
+  const item = track();
+  track({ schedule: null, nextRunAt: null });
+  await tick(35 * minute);
+  expect(messages()).toEqual([]);
+  expect(job(item.id)?.nextRunAt).toBe(minute);
+  db.update(dots).set({ sessionState: "ready" }).run();
+  await tick(36 * minute);
+  expect(messages()).toHaveLength(1);
+  expect(job(item.id)?.nextRunAt).toBe(41 * minute);
+});
+
+test("a daily run keeps its local time across DST and follows a changed system time zone", async () => {
+  process.env.TZ = "America/New_York";
+  const item = track({
+    schedule: { kind: "daily", time: "09:00" },
+    nextRunAt: Date.UTC(2026, 2, 7, 14, 0),
+  });
+  await tick(Date.UTC(2026, 2, 7, 14, 0, 30));
+  // Daylight time starts overnight, so 09:00 is an hour earlier in UTC.
+  expect(job(item.id)?.nextRunAt).toBe(Date.UTC(2026, 2, 8, 13, 0));
+  await tick(Date.UTC(2026, 2, 8, 12, 59));
+  expect(messages()).toHaveLength(1);
+  process.env.TZ = "Europe/London";
+  await tick(Date.UTC(2026, 2, 8, 13, 0));
+  expect(messages()).toHaveLength(2);
+  // The next run is computed in the zone the system has now.
+  expect(job(item.id)?.nextRunAt).toBe(Date.UTC(2026, 2, 9, 9, 0));
+});
+
+test("a schedule claim rolls back its next run if persisting the wake fails", () => {
+  const item = track();
+  db.$client.exec(`CREATE TRIGGER reject_schedule_wake BEFORE INSERT ON outbox
+    BEGIN SELECT RAISE(ABORT, 'test wake persistence failure'); END`);
+  expect(() => claimDue(db, 35 * minute)).toThrow("test wake persistence failure");
+  expect(job(item.id)).toMatchObject({ nextRunAt: minute, version: 1, updatedBy: "dot" });
+  expect(messages()).toEqual([]);
+  db.$client.exec("DROP TRIGGER reject_schedule_wake");
+  claimDue(db, 35 * minute);
+  expect(job(item.id)).toMatchObject({ nextRunAt: 41 * minute, version: 2 });
+  expect(messages()).toMatchObject([{ route: null, state: "pending" }]);
+  const savedID = messages()[0]?.messageID ?? "missing";
+  expect(savedID).toMatch(/^msg_/);
+  claimDue(db, 35 * minute);
+  expect(messages().map((row) => row.messageID)).toEqual([savedID]);
+});
+
+test("a schedule retries an absent admission with its saved ID, but not during a failed lookup", async () => {
+  track();
+  fake.state.prompt = "fail";
+  await tick(35 * minute);
+  const savedID = messages()[0]?.messageID ?? "missing";
+  expect(savedID).toMatch(/^msg_/);
+  expect(messages()).toMatchObject([{ state: "pending", route: null }]);
+  expect(fake.state.prompted).toEqual([]);
+  fake.state.prompt = "ok";
+  fake.state.lookupFailure = true;
+  await tick(36 * minute);
+  expect(fake.state.prompted).toEqual([]);
+  expect(messages()).toMatchObject([{ messageID: savedID, state: "pending" }]);
+  fake.state.lookupFailure = false;
+  await tick(37 * minute);
+  await tick(38 * minute);
+  expect(fake.state.prompted).toEqual([savedID]);
+  expect(messages()).toMatchObject([{ messageID: savedID, state: "sent", route: null }]);
+});
+
+test("an owner edit between the due read and claim prevents a stale schedule wake", () => {
+  const changed = track();
+  const paused = track();
+  const transaction = db.transaction.bind(db);
+  let interleaved = false;
+  const spy = spyOn(db, "transaction").mockImplementationOnce(((run: never) => {
+    spy.mockRestore();
+    expect(
+      editResponsibility(db, "jojo", changed.id, 1, { nextAction: "Read the latest mail" }),
+    ).toHaveProperty("saved");
+    expect(editResponsibility(db, "jojo", paused.id, 1, { status: "done" })).toHaveProperty(
+      "saved",
+    );
+    interleaved = true;
+    return transaction(run);
+  }) as never);
+  try {
+    claimDue(db, 35 * minute);
+  } finally {
+    spy.mockRestore();
+  }
+  expect(interleaved).toBe(true);
+  expect(messages()).toEqual([]);
+  expect(job(changed.id)).toMatchObject({ nextRunAt: minute, version: 2, updatedBy: "owner" });
+  expect(job(paused.id)).toMatchObject({ nextRunAt: null, status: "done", version: 2 });
+  claimDue(db, 35 * minute);
+  expect(messages()).toHaveLength(1);
+  expect(messages()[0]?.text).toContain("Next action: Read the latest mail");
+  expect(job(changed.id)).toMatchObject({ nextRunAt: 41 * minute, version: 3 });
+});
+
+test("daily and weekly schedules catch up once after downtime, then wait until exactly due", async () => {
+  process.env.TZ = "UTC";
+  const oldDue = Date.UTC(2026, 9, 19, 9);
+  const daily = track({ schedule: { kind: "daily", time: "09:00" }, nextRunAt: oldDue });
+  const weekly = track({
+    schedule: { kind: "weekly", days: [1], time: "09:00" },
+    nextRunAt: oldDue,
+  });
+  const returned = Date.UTC(2026, 9, 23, 12);
+  await tick(returned);
+  await tick(returned + minute);
+  expect(messages()).toHaveLength(2);
+  expect(fake.state.prompted).toHaveLength(2);
+  expect(new Set(fake.state.prompted).size).toBe(2);
+  const dailyDue = Date.UTC(2026, 9, 24, 9);
+  expect(job(daily.id)?.nextRunAt).toBe(dailyDue);
+  expect(job(weekly.id)?.nextRunAt).toBe(Date.UTC(2026, 9, 26, 9));
+  await tick(dailyDue - 1);
+  expect(messages()).toHaveLength(2);
+  await tick(dailyDue);
+  expect(messages()).toHaveLength(3);
+  expect(fake.state.prompted).toHaveLength(3);
+  expect(new Set(fake.state.prompted).size).toBe(3);
+  expect(job(daily.id)?.nextRunAt).toBe(Date.UTC(2026, 9, 25, 9));
 });

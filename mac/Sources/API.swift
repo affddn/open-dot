@@ -112,6 +112,33 @@ struct MemoryResponsibility: Decodable, Equatable, Identifiable {
   let goal: String
   let nextAction: String
   let status: String
+  /// When the daemon wakes the dot about it, and its next run while active. Older daemons send neither.
+  var schedule: ResponsibilitySchedule? = nil
+  var nextRunAt: Double? = nil
+}
+
+/// Every `everyMinutes`, or daily or weekly (days 0 = Sunday to 6) at `time`, HH:mm in the Mac's time zone.
+struct ResponsibilitySchedule: Decodable, Equatable {
+  let kind: String
+  var everyMinutes: Int? = nil
+  var days: [Int]? = nil
+  var time: String? = nil
+
+  var summary: String {
+    let at = time ?? ""
+    switch kind {
+    case "interval": return "Every \(everyMinutes ?? 0) min"
+    case "daily": return "Daily at \(at)"
+    default:
+      let names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+      let list = days ?? []
+      let named = list == [0, 1, 2, 3, 4, 5, 6] ? "Every day"
+        : list == [1, 2, 3, 4, 5] ? "Weekdays"
+        : list == [0, 6] ? "Weekends"
+        : list.compactMap { names.indices.contains($0) ? names[$0] : nil }.joined(separator: ", ")
+      return "\(named) at \(at)"
+    }
+  }
 }
 
 struct MemoryReminder: Decodable, Equatable, Identifiable {

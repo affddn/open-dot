@@ -1,5 +1,6 @@
 import { integer, primaryKey, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
 import type { Attachment } from "./opencode";
+import type { Schedule } from "./schedule";
 
 export const dots = sqliteTable("dots", {
   name: text().primaryKey(),
@@ -243,6 +244,12 @@ export const responsibilities = sqliteTable("responsibilities", {
   createdAt: integer("created_at").notNull(),
   updatedAt: integer("updated_at").notNull(),
   ...versioned(),
+  // When the daemon wakes the dot about it. Null means no schedule.
+  schedule: text({ mode: "json" }).$type<Schedule>(),
+  // The next due time of an active scheduled responsibility, null while it's done or dropped or
+  // until the daemon arms it. A trigger (migration 0021) clears it whenever any writer, including
+  // a plugin from before the migration, sets the status to done or dropped.
+  nextRunAt: integer("next_run_at"),
 });
 
 export type Responsibility = typeof responsibilities.$inferSelect;

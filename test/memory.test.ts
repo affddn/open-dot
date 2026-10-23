@@ -334,3 +334,61 @@ test("all memory writes require authentication and reminder API edits preserve t
   expect(active).toMatchObject({ status: 200, body: { responsibility: { status: "active" } } });
   nothingQueued();
 });
+
+test("memory shows each schedule and next run, and the owner's status edits pause and resume it", async () => {
+  const schedule = { kind: "weekly", days: [1, 2, 3, 4, 5], time: "09:00" } as const;
+  const due = Date.now() - 60_000;
+  const job = db
+    .insert(responsibilities)
+    .values({
+      dot: "jojo",
+      goal: "Inbox zero",
+      nextAction: "Triage",
+      status: "active",
+      schedule,
+      nextRunAt: due,
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    .returning()
+    .get();
+  responsibility("jojo");
+  expect((await json(await call("/dots/jojo/memory"))).body.responsibilities).toMatchObject([
+    { goal: "Inbox zero", schedule, nextRunAt: due },
+    { goal: "Ship", schedule: null, nextRunAt: null },
+  ]);
+  const path = `/dots/jojo/memory/responsibilities/${job.id}`;
+  // The owner's API doesn't edit schedules.
+  expect((await call(path, { method: "PATCH", body: { version: 1, schedule: null } })).status).toBe(
+    400,
+  );
+  // The daemon's run since the owner loaded it makes the owner's edit a conflict.
+  claimDue(db, Date.now());
+  const conflict = await json(
+    await call(path, { method: "PATCH", body: { version: 1, status: "done" } }),
+  );
+  expect(conflict).toMatchObject({
+    status: 409,
+    body: { current: { status: "active", version: 2, updatedBy: "scheduler" } },
+  });
+  expect(db.select().from(outbox).all()).toHaveLength(1);
+  const paused = await json(
+    await call(path, { method: "PATCH", body: { version: 2, status: "dropped" } }),
+  );
+  expect(paused).toMatchObject({
+    status: 200,
+    body: { responsibility: { status: "dropped", nextRunAt: null, schedule, version: 3 } },
+  });
+  const before = Date.now();
+  const resumed = await json(
+    await call(path, { method: "PATCH", body: { version: 3, status: "active" } }),
+  );
+  const view = resumed.body.responsibility as { nextRunAt: number; version: number };
+  expect(view.nextRunAt).toBeGreaterThan(before);
+  // What the owner got back is what's saved, so the next edit isn't a false conflict.
+  expect(
+    db.select().from(responsibilities).where(eq(responsibilities.id, job.id)).get(),
+  ).toMatchObject({ version: view.version, nextRunAt: view.nextRunAt, updatedBy: "owner" });
+  claimDue(db, Date.now());
+  expect(db.select().from(outbox).all()).toHaveLength(1);
+});

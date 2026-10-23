@@ -825,9 +825,12 @@ test("0020 adds memory versions that legacy writers still advance, and keeps eve
       "version",
       "updated_by",
     ]);
+    // 0021 then adds the schedule.
     expect(added("responsibilities").map((column) => column.name)).toEqual([
       "version",
       "updated_by",
+      "schedule",
+      "next_run_at",
     ]);
     for (const name of tables.filter(
       (table) => !["notes", "reminders", "responsibilities"].includes(table),
@@ -843,6 +846,7 @@ test("0020 adds memory versions that legacy writers still advance, and keeps eve
     expect(triggers.map((trigger) => trigger.name)).toEqual([
       "notes_version",
       "reminders_version",
+      "responsibilities_pause",
       "responsibilities_version",
     ]);
     expectLedger(db.$client, ledger, "0020");
@@ -902,6 +906,111 @@ test("0020 adds memory versions that legacy writers still advance, and keeps eve
     db = openDatabase(path);
     expect(db.select().from(notes).get()).toMatchObject({ text: "Dot after owner", version: 4 });
     expectLedger(db.$client, ledger, "0020");
+  } finally {
+    old.close();
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+const triggerSQL = (sqlite: Database) =>
+  sqlite
+    .query<{ name: string; sql: string }, []>(
+      "select name, sql from sqlite_master where type='trigger' order by name",
+    )
+    .all();
+
+test("0021 adds a nullable schedule that legacy status writers pause, and keeps every 0020 row and trigger", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-schedule-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0021");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run(
+    "insert into responsibilities (dot,goal,next_action,status,created_at,updated_at) values ('jojo','Keep','Next','active',4,5)",
+  );
+  old.run(
+    "insert into responsibilities (dot,goal,next_action,status,created_at,updated_at,version,updated_by) values ('jojo','Old','Done','done',4,5,3,'owner')",
+  );
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [
+      name,
+      old.query<{ name: string }, []>(`pragma table_info("${name}")`).all(),
+    ]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [
+      name,
+      sqlite
+        .query(
+          `select ${columns
+            .get(name)
+            ?.map((column) => `"${column.name}"`)
+            .join(",")} from "${name}"`,
+        )
+        .all(),
+    ]);
+  const before = rows(old);
+  const ledger = ledgerOf(old);
+  const oldTriggers = triggerSQL(old);
+  let db = openDatabase(path);
+  try {
+    expect(rows(db.$client)).toEqual(before);
+    expect(tableNames(db.$client)).toEqual(tables);
+    expect(
+      db.$client
+        .query<{ name: string }, []>(`pragma table_info("responsibilities")`)
+        .all()
+        .slice(columns.get("responsibilities")?.length),
+    ).toMatchObject([
+      { name: "schedule", notnull: 0, dflt_value: null },
+      { name: "next_run_at", notnull: 0, dflt_value: null },
+    ]);
+    for (const name of tables.filter((table) => table !== "responsibilities"))
+      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(
+        columns.get(name) ?? [],
+      );
+    // 0020's version triggers stay exactly as they were, beside the new pause trigger.
+    expect(
+      triggerSQL(db.$client).filter((trigger) => trigger.name !== "responsibilities_pause"),
+    ).toEqual(oldTriggers);
+    expectLedger(db.$client, ledger, "0021");
+    expect(db.select().from(responsibilities).all()).toMatchObject([
+      { goal: "Keep", schedule: null, nextRunAt: null, version: 1 },
+      { goal: "Old", schedule: null, nextRunAt: null, version: 3, updatedBy: "owner" },
+    ]);
+
+    // A plugin from before 0021 marks a scheduled responsibility done, then active again.
+    db.$client.run(
+      `update responsibilities set schedule = '{"kind":"interval","everyMinutes":5}', next_run_at = 1000 where id = 1`,
+    );
+    const armed = db.select().from(responsibilities).get();
+    old.run("update responsibilities set status = 'done', updated_at = 7 where id = 1");
+    const paused = db.select().from(responsibilities).get();
+    expect(paused).toMatchObject({ status: "done", nextRunAt: null, updatedBy: "dot" });
+    expect(paused?.version).toBeGreaterThan(armed?.version ?? Infinity);
+    old.run("update responsibilities set status = 'active', updated_at = 8 where id = 1");
+    expect(db.select().from(responsibilities).get()).toMatchObject({
+      status: "active",
+      nextRunAt: null,
+      schedule: { kind: "interval", everyMinutes: 5 },
+    });
+    // An unrelated legacy edit of a done row leaves the schedule alone.
+    old.run("update responsibilities set next_action = 'Later' where id = 2");
+    expect(db.select().from(responsibilities).all()[1]).toMatchObject({ nextAction: "Later" });
+
+    db.$client.close();
+    db = openDatabase(path);
+    expectLedger(db.$client, ledger, "0021");
   } finally {
     old.close();
     db.$client.close();

@@ -364,6 +364,9 @@ struct MemoryRow: View {
         }
       }
       Text(verbatim: "Next: \(responsibility.nextAction)").font(.caption).foregroundStyle(.secondary)
+      if let schedule = responsibility.schedule {
+        Text(verbatim: scheduleLine(schedule, responsibility)).font(.caption).foregroundStyle(.secondary)
+      }
     case .reminder(let reminder):
       Text(verbatim: reminder.text).font(.callout)
       Text(verbatim: when(reminder)).font(.caption).foregroundStyle(.secondary)
@@ -389,6 +392,13 @@ struct MemoryRow: View {
     case .reminder: "Cancel…"
     case .responsibility: nil
     }
+  }
+
+  private func scheduleLine(_ schedule: ResponsibilitySchedule, _ item: MemoryResponsibility) -> String {
+    guard item.status == "active" else { return "\(schedule.summary), paused" }
+    guard let next = item.nextRunAt else { return schedule.summary }
+    let date = Date(timeIntervalSince1970: next / 1000).formatted(date: .abbreviated, time: .shortened)
+    return "\(schedule.summary), next \(date)"
   }
 
   private func when(_ reminder: MemoryReminder) -> String {

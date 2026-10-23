@@ -290,6 +290,63 @@ test("an active responsibility stays in memory until it is done", async () => {
   await loaded.cleanup?.();
 });
 
+test("a responsibility's schedule is set, kept, paused, resumed and removed through the dot's tools", async () => {
+  const db = openDatabase(databasePath());
+  const loaded = await load(dot.directory);
+  const job = () => db.select().from(responsibilities).get();
+  for (const schedule of [
+    { kind: "weekly", days: [], time: "09:00" },
+    { kind: "daily", time: "9am" },
+    { kind: "interval", everyMinutes: 0 },
+  ])
+    expect(
+      await fails(loaded.call("dot_track", { goal: "Inbox", next_action: "Triage", schedule })),
+    ).toBe(true);
+  expect(job()).toBeUndefined();
+
+  const before = Date.now();
+  await loaded.call("dot_track", {
+    goal: "Inbox zero",
+    next_action: "Triage new mail",
+    schedule: { kind: "weekly", days: [5, 4, 3, 2, 1], time: "09:00" },
+  });
+  const armed = job();
+  expect(armed?.schedule).toEqual({ kind: "weekly", days: [1, 2, 3, 4, 5], time: "09:00" });
+  expect(armed?.nextRunAt).toBeGreaterThan(before);
+  const memory = await loaded.injected(dot.sessionID);
+  expect(memory).toContain(
+    "Inbox zero. Next: Triage new mail. Schedule: weekdays at 09:00; next run",
+  );
+  expect(memory).toContain(
+    `a schedule wakes you in ${Intl.DateTimeFormat().resolvedOptions().timeZone} time`,
+  );
+
+  // Omitting the schedule keeps it and its next run.
+  await loaded.call("dot_update", { id: 1, next_action: "Archive newsletters" });
+  expect(job()).toMatchObject({ schedule: armed?.schedule, nextRunAt: armed?.nextRunAt });
+  expect(
+    await fails(loaded.call("dot_update", { id: 1, schedule: { kind: "daily", time: "25:00" } })),
+  ).toBe(true);
+  expect(job()?.schedule).toEqual(armed?.schedule ?? null);
+
+  await loaded.call("dot_update", { id: 1, status: "done" });
+  expect(job()).toMatchObject({ status: "done", nextRunAt: null, schedule: armed?.schedule });
+  await loaded.call("dot_update", { id: 1, status: "active" });
+  expect(job()?.nextRunAt).toBeGreaterThan(Date.now());
+
+  await loaded.call("dot_update", { id: 1, schedule: { kind: "interval", everyMinutes: 30 } });
+  const interval = job()?.nextRunAt ?? 0;
+  expect(interval - Date.now()).toBeGreaterThan(29 * 60_000);
+  expect(interval - Date.now()).toBeLessThanOrEqual(30 * 60_000);
+
+  await loaded.call("dot_update", { id: 1, schedule: null });
+  expect(job()).toMatchObject({ status: "active", schedule: null, nextRunAt: null });
+  expect(await loaded.injected(dot.sessionID)).toContain("Inbox zero. Next: Archive newsletters\n");
+  expect(db.select().from(outbox).all()).toEqual([]);
+  await loaded.cleanup?.();
+  db.$client.close();
+});
+
 test("the owner's memory edits reach the dot's next snapshot without a turn, and its later edits win", async () => {
   const db = openDatabase(databasePath());
   const loaded = await load(dot.directory);

@@ -6,7 +6,16 @@ import { Effect } from "effect";
 import type { Db } from "./db";
 import { worktreeDirectory } from "./home";
 import { OpenCode, type Turn } from "./opencode";
-import { dots, outbox, reminders, routeKey, type Worker, workers } from "./schema";
+import { describeSchedule, nextRun, parseSchedule } from "./schedule";
+import {
+  dots,
+  outbox,
+  reminders,
+  responsibilities,
+  routeKey,
+  type Worker,
+  workers,
+} from "./schema";
 import { queueReport } from "./slack-agents";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -94,6 +103,67 @@ export function claimDue(db: Db, now: number) {
       );
       if (reminder.route)
         queueReport(tx, reminder.dot, message.text, message.messageID, reminder.route);
+    });
+  }
+  claimSchedules(db, now);
+}
+
+/**
+ * Wakes each ready dot about its active scheduled responsibilities that are due, and arms any
+ * without a next run, such as one a plugin from before migration 0021 set active again. Each claim
+ * needs the version it read, and moves the next run past `now` in the same transaction that
+ * queues the wake, so runs missed during downtime wake the dot once and a restart sends nothing
+ * twice. Arming queues nothing.
+ */
+export function claimSchedules(db: Db, now: number) {
+  const due = db
+    .select({ item: responsibilities, sessionID: dots.sessionID })
+    .from(responsibilities)
+    .innerJoin(dots, eq(responsibilities.dot, dots.name))
+    .where(
+      and(
+        eq(responsibilities.status, "active"),
+        isNotNull(responsibilities.schedule),
+        eq(dots.sessionState, "ready"),
+        or(isNull(responsibilities.nextRunAt), lte(responsibilities.nextRunAt, now)),
+      ),
+    )
+    .orderBy(asc(responsibilities.id))
+    .all();
+  for (const { item, sessionID } of due) {
+    const schedule = parseSchedule(item.schedule);
+    if ("invalid" in schedule) {
+      console.error(`Responsibility #${item.id} has an unusable schedule: ${schedule.invalid}`);
+      continue;
+    }
+    db.transaction((tx) => {
+      const claimed = tx
+        .update(responsibilities)
+        .set({
+          nextRunAt: nextRun(schedule, now, item.nextRunAt ?? undefined),
+          version: item.version + 1,
+          updatedAt: now,
+          updatedBy: "scheduler",
+        })
+        .where(
+          and(
+            eq(responsibilities.id, item.id),
+            eq(responsibilities.status, "active"),
+            eq(responsibilities.version, item.version),
+          ),
+        )
+        .returning({ id: responsibilities.id })
+        .get();
+      if (!claimed || item.nextRunAt === null) return;
+      enqueue(
+        tx,
+        sessionID,
+        `Scheduled run of responsibility #${item.id} (${describeSchedule(schedule)}), due ${new Date(item.nextRunAt).toString()}.
+Goal: ${item.goal}
+Next action: ${item.nextAction}
+
+Act on it now if you can, then keep its next action current with dot_update.`,
+      );
     });
   }
 }

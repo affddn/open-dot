@@ -9,6 +9,13 @@ import { unreadFeed } from "./feed";
 import { databasePath, workDirectory, worktreeDirectory } from "./home";
 import { isReactionEmoji, messageKind, messageSources, saveReaction } from "./reactions";
 import {
+  describeSchedule,
+  nextRunAfter,
+  parseSchedule,
+  type Schedule,
+  systemTimeZone,
+} from "./schedule";
+import {
   dots,
   type FeedItem,
   notes,
@@ -24,6 +31,40 @@ const text = (description: string) => Schema.String.annotate({ description });
 const id = (description: string) => Schema.Int.annotate({ description });
 const withOffset = /(?:Z|[+-]\d{2}:?\d{2})$/i;
 const list = (lines: string[]) => (lines.length > 0 ? lines.join("\n") : "(none)");
+
+const clockTime = (description: string) =>
+  text(`${description}, as 24-hour HH:mm in your owner's local time zone, e.g. 09:00`);
+const scheduleInput = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("interval"),
+    everyMinutes: id("Wake every this many minutes, from 1 to 525600"),
+  }),
+  Schema.Struct({ kind: Schema.Literal("daily"), time: clockTime("The time each day") }),
+  Schema.Struct({
+    kind: Schema.Literal("weekly"),
+    days: Schema.Array(Schema.Int).annotate({
+      description: "Days of the week, 0 (Sunday) to 6, e.g. [1,2,3,4,5] for weekdays",
+    }),
+    time: clockTime("The time on each of those days"),
+  }),
+]).annotate({
+  description:
+    "When to wake you about it with its goal and next action, while it's active. A missed run during downtime wakes you once.",
+});
+
+/** A schedule the model sent, checked again because tool input is only shaped by its schema. */
+function checkedSchedule(value: unknown): Schedule {
+  const schedule = parseSchedule(value);
+  if ("invalid" in schedule) throw new Error(schedule.invalid);
+  return schedule;
+}
+
+const scheduleNote = (item: { schedule: Schedule | null; nextRunAt: number | null }) =>
+  item.schedule
+    ? `Schedule: ${describeSchedule(item.schedule)}; next run ${item.nextRunAt === null ? "being set" : new Date(item.nextRunAt).toString()}`
+    : "";
+const withSchedule = (item: { schedule: Schedule | null; nextRunAt: number | null }) =>
+  item.schedule ? ` ${scheduleNote(item)}.` : "";
 
 // Caps how many messages one dot sends per rolling hour, so two dots can't keep each other busy.
 const messagesPerHour = 10;
@@ -116,8 +157,8 @@ Current time: ${new Date().toString()}
 ## Notes (dot_note saves, dot_forget removes)
 ${list(saved.map((note) => `- #${note.id}: ${note.text}`))}
 
-## Responsibilities (dot_track adds, dot_update changes)
-${list(active.map((item) => `- #${item.id}: ${item.goal}. Next: ${item.nextAction}`))}
+## Responsibilities (dot_track adds, dot_update changes; a schedule wakes you in ${systemTimeZone()} time)
+${list(active.map((item) => `- #${item.id}: ${item.goal}. Next: ${item.nextAction}${item.schedule ? `. ${scheduleNote(item)}` : ""}`))}
 
 ## Unfinished workers (dot_delegate starts one; its report arrives here as a message)
 ${list(unfinished.map((worker) => `- #${worker.id} ${worker.state}, session ${worker.sessionID} in ${worker.directory}${onBranch(worker)}: ${worker.task.split("\n")[0]}`))}
@@ -355,13 +396,15 @@ export default Plugin.define({
       editor.add({
         name: "dot_track",
         description:
-          "Take on an ongoing responsibility for your owner, with the next thing you will do about it. Responsibilities appear in your context every turn until done or dropped.",
+          'Take on an ongoing responsibility for your owner, with the next thing you will do about it. Responsibilities appear in your context every turn until done or dropped. With a schedule, such as {kind:"weekly", days:[1,2,3,4,5], time:"09:00"} for every weekday at 9, you are woken with its goal and next action at each run while it is active.',
         input: Schema.Struct({
           goal: text("The outcome you are responsible for"),
           next_action: text("The next concrete thing you will do about it"),
+          schedule: Schema.optionalKey(scheduleInput),
         }),
         options: { codemode: false },
         execute: async (input) => {
+          const schedule = input.schedule === undefined ? null : checkedSchedule(input.schedule);
           const now = Date.now();
           const row = db
             .insert(responsibilities)
@@ -370,18 +413,24 @@ export default Plugin.define({
               goal: input.goal,
               nextAction: input.next_action,
               status: "active",
+              schedule,
+              nextRunAt: nextRunAfter(
+                { status: "active", schedule: null, nextRunAt: null },
+                { status: "active", schedule },
+                now,
+              ),
               createdAt: now,
               updatedAt: now,
             })
             .returning()
             .get();
-          return { content: `Tracking responsibility #${row.id}.` };
+          return { content: `Tracking responsibility #${row.id}.${withSchedule(row)}` };
         },
       });
       editor.add({
         name: "dot_update",
         description:
-          "Change a responsibility's next action, or mark it done or dropped, by its number.",
+          "Change a responsibility's next action or schedule, or mark it done or dropped, by its number. Done or dropped pauses its schedule; active again resumes it from now, without catching up.",
         input: Schema.Struct({
           id: id("The responsibility number"),
           next_action: Schema.optionalKey(text("The new next action")),
@@ -390,21 +439,51 @@ export default Plugin.define({
               description: "The new status",
             }),
           ),
+          schedule: Schema.optionalKey(
+            Schema.NullOr(scheduleInput).annotate({
+              description: "The new schedule, or null to remove it. Omit to keep it",
+            }),
+          ),
         }),
         options: { codemode: false },
         execute: async (input) => {
-          const changed = db
-            .update(responsibilities)
-            .set({
-              ...(input.next_action === undefined ? {} : { nextAction: input.next_action }),
-              ...(input.status === undefined ? {} : { status: input.status }),
-              updatedAt: Date.now(),
-            })
-            .where(and(eq(responsibilities.id, input.id), eq(responsibilities.dot, name)))
-            .returning()
-            .get();
+          const schedule =
+            input.schedule === undefined || input.schedule === null
+              ? input.schedule
+              : checkedSchedule(input.schedule);
+          const now = Date.now();
+          // One write transaction, so the next run is computed from the row it replaces.
+          const changed = db.transaction(
+            (tx) => {
+              const current = tx
+                .select()
+                .from(responsibilities)
+                .where(and(eq(responsibilities.id, input.id), eq(responsibilities.dot, name)))
+                .get();
+              if (!current) return undefined;
+              const after = {
+                status: input.status ?? current.status,
+                schedule: schedule === undefined ? current.schedule : schedule,
+              };
+              return tx
+                .update(responsibilities)
+                .set({
+                  ...(input.next_action === undefined ? {} : { nextAction: input.next_action }),
+                  ...(input.status === undefined ? {} : { status: input.status }),
+                  ...(schedule === undefined ? {} : { schedule }),
+                  nextRunAt: nextRunAfter(current, after, now),
+                  updatedAt: now,
+                })
+                .where(eq(responsibilities.id, current.id))
+                .returning()
+                .get();
+            },
+            { behavior: "immediate" },
+          );
           if (!changed) throw new Error(`No responsibility #${input.id}.`);
-          return { content: `Responsibility #${changed.id} is ${changed.status}.` };
+          return {
+            content: `Responsibility #${changed.id} is ${changed.status}.${changed.status === "active" ? withSchedule(changed) : ""}`,
+          };
         },
       });
       editor.add({
