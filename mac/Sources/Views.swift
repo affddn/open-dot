@@ -88,7 +88,7 @@ struct ExpandedView: View {
           } else {
             Conversation(store: store, name: name)
               .id(name)
-            if !dot.workers.isEmpty { workers(name, dot.workers) }
+            if !dot.workers.isEmpty || !(dot.sessions ?? []).isEmpty { workers(name, dot) }
             composer(name)
           }
         } else {
@@ -169,11 +169,14 @@ struct ExpandedView: View {
     .accessibilityIdentifier("dot-mode")
   }
 
-  private func workers(_ name: String, _ workers: [Dot.Worker]) -> some View {
-    VStack(alignment: .leading, spacing: 3) {
+  private func workers(_ name: String, _ dot: Dot) -> some View {
+    let workers = dot.workers
+    let threads = dot.sessions ?? []
+    return VStack(alignment: .leading, spacing: 3) {
       ScrollView(.horizontal) {
         HStack(spacing: 6) {
           ForEach(workers, id: \.id) { worker in workerRow(name, worker) }
+          ForEach(threads, id: \.sessionID) { request in threadsRow(request) }
         }
       }
       .scrollIndicators(.hidden)
@@ -184,14 +187,46 @@ struct ExpandedView: View {
           .textSelection(.enabled)
           .accessibilityIdentifier("worker-notice-\(worker.id)")
       }
+      ForEach(threads.filter { store.requestNotices[$0.request] != nil }, id: \.sessionID) { request in
+        Text(verbatim: "\(request.title): \(store.requestNotices[request.request] ?? "")")
+          .font(.caption2)
+          .foregroundStyle(.orange)
+          .textSelection(.enabled)
+          .accessibilityIdentifier("request-notice-\(request.request)")
+      }
     }
     .accessibilityElement(children: .contain)
     .accessibilityIdentifier("workers")
   }
 
+  /// A Threads worker's or finished worker's requests. Its session opens here; a Threads worker
+  /// stops in Threads.
+  private func threadsRow(_ request: Dot.SessionRequest) -> some View {
+    HStack(spacing: 6) {
+      Text(verbatim: request.line)
+        .foregroundStyle(request.needsYou ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+        .lineLimit(1)
+        .frame(maxWidth: 220, alignment: .leading)
+      if store.requestBusy.contains(request.request) {
+        Text("…").foregroundStyle(.secondary)
+      } else {
+        Button("Open") { store.openRequest(request) }
+          .help(request.source == "threads" ? "Open its session in a new terminal window. Stop it in Threads." : "Open its session in a new terminal window.")
+          .accessibilityIdentifier("session-open-\(request.request)")
+      }
+    }
+    .buttonStyle(.plain)
+    .font(.caption2)
+    .padding(.horizontal, 8)
+    .padding(.vertical, 3)
+    .background(Capsule().fill(request.needsYou ? .orange.opacity(0.18) : .white.opacity(0.08)))
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("session-requests-\(request.sessionID)")
+  }
+
   private func workerRow(_ name: String, _ worker: Dot.Worker) -> some View {
     HStack(spacing: 6) {
-      Text(verbatim: "#\(worker.id) \(worker.status) · \(worker.task)")
+      Text(verbatim: worker.line)
         .foregroundStyle(worker.needsYou ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
         .lineLimit(1)
         .frame(maxWidth: 220, alignment: .leading)

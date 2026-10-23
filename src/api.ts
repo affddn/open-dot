@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { SessionMessage } from "@opencode/client/effect";
-import { and, eq, inArray, isNotNull, isNull, ne, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { Effect, type Layer } from "effect";
 import { stopWorker } from "./daemon";
 import type { Db } from "./db";
@@ -30,6 +30,7 @@ import {
   saveReaction,
 } from "./reactions";
 import { quoted, quoteText, replyPrompt } from "./replies";
+import { answerSummary, needsYou, requestView } from "./requests";
 import { approveBinding, endBinding, openSupervisions, supervisionView } from "./supervise";
 import {
   type Dot,
@@ -39,8 +40,9 @@ import {
   hiddenMessages,
   type QuoteSnapshot,
   outbox,
-  readWaiting,
+  requests,
   type Worker,
+  type WorkerRequest,
   workers,
 } from "./schema";
 
@@ -54,37 +56,160 @@ const read = 100;
 
 const framed = /<dot-message from="[^"]*">\n([\s\S]*)\n<\/dot-message>$/;
 
+const kinds = (rows: readonly WorkerRequest[]) => [...new Set(rows.map((row) => row.kind))];
+
 /**
- * A worker as the notch shows it. `needs` lists what it waits on its owner for now, a permission
- * or a question, as the daemon last saw it; a stopping or finished worker waits on nothing.
+ * What a worker's requests mean for the notch: `needs`, the kinds its owner should look at now
+ * (an unknown answer, even once the request is gone, or a waiting request escalated or past the
+ * grace period); `waiting`, the kinds its dot is handling; and `answered`, a few words about the
+ * dot's latest answer.
  */
-const workerView = (worker: Worker) => ({
-  id: worker.id,
-  state: worker.state,
-  outcome: worker.outcome,
-  task: worker.task.split("\n")[0],
-  needs: [
-    ...new Set(
-      worker.state === "running"
-        ? readWaiting(worker.waitingOn).current.map((key) => key.split(":")[0] ?? "")
-        : [],
+const requestsView = (rows: readonly WorkerRequest[], now: number) => {
+  const latest = rows
+    .filter((row) => row.answer !== null)
+    .toSorted((a, b) => (b.queuedAt ?? 0) - (a.queuedAt ?? 0))[0];
+  return {
+    needs: kinds(rows.filter((row) => needsYou(row, now))),
+    waiting: kinds(
+      rows.filter(
+        (row) =>
+          row.goneAt === null &&
+          !needsYou(row, now) &&
+          (row.state === "open" || row.state === "queued" || row.state === "answering"),
+      ),
     ),
-  ],
-});
+    answered: latest ? answerSummary(latest) : null,
+  };
+};
+
+/**
+ * A worker as the notch shows it. A stopping or finished worker waits on nothing, but an answer
+ * whose outcome is unknown still needs its owner.
+ */
+const workerView = (worker: Worker, rows: readonly WorkerRequest[] = [], now = Date.now()) => {
+  const own = rows.filter((row) => row.source === "worker" && row.worker === worker.id);
+  return {
+    id: worker.id,
+    state: worker.state,
+    outcome: worker.outcome,
+    task: worker.task.split("\n")[0],
+    ...requestsView(own, now),
+    ...(worker.state === "running"
+      ? {}
+      : { needs: kinds(own.filter((row) => row.state === "unknown")), waiting: [] }),
+  };
+};
+
+const workerRequests = (db: Db, worker: Worker) =>
+  db.select().from(requests).where(eq(requests.sessionID, worker.sessionID)).all();
+
+/**
+ * Sessions with requests outside the unfinished workers' rows, newest request first: each
+ * Threads session that waits on something now, and any session, Threads or a finished worker's,
+ * with an answer whose outcome is unknown, which stays until the owner has seen the audit.
+ */
+const sessionsView = (rows: readonly WorkerRequest[], now: number) =>
+  Object.values(Object.groupBy(rows, (row) => row.sessionID)).flatMap((group) => {
+    const newest = group?.toSorted((a, b) => b.id - a.id)[0];
+    return group && newest
+      ? [
+          {
+            request: newest.id,
+            source: newest.source,
+            worker: newest.worker,
+            sessionID: newest.sessionID,
+            title: newest.title,
+            directory: newest.directory,
+            ...requestsView(group, now),
+          },
+        ]
+      : [];
+  });
 
 const listAll = (db: Db) =>
   Effect.gen(function* () {
     const active = yield* (yield* OpenCode).activeSessions;
+    const now = Date.now();
     const unfinished = db.select().from(workers).where(ne(workers.state, "done")).all();
+    const sessions = new Set(unfinished.map((worker) => worker.sessionID));
+    const rows = sessions.size
+      ? db
+          .select()
+          .from(requests)
+          .where(inArray(requests.sessionID, [...sessions]))
+          .all()
+      : [];
+    const others = db
+      .select()
+      .from(requests)
+      .where(
+        or(
+          and(eq(requests.source, "threads"), isNull(requests.goneAt)),
+          eq(requests.state, "unknown"),
+        ),
+      )
+      .all()
+      .filter((row) => !sessions.has(row.sessionID));
     return Response.json(
       listDots(db).map((dot) => ({
         name: dot.name,
         purpose: dot.purpose,
         busy: active.has(dot.sessionID),
-        workers: unfinished.filter((worker) => worker.dot === dot.name).map(workerView),
+        workers: unfinished
+          .filter((worker) => worker.dot === dot.name)
+          .map((worker) => workerView(worker, rows, now)),
+        sessions: sessionsView(
+          others.filter((row) => row.dot === dot.name),
+          now,
+        ),
       })),
     );
   });
+
+const auditPage = 100;
+
+/**
+ * `GET /dots/<name>/requests[?before=<id>]`: a page of the dot's worker requests, newest first by
+ * ID, with each complete answer the dot chose and what became of it, for the owner to review.
+ * `next`, when there may be more, is the `before` of the next older page. Kept after workers
+ * finish.
+ */
+const requestAudit = (db: Db, request: Request, path: string[]) => {
+  if (path.length !== 3 || request.method !== "GET") return error(404, "Not found");
+  const name = (() => {
+    try {
+      return decodeURIComponent(path[1] ?? "");
+    } catch {
+      return undefined;
+    }
+  })();
+  if (name === undefined) return error(400, "Bad dot name.");
+  const dot = findDot(db, name);
+  if (!dot) return error(404, `There's no dot named "${name}".`);
+  const query = new URL(request.url).searchParams;
+  const rawBefore = query.get("before");
+  if (
+    [...query.keys()].some((key) => key !== "before") ||
+    (rawBefore !== null && (!positive.test(rawBefore) || !Number.isSafeInteger(Number(rawBefore))))
+  )
+    return error(400, "before must be a request ID.");
+  const now = Date.now();
+  const page = db
+    .select()
+    .from(requests)
+    .where(
+      rawBefore === null
+        ? eq(requests.dot, dot.name)
+        : and(eq(requests.dot, dot.name), lt(requests.id, Number(rawBefore))),
+    )
+    .orderBy(desc(requests.id))
+    .limit(auditPage)
+    .all();
+  return Response.json({
+    requests: page.map((row) => requestView(row, now)),
+    next: page.length === auditPage ? (page.at(-1)?.id ?? null) : null,
+  });
+};
 
 /** True once the dot's binding no longer matches the one a request began with. */
 const rebound = (db: Db, dot: Dot) => {
@@ -881,13 +1006,17 @@ const opencodeBinary = (env: Record<string, string | undefined>) => {
 };
 
 /** Falls back to copying the command, and says so, when no terminal window opens. */
-const openWorker = async (worker: Worker, run: Run, env: Record<string, string | undefined>) => {
-  const command = openCommand(opencodeBinary(env), worker.directory, worker.sessionID);
+const openSession = async (
+  target: { readonly label: string; readonly directory: string; readonly sessionID: string },
+  run: Run,
+  env: Record<string, string | undefined>,
+) => {
+  const command = openCommand(opencodeBinary(env), target.directory, target.sessionID);
   const terminal = pickTerminal(env);
-  const failed = await run(terminalLaunch(terminal, command, worker.directory));
+  const failed = await run(terminalLaunch(terminal, command, target.directory));
   if (failed === undefined)
     return Response.json({ opened: true, terminal: terminalNames[terminal], command });
-  console.error(`Opening worker #${worker.id} in ${terminalNames[terminal]}: ${failed}`);
+  console.error(`Opening ${target.label} in ${terminalNames[terminal]}: ${failed}`);
   const uncopied = await run(["pbcopy"], command);
   return Response.json({
     opened: false,
@@ -921,7 +1050,7 @@ const workerRoute = (
   if (action === "open") {
     if (worker.state === "creating")
       return Promise.resolve(error(409, "Its session isn't ready yet. Try again in a moment."));
-    return openWorker(worker, run, process.env);
+    return openSession({ ...worker, label: `worker #${worker.id}` }, run, process.env);
   }
   return Effect.runPromise(
     stopWorker(db, id).pipe(
@@ -931,10 +1060,13 @@ const workerRoute = (
           ? error(404, "There's no such worker.")
           : stopped.state === "done" && stopped.outcome !== "stopped"
             ? Response.json(
-                { error: "It already finished.", worker: workerView(stopped) },
+                {
+                  error: "It already finished.",
+                  worker: workerView(stopped, workerRequests(db, stopped)),
+                },
                 { status: 409 },
               )
-            : Response.json({ worker: workerView(stopped) }),
+            : Response.json({ worker: workerView(stopped, workerRequests(db, stopped)) }),
       ),
       Effect.catch((failure) => {
         const current = db.select().from(workers).where(eq(workers.id, id)).get();
@@ -946,7 +1078,7 @@ const workerRoute = (
               error: held
                 ? `Couldn't confirm the stop: ${failure.message}. Nothing queued for it will be sent. Stop it again to retry.`
                 : `Not stopped: ${failure.message}`,
-              worker: current && workerView(current),
+              worker: current && workerView(current, workerRequests(db, current)),
             },
             { status: 502 },
           ),
@@ -954,6 +1086,30 @@ const workerRoute = (
       }),
     ),
   );
+};
+
+/**
+ * `POST /requests/<id>/open` opens the request's session, such as a Threads worker's, in a new
+ * terminal window. Threads keeps that worker's lifecycle, so there is no stop here.
+ */
+const requestRoute = (db: Db, request: Request, path: string[], run: Run): Promise<Response> => {
+  const [rawID, action, ...extra] = path;
+  if (
+    request.method !== "POST" ||
+    extra.length ||
+    action !== "open" ||
+    rawID === undefined ||
+    !positive.test(rawID) ||
+    !Number.isSafeInteger(Number(rawID))
+  )
+    return Promise.resolve(error(404, "Not found"));
+  const row = db
+    .select()
+    .from(requests)
+    .where(eq(requests.id, Number(rawID)))
+    .get();
+  if (!row) return Promise.resolve(error(404, "There's no such request."));
+  return openSession({ ...row, label: `request #${row.id}` }, run, process.env);
 };
 
 /**
@@ -969,6 +1125,9 @@ export const api =
     const path = new URL(request.url).pathname.split("/").filter(Boolean);
     if (path[0] === "feed") return Promise.resolve(feedRoute(db, request, path.slice(1)));
     if (path[0] === "workers") return workerRoute(db, request, path.slice(1), layer, run);
+    if (path[0] === "requests") return requestRoute(db, request, path.slice(1), run);
+    if (path[0] === "dots" && path[2] === "requests")
+      return Promise.resolve(requestAudit(db, request, path));
     if (path[0] === "dots" && path[2] === "memory")
       return memoryRoute(db, request, path).catch((cause) => {
         console.error(`Memory: ${cause instanceof Error ? cause.message : String(cause)}`);

@@ -1,5 +1,10 @@
 import Foundation
 
+/// "permission", "question" or both, as a row says them.
+func requestKinds(_ kinds: [String]) -> String {
+  kinds.contains("permission") && kinds.contains("question") ? "permission, question" : kinds.contains("question") ? "question" : "permission"
+}
+
 struct Dot: Decodable, Equatable {
   struct Worker: Decodable, Equatable {
     let id: Int
@@ -7,18 +12,23 @@ struct Dot: Decodable, Equatable {
     let state: String
     var outcome: String? = nil
     let task: String
-    /// What it waits on its owner for now: "permission", "question" or both. Older daemons send none.
+    /// What you should answer now: escalated, unknown, or unanswered past the grace period. Older
+    /// daemons send none.
     var needs: [String]? = nil
+    /// What its dot is handling for it now.
+    var waiting: [String]? = nil
+    /// A few words about the dot's latest answer for it.
+    var answered: String? = nil
 
-    var needsYou: Bool { state == "running" && !(needs ?? []).isEmpty }
+    var needsYou: Bool { !(needs ?? []).isEmpty }
 
-    /// The row's status: what it needs from you first, else its state.
+    /// The row's status: what it needs from you first, then what the dot handles, else its state.
     var status: String {
       if needsYou {
-        let kinds = needs ?? []
-        if kinds.contains("permission") && kinds.contains("question") { return "needs you: permission, question" }
-        return "needs you: \(kinds.contains("question") ? "question" : "permission")"
+        let waiting = "needs you: \(requestKinds(needs ?? []))"
+        return state == "stopping" ? "stopping, not confirmed · \(waiting)" : waiting
       }
+      if state == "running", let waiting, !waiting.isEmpty { return "dot handling: \(requestKinds(waiting))" }
       switch state {
       case "stopping": return "stopping, not confirmed"
       case "done": return outcome ?? "done"
@@ -26,19 +36,163 @@ struct Dot: Decodable, Equatable {
       }
     }
 
+    /// The row's text: number, status, task and the dot's latest answer.
+    var line: String { "#\(id) \(status) · \(task)\(answered.map { " · \($0)" } ?? "")" }
+
     /// Its session exists once it's past creating.
     var canOpen: Bool { state != "creating" }
     /// A stop that OpenCode hasn't confirmed can be tried again.
     var canStop: Bool { state != "done" }
   }
 
+  /// A session with requests outside the unfinished workers' rows: a Threads worker of the dot's
+  /// waiting on something now, or any session with an answer whose outcome is unknown, which
+  /// stays. Threads keeps a Threads worker's lifecycle, so the notch only opens its session.
+  struct SessionRequest: Decodable, Equatable {
+    /// Its newest request, which opens its session.
+    let request: Int
+    /// "threads", or "worker" for an open-dot worker that finished.
+    let source: String
+    var worker: Int? = nil
+    let sessionID: String
+    let title: String
+    let directory: String
+    var needs: [String]? = nil
+    var waiting: [String]? = nil
+    var answered: String? = nil
+
+    var needsYou: Bool { !(needs ?? []).isEmpty }
+
+    var line: String {
+      let status = needsYou
+        ? "needs you: \(requestKinds(needs ?? []))"
+        : (waiting ?? []).isEmpty ? "answered" : "dot handling: \(requestKinds(waiting ?? []))"
+      let from = source == "threads" ? "Threads" : "Worker #\(worker ?? 0), finished,"
+      return "\(from) \(status) · \(title)\(answered.map { " · \($0)" } ?? "")"
+    }
+  }
+
   let name: String
   let purpose: String?
   let busy: Bool
   let workers: [Worker]
+  /// Older daemons send none.
+  var sessions: [SessionRequest]? = nil
 
-  /// How many of its workers wait on you.
-  var needsYouCount: Int { workers.filter(\.needsYou).count }
+  /// How many of its workers and other sessions wait on you.
+  var needsYouCount: Int { workers.filter(\.needsYou).count + (sessions ?? []).filter(\.needsYou).count }
+}
+
+/// A worker's permission request or question and what became of the dot's answer, for review.
+struct RequestAudit: Decodable, Equatable, Identifiable {
+  struct Field: Decodable, Equatable {
+    let key: String
+    var title: String? = nil
+    var description: String? = nil
+  }
+
+  /// What OpenCode showed: an action and its resources, or a form's title and fields.
+  struct Detail: Decodable, Equatable {
+    let kind: String
+    var action: String? = nil
+    var resources: [String]? = nil
+    var message: String? = nil
+    var title: String? = nil
+    var fields: [Field]? = nil
+  }
+
+  let id: Int
+  /// "worker" or "threads".
+  let source: String
+  var worker: Int? = nil
+  let sessionID: String
+  let title: String
+  let kind: String
+  /// OpenCode's own ID for the permission request or form.
+  let requestID: String
+  /// The complete request and answer as the daemon saved them, as indented JSON.
+  let detailText: String
+  var answerText: String? = nil
+  let state: String
+  let needsYou: Bool
+  let detail: Detail
+  var reason: String? = nil
+  var summary: String? = nil
+  var actorSession: String? = nil
+  let createdAt: Double
+  var queuedAt: Double? = nil
+  var attemptedAt: Double? = nil
+  var confirmedAt: Double? = nil
+  var escalatedAt: Double? = nil
+  var goneAt: Double? = nil
+
+  var stateTitle: String {
+    switch state {
+    case "open": return goneAt == nil ? "dot handling" : "gone unanswered"
+    case "queued": return "answer queued"
+    case "answering": return "sending"
+    case "answered": return "confirmed"
+    case "unknown": return "outcome unknown"
+    case "stale": return "not sent"
+    case "escalated": return "escalated to you"
+    default: return state
+    }
+  }
+
+  /// The request's own words, which are the worker's data.
+  var asked: String {
+    if detail.kind == "permission" {
+      return "\(detail.action ?? "?"): \((detail.resources ?? []).joined(separator: ", "))"
+    }
+    let fields = (detail.fields ?? []).map { $0.title ?? $0.description ?? $0.key }
+    return ([detail.title ?? ""] + fields).filter { !$0.isEmpty }.joined(separator: " · ")
+  }
+
+  var line: String {
+    let from = source == "worker" ? "worker #\(worker ?? 0)" : "Threads"
+    return "#\(id) \(kind) from \(from) · \(stateTitle)\(summary.map { " · \($0)" } ?? "")"
+  }
+}
+
+/// One page of the audit. `next`, when there may be more, is where the next older page starts.
+struct RequestAuditPage: Decodable, Equatable {
+  let requests: [RequestAudit]
+  var next: Int? = nil
+}
+
+/// The audit pages the notch has read for one dot. A read applies only to rows no later read
+/// already set, so a slow refresh can't bring back an older state, and older pages stay loaded.
+struct RequestAuditState: Equatable {
+  private var byID: [Int: RequestAudit] = [:]
+  private var readOf: [Int: Int] = [:]
+  private var reads = 0
+  /// Where the next older page starts, from the page that reached the oldest loaded row.
+  private(set) var older: Int? = nil
+  var loadingOlder = false
+
+  /// Newest first.
+  var rows: [RequestAudit] { byID.values.sorted { $0.id > $1.id } }
+
+  mutating func startRead() -> Int {
+    reads += 1
+    return reads
+  }
+
+  mutating func apply(_ read: Int, _ page: RequestAuditPage, older isOlder: Bool) {
+    let oldest = byID.keys.min()
+    for row in page.requests where (readOf[row.id] ?? 0) < read {
+      byID[row.id] = row
+      readOf[row.id] = read
+    }
+    // The page that reaches past every row loaded so far says where the next older one starts.
+    if let last = page.requests.last?.id, oldest == nil || last <= oldest! {
+      older = page.next
+    } else if isOlder && page.requests.isEmpty {
+      older = nil
+    } else if oldest == nil {
+      older = page.next
+    }
+  }
 }
 
 /// What opening a worker did: a terminal window, or the command on the clipboard instead.
@@ -362,6 +516,17 @@ enum APIError: Error {
   /// Opens a worker's session in a new terminal window, or copies its command. Never retried on its own.
   func openWorker(_ id: Int) async throws -> WorkerOpened {
     try decode(WorkerOpened.self, await send("POST", "/workers/\(id)/open"))
+  }
+
+  /// Opens a worker request's session, such as a Threads worker's. Never retried on its own.
+  func openRequest(_ id: Int) async throws -> WorkerOpened {
+    try decode(WorkerOpened.self, await send("POST", "/requests/\(id)/open"))
+  }
+
+  /// A page of the dot's worker requests and answers, newest first, older than `before` if given.
+  func requests(_ dot: String, before: Int? = nil) async throws -> RequestAuditPage {
+    let query = before.map { "?before=\($0)" } ?? ""
+    return try decode(RequestAuditPage.self, await send("GET", "/dots/\(escape(dot))/requests\(query)"))
   }
 
   /// Stops a worker the owner confirmed. Never retried on its own.

@@ -7,9 +7,27 @@ import {
   OpenCodeError,
   type SessionInput,
   type Turn,
+  type ThreadsWorker,
   type TurnEnd,
   type Waiting,
 } from "../src/opencode";
+import type { RequestAnswer } from "../src/schema";
+
+/** A waiting item as a test writes it: details default to what the summary says. */
+export type FakeWaiting = Omit<Waiting, "detail" | "sensitive"> & Partial<Waiting>;
+
+const filled = (item: FakeWaiting): Waiting => ({
+  sensitive: false,
+  detail:
+    item.kind === "permission"
+      ? {
+          kind: "permission",
+          action: item.summary.split(": ")[0] ?? item.summary,
+          resources: [item.summary.split(": ").slice(1).join(": ")],
+        }
+      : { kind: "question", title: item.summary, fields: [{ key: "answer", type: "string" }] },
+  ...item,
+});
 
 const broken = (message: string) => Effect.fail(new OpenCodeError({ message }));
 
@@ -45,7 +63,15 @@ export function fakeOpenCode() {
     // Supervised sessions: each one's directory, turn ends and what it waits on.
     directories: new Map<string, string>(),
     ends: new Map<string, TurnEnd[]>(),
-    waiting: new Map<string, Waiting[]>(),
+    waiting: new Map<string, FakeWaiting[]>(),
+    onWaiting: (_sessionID: string) => {},
+    // Each answer sent. "lost" sends it but reports a failure, like a dropped response.
+    answers: [] as { sessionID: string; kind: string; requestID: string; answer: RequestAnswer }[],
+    answer: "ok" as "ok" | "fail" | "lost",
+    onAnswer: (_requestID: string) => {},
+    // Each coordinator's Threads snapshot, or "unavailable" when its RPC fails.
+    threads: new Map<string, readonly ThreadsWorker[] | "unavailable">(),
+    threadsCalls: [] as { directory: string; coordinatorID: string }[],
     superviseFailure: false,
     history: new Map<string, Entry[]>(),
     create: "ok" as "ok" | "fail",
@@ -133,11 +159,29 @@ export function fakeOpenCode() {
           : Effect.succeed((state.ends.get(sessionID) ?? []).filter((end) => end.time >= since)),
       ),
     waiting: (sessionID) =>
-      Effect.suspend(() =>
-        state.superviseFailure
+      Effect.suspend(() => {
+        state.onWaiting(sessionID);
+        return state.superviseFailure
           ? broken("requests unavailable")
-          : Effect.succeed(state.waiting.get(sessionID) ?? []),
-      ),
+          : Effect.succeed((state.waiting.get(sessionID) ?? []).map(filled));
+      }),
+    answer: (sessionID, kind, requestID, answer) =>
+      Effect.suspend(() => {
+        if (state.answer === "fail") return broken("connection refused");
+        state.onAnswer(requestID);
+        state.answers.push({ sessionID, kind, requestID, answer });
+        state.waiting.set(
+          sessionID,
+          (state.waiting.get(sessionID) ?? []).filter((item) => item.id !== requestID),
+        );
+        return state.answer === "lost" ? broken("connection reset") : Effect.void;
+      }),
+    threadsWorkers: (directory, coordinatorID) =>
+      Effect.suspend(() => {
+        state.threadsCalls.push({ directory, coordinatorID });
+        const listed = state.threads.get(coordinatorID);
+        return listed === "unavailable" ? broken("no threads RPC") : Effect.succeed(listed ?? []);
+      }),
   });
 
   return { state, layer };

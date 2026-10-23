@@ -20,6 +20,7 @@ import {
   reactions,
   recentReactions,
   reminders,
+  requests,
   responsibilities,
   supervisions,
   workers,
@@ -822,4 +823,109 @@ test("dot_send queues a labelled message only on an active watch-and-send bindin
   expect(loaded.turns).toEqual([]);
   await loaded.cleanup?.();
   db.$client.close();
+});
+
+/** A running worker of jojo's waiting on one permission request, as the daemon saves it. */
+function waitingWorker(db: ReturnType<typeof openDatabase>) {
+  db.insert(workers)
+    .values({
+      id: 1,
+      dot: "jojo",
+      task: "Task",
+      directory: "/work/1",
+      sessionID: "ses_w1",
+      state: "running",
+      createdAt: 0,
+    })
+    .run();
+  return db
+    .insert(requests)
+    .values({
+      dot: "jojo",
+      source: "worker",
+      worker: 1,
+      sessionID: "ses_w1",
+      title: "Task",
+      directory: "/work/1",
+      kind: "permission",
+      requestID: "per_1",
+      detail: { kind: "permission", action: "shell", resources: ["bun test"] },
+      state: "open",
+      createdAt: Date.now(),
+    })
+    .returning()
+    .get();
+}
+
+test("dot_permission never sends always, answers only from the bound conversation, and reports the daemon's confirmation", async () => {
+  const db = openDatabase(databasePath());
+  const row = waitingWorker(db);
+  const loaded = await load(dot.directory);
+  try {
+    for (const decision of ["always", "ALWAYS", undefined, ["once"]])
+      expect(await fails(loaded.call("dot_permission", { id: row.id, decision }))).toBe(true);
+    expect(
+      await fails(loaded.call("dot_permission", { id: row.id, decision: "once" }, "ses_w1")),
+    ).toBe(true);
+    expect(db.select().from(requests).get()?.state).toBe("open");
+
+    // The daemon confirms it shortly after.
+    setTimeout(
+      () => db.update(requests).set({ state: "answered", confirmedAt: Date.now() }).run(),
+      300,
+    );
+    const answered = await loaded.call("dot_permission", { id: row.id, decision: "once" });
+    expect(answered.content).toContain("OpenCode confirmed it");
+    expect(db.select().from(requests).get()).toMatchObject({
+      answer: { decision: "once" },
+      actorSession: dot.sessionID,
+    });
+    expect(loaded.turns).toEqual([]);
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+});
+
+test("an answer the daemon hasn't sent yet is reported as queued, not done", async () => {
+  const db = openDatabase(databasePath());
+  const row = waitingWorker(db);
+  const loaded = await load(dot.directory);
+  try {
+    const queued = await loaded.call("dot_permission", { id: row.id, decision: "reject" });
+    expect(queued.content).toContain("queued, not confirmed");
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+}, 10_000);
+
+test("dot_escalate hands a request to the owner with one message, and memory carries the request policy", async () => {
+  const db = openDatabase(databasePath());
+  const row = waitingWorker(db);
+  const loaded = await load(dot.directory);
+  try {
+    const memory = await loaded.injected(dot.sessionID);
+    expect(memory).toContain("force pushes");
+    expect(memory).toContain("~/.config/opencode");
+    expect(memory).toContain("is your owner's consent");
+    expect(memory).toContain(`#${row.id} permission request from worker #1 session ses_w1`);
+    expect(memory).toContain('"bun test"');
+
+    await loaded.call("dot_escalate", { id: row.id, reason: "It touches the deploy config." });
+    expect(db.select().from(requests).get()).toMatchObject({
+      state: "escalated",
+      reason: "It touches the deploy config.",
+    });
+    const messages = db.select().from(outbox).all();
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ sessionID: dot.sessionID, route: null, fromDot: null });
+    expect(messages[0]?.text).toStartWith("Needs your owner: permission request #1");
+    expect(await fails(loaded.call("dot_escalate", { id: row.id, reason: "Again." }))).toBe(true);
+    expect(await fails(loaded.call("dot_permission", { id: row.id, decision: "once" }))).toBe(true);
+    expect(db.select().from(outbox).all()).toHaveLength(1);
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
 });

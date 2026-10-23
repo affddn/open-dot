@@ -332,15 +332,94 @@ export const workers = sqliteTable("workers", {
   promptID: text("prompt_id"),
   route: text({ mode: "json" }).$type<Route>(),
   outcome: text(),
-  // JSON {current, seen}: the "permission:<id>" and "question:<id>" keys it waits on now, and every
-  // one its dot was told about, kept after an answer so none is told twice. Older daemons saved
-  // the bare ID of the last permission told. Read it with `readWaiting`.
+  // Written only by daemons before migration 0023, which track requests in `requests` instead:
+  // JSON {current, seen} of "permission:<id>" and "question:<id>" keys, or the bare ID of the last
+  // permission told. Its seen keys are never told again. Read it with `readWaiting`.
   waitingOn: text("waiting_on"),
   createdAt: integer("created_at").notNull(),
   finishedAt: integer("finished_at"),
 });
 
 export type Worker = typeof workers.$inferSelect;
+
+/** What a worker's permission request or question showed when open-dot first read it. */
+export type RequestDetail =
+  | {
+      readonly kind: "permission";
+      readonly action: string;
+      readonly resources: readonly string[];
+      readonly message?: string;
+    }
+  | {
+      readonly kind: "question";
+      readonly title: string;
+      readonly fields: readonly Record<string, unknown>[];
+    };
+
+/** What the dot chose. Saved before the daemon makes the one call that sends it. */
+export type RequestAnswer =
+  | { readonly decision: "once" | "reject" }
+  | {
+      readonly decision: "reply";
+      readonly answer: Record<string, string | number | boolean | readonly string[]>;
+    }
+  | { readonly decision: "cancel" };
+
+export const requestStates = [
+  "open",
+  "queued",
+  "answering",
+  "answered",
+  "unknown",
+  "stale",
+  "escalated",
+] as const;
+
+/**
+ * Each permission request or question a dot's own worker waited on, and the dot's answer: the
+ * ledger that tells the dot once and the owner's audit. Rows are never deleted. "open": the dot
+ * may answer. "queued": the dot answered and the daemon will check and send it. "answering": the
+ * daemon saved the attempt just before its one call. "answered": OpenCode confirmed it. "unknown":
+ * the call's outcome was lost, so it's never sent again. "stale": the request or worker was gone
+ * before the call. "escalated": only the owner answers it now.
+ */
+export const requests = sqliteTable(
+  "requests",
+  {
+    id: integer().primaryKey({ autoIncrement: true }),
+    dot: text()
+      .notNull()
+      .references(() => dots.name),
+    // An open-dot worker, or a Threads worker whose coordinator is the dot's session.
+    source: text({ enum: ["worker", "threads"] }).notNull(),
+    worker: integer(),
+    sessionID: text("session_id").notNull(),
+    title: text().notNull(),
+    directory: text().notNull(),
+    kind: text({ enum: ["permission", "question"] }).notNull(),
+    requestID: text("request_id").notNull(),
+    detail: text({ mode: "json" }).$type<RequestDetail>().notNull(),
+    // A question that may ask for a secret. Only the owner answers it.
+    sensitive: integer({ mode: "boolean" }).notNull().default(false),
+    state: text({ enum: requestStates }).notNull(),
+    // Why it was escalated or went stale, in open-dot's or the dot's words.
+    reason: text(),
+    answer: text({ mode: "json" }).$type<RequestAnswer>(),
+    // The dot session that chose the answer.
+    actorSession: text("actor_session"),
+    // When open-dot first saw it waiting, which starts the owner's grace period.
+    createdAt: integer("created_at").notNull(),
+    // Null while OpenCode last listed it as waiting.
+    goneAt: integer("gone_at"),
+    queuedAt: integer("queued_at"),
+    attemptedAt: integer("attempted_at"),
+    confirmedAt: integer("confirmed_at"),
+    escalatedAt: integer("escalated_at"),
+  },
+  (table) => [unique().on(table.sessionID, table.kind, table.requestID)],
+);
+
+export type WorkerRequest = typeof requests.$inferSelect;
 
 export interface WorkerWaiting {
   readonly current: readonly string[];

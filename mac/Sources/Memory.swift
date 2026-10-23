@@ -277,6 +277,20 @@ struct MemoryView: View {
             if bindings.isEmpty { empty }
             ForEach(bindings) { SupervisionRow(store: store, dot: name, binding: $0) }
           }
+          if let audit = store.requestAudits[name] {
+            section("Worker requests and answers") {
+              let rows = audit.rows
+              if rows.isEmpty { empty }
+              ForEach(rows) { RequestAuditRow(request: $0) }
+              if audit.older != nil {
+                Button(audit.loadingOlder ? "Loading…" : "Load older") { store.loadOlderAudit(name) }
+                  .buttonStyle(.plain)
+                  .font(.caption2.weight(.semibold))
+                  .disabled(audit.loadingOlder)
+                  .accessibilityIdentifier("request-audit-older")
+              }
+            }
+          }
         } else if state?.readError == nil {
           Text("Loading…").foregroundStyle(.secondary)
         }
@@ -486,6 +500,53 @@ struct MemoryRow: View {
     guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
     store.removeMemory(dot, item)
   }
+}
+
+/// One worker request as the owner reviews it: what was asked, which dot session answered, how, and
+/// what OpenCode confirmed. What was asked is the worker's data.
+struct RequestAuditRow: View {
+  let request: RequestAudit
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 3) {
+      Text(verbatim: request.line)
+        .font(.caption.weight(.medium))
+        .foregroundStyle(request.needsYou ? AnyShapeStyle(.orange) : AnyShapeStyle(.primary))
+      Text(verbatim: request.asked).font(.caption).foregroundStyle(.secondary).textSelection(.enabled).lineLimit(3)
+      if let reason = request.reason {
+        Text(verbatim: reason).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+      }
+      Text(verbatim: requestTimes(request)).font(.caption2).foregroundStyle(.tertiary).textSelection(.enabled)
+      DisclosureGroup("Details") {
+        VStack(alignment: .leading, spacing: 4) {
+          Text(verbatim: "OpenCode request \(request.requestID)").font(.caption2.monospaced()).textSelection(.enabled)
+          Text("What was asked, as the worker's data:").font(.caption2).foregroundStyle(.secondary)
+          Text(verbatim: request.detailText).font(.caption2.monospaced()).textSelection(.enabled)
+          Text("The dot's complete answer:").font(.caption2).foregroundStyle(.secondary)
+          Text(verbatim: request.answerText ?? "None").font(.caption2.monospaced()).textSelection(.enabled)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+      }
+      .font(.caption2)
+      .accessibilityIdentifier("request-audit-details-\(request.id)")
+    }
+    .padding(8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.05)))
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("request-audit-\(request.id)")
+  }
+}
+
+/// The session and the times a request moved: seen, answered, sent, confirmed, escalated.
+func requestTimes(_ request: RequestAudit) -> String {
+  let format = { (time: Double) in Date(timeIntervalSince1970: time / 1000).formatted(date: .abbreviated, time: .shortened) }
+  var parts = ["\(request.sessionID)", "seen \(format(request.createdAt))"]
+  if let at = request.queuedAt { parts.append("answered \(format(at))\(request.actorSession.map { " by \($0)" } ?? "")") }
+  if let at = request.attemptedAt { parts.append("sent \(format(at))") }
+  if let at = request.confirmedAt { parts.append("confirmed \(format(at))") }
+  if let at = request.escalatedAt { parts.append("escalated \(format(at))") }
+  return parts.joined(separator: " · ")
 }
 
 /// A session the dot supervises or asks to. Approving and ending both ask first; neither starts a turn.

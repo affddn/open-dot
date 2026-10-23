@@ -4,7 +4,7 @@ import { renameSync, rmSync, writeFileSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { Effect, Schedule } from "effect";
 import { api } from "./api";
-import { claimDue, hasWork, step } from "./daemon";
+import { daemonLoops } from "./daemon";
 import { backupDatabase, claimDaemon, openDatabase, restoreDatabase } from "./db";
 import { createDot, ensureSession, findDot, listDots, pickDot } from "./dots";
 import { collect, github, linear } from "./feed";
@@ -265,15 +265,6 @@ const list = Effect.sync(() => {
     );
 });
 
-const report = (error: { readonly message: string }) =>
-  Effect.sync(() => console.error(error.message));
-
-const tick = Effect.suspend(() => {
-  claimDue(db, Date.now());
-  if (!hasWork(db)) return Effect.void;
-  return step(db).pipe(Effect.provide(OpenCode.layer), Effect.catch(report));
-});
-
 /** Serves the notch app's API on a fresh port and token, then saves both where only the owner can read them. */
 const serve = Effect.sync(() => {
   const token = randomBytes(32).toString("hex");
@@ -330,7 +321,7 @@ const daemon = Effect.sync(() => console.log(`open-dot daemon watching ${databas
   Effect.andThen(
     Effect.all(
       [
-        Effect.repeat(tick, Schedule.spaced("1 second")),
+        daemonLoops(db, OpenCode.layer),
         Effect.repeat(converse, Schedule.spaced("3 seconds")),
         Effect.repeat(agents.tick, Schedule.spaced("3 seconds")),
         Effect.repeat(setUp, Schedule.spaced("10 seconds")),

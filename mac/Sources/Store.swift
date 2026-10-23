@@ -138,6 +138,11 @@ struct FeedState {
   /// Workers being opened or stopped, and what the last attempt for each said.
   var workerBusy: Set<Int> = []
   var workerNotices: [Int: String] = [:]
+  /// Threads requests being opened, and what the last attempt for each said, by request number.
+  var requestBusy: Set<Int> = []
+  var requestNotices: [Int: String] = [:]
+  /// Each dot's worker requests and answers, read with its memory. Nil from older daemons.
+  var requestAudits: [String: RequestAuditState] = [:]
   var reacting: Set<MessageKey> = []
   var reactionErrors: [MessageKey: String] = [:]
   /// The owner's latest non-classic emoji, newest first, as the daemon last reported them.
@@ -763,6 +768,20 @@ struct FeedState {
     }
   }
 
+  /// Opens a Threads worker's session from its request. Never retried on its own.
+  func openRequest(_ request: Dot.SessionRequest) {
+    guard requestBusy.insert(request.request).inserted else { return }
+    requestNotices[request.request] = nil
+    Task {
+      do {
+        requestNotices[request.request] = try await api.openRequest(request.request).notice
+      } catch {
+        requestNotices[request.request] = Self.describeMemory(error, "Not opened", unknown: "A window may have opened anyway.")
+      }
+      requestBusy.remove(request.request)
+    }
+  }
+
   /// Stops a worker the owner confirmed, then reads the dots again. A stop OpenCode didn't confirm
   /// says so; the owner may stop it again, but it's never retried on its own.
   func stopWorker(_ worker: Dot.Worker) {
@@ -839,11 +858,35 @@ struct FeedState {
     }
   }
 
+  /// Reads the newest audit page again, keeping older pages already loaded.
+  private func refreshAudit(_ name: String) async {
+    var state = requestAudits[name] ?? RequestAuditState()
+    let read = state.startRead()
+    requestAudits[name] = state
+    guard let page = try? await api.requests(name) else { return }
+    requestAudits[name]?.apply(read, page, older: false)
+  }
+
+  /// Reads the next older audit page, once at a time. A failure leaves what's shown.
+  func loadOlderAudit(_ name: String) {
+    guard var state = requestAudits[name], let before = state.older, !state.loadingOlder else { return }
+    state.loadingOlder = true
+    let read = state.startRead()
+    requestAudits[name] = state
+    Task {
+      if let page = try? await api.requests(name, before: before) {
+        requestAudits[name]?.apply(read, page, older: true)
+      }
+      requestAudits[name]?.loadingOlder = false
+    }
+  }
+
   private func refreshMemory(_ name: String) async {
     let read = memories[name, default: MemoryState()].startRead()
     do {
       let memory = try await api.memory(name)
       _ = memories[name, default: MemoryState()].apply(read, memory)
+      await refreshAudit(name)
     } catch {
       guard memories[name]?.isCurrent(read) == true else { return }
       memories[name]?.readError = Self.describe(error)

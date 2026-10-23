@@ -1,7 +1,15 @@
-import { AbsolutePath, OpenCode as Client, Session, SessionMessage } from "@opencode/client/effect";
+import {
+  AbsolutePath,
+  OpenCode as Client,
+  Form,
+  Permission,
+  Session,
+  SessionMessage,
+} from "@opencode/client/effect";
 import { Service } from "@opencode/client/service";
-import { Context, Data, DateTime, Effect, Layer } from "effect";
+import { Context, Data, DateTime, Effect, Layer, Schema } from "effect";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
+import type { RequestAnswer, RequestDetail } from "./schema";
 
 export class OpenCodeError extends Data.TaggedError("OpenCodeError")<{
   readonly message: string;
@@ -132,7 +140,95 @@ export interface Waiting {
   readonly id: string;
   readonly kind: "permission" | "question";
   readonly summary: string;
+  readonly detail: RequestDetail;
+  /** A question that may ask for a secret, so only the owner answers it. */
+  readonly sensitive: boolean;
 }
+
+/** A Threads worker, from the public `threads` RPC snapshot. */
+export interface ThreadsWorker {
+  readonly workerID: string;
+  readonly coordinatorID: string;
+  readonly title: string;
+  readonly directory: string;
+  readonly hidden: boolean;
+}
+
+const secretWords =
+  /pass(word|phrase|code)|secret|token|api[\s_-]?key|credential|\botp\b|2fa|mfa|one[\s-]?time|private[\s_-]?key|ssh[\s_-]?key|cookie/i;
+
+/**
+ * A form may ask for a secret when any of its words or its metadata say so, or a field sends the
+ * owner to an outside page. OpenCode 2.1.1 has no password field type, so this reads words; it
+ * errs toward the owner.
+ */
+const sensitiveForm = (form: {
+  readonly title: string;
+  readonly metadata?: unknown;
+  readonly fields: readonly Record<string, unknown>[];
+}) =>
+  form.fields.some((field) => field.type === "external") ||
+  secretWords.test(JSON.stringify([form.title, form.metadata ?? null, form.fields]));
+
+const permissionDetail = (request: {
+  readonly action: string;
+  readonly resources: readonly string[];
+  readonly message?: string | undefined;
+}): RequestDetail => ({
+  kind: "permission",
+  action: request.action,
+  resources: [...request.resources],
+  ...(request.message === undefined ? {} : { message: request.message }),
+});
+
+/** What open-dot keeps of a question that may ask for a secret: none of its own words. */
+export const redactedQuestion = "A question that may ask for a secret (its words are not kept)";
+
+/**
+ * A form as open-dot keeps it. A form that may ask for a secret keeps only a fixed title, with
+ * no fields, metadata or words of its own, so nothing of it reaches the database or a prompt.
+ */
+export const formWaiting = (form: {
+  readonly id: string;
+  readonly title: string;
+  readonly metadata?: unknown;
+  readonly fields: readonly Record<string, unknown>[];
+}): Waiting =>
+  sensitiveForm(form)
+    ? {
+        id: form.id,
+        kind: "question",
+        summary: redactedQuestion,
+        detail: { kind: "question", title: redactedQuestion, fields: [] },
+        sensitive: true,
+      }
+    : {
+        id: form.id,
+        kind: "question",
+        summary: [form.title, ...form.fields.map((field) => field.description)]
+          .filter((part): part is string => typeof part === "string" && part !== "")
+          .join("\n"),
+        detail: {
+          kind: "question",
+          title: form.title,
+          fields: form.fields.map((field) => ({ ...field })),
+        },
+        sensitive: false,
+      };
+
+const ThreadsSnapshot = Schema.Struct({
+  output: Schema.Struct({
+    workers: Schema.Array(
+      Schema.Struct({
+        workerID: Schema.String,
+        coordinatorID: Schema.String,
+        title: Schema.String,
+        directory: Schema.String,
+        hidden: Schema.Boolean,
+      }),
+    ),
+  }),
+});
 
 /** A file attached to a user message. OpenCode keeps its bytes inline, as base64. */
 export interface Attachment {
@@ -232,6 +328,24 @@ export class OpenCode extends Context.Service<
     ) => Effect.Effect<readonly TurnEnd[], OpenCodeError>;
     /** Every permission request and question the session waits on. */
     readonly waiting: (sessionID: string) => Effect.Effect<readonly Waiting[], OpenCodeError>;
+    /**
+     * Sends one answer: a permission once or rejected, never always; a question's reply; or a
+     * question cancelled. A failure may still have reached OpenCode.
+     */
+    readonly answer: (
+      sessionID: string,
+      kind: Waiting["kind"],
+      requestID: string,
+      answer: RequestAnswer,
+    ) => Effect.Effect<void, OpenCodeError>;
+    /**
+     * The Threads workers of one coordinator session, from Threads' public `snapshot` RPC in that
+     * directory, which delivers no follow-ups. Any other shape is an OpenCodeError.
+     */
+    readonly threadsWorkers: (
+      directory: string,
+      coordinatorID: string,
+    ) => Effect.Effect<readonly ThreadsWorker[], OpenCodeError>;
   }
 >()("open-dot/OpenCode") {
   static readonly layer = Layer.effect(
@@ -450,17 +564,47 @@ export class OpenCode extends Context.Service<
                 id: request.id,
                 kind: "permission" as const,
                 summary: `${request.action}: ${request.resources.join(", ")}`,
+                detail: permissionDetail(request),
+                sensitive: false,
               })),
-              ...forms.map((form) => ({
-                id: form.id,
-                kind: "question" as const,
-                summary: [form.title, ...form.fields.map((field) => field.description ?? "")]
-                  .filter((part) => part !== "")
-                  .join("\n"),
-              })),
+              ...forms.map(formWaiting),
             ]),
             Effect.mapError(failed(`Could not list what ${sessionID} waits on`)),
           ),
+        answer: (sessionID, kind, requestID, answer) =>
+          (kind === "permission"
+            ? answer.decision === "once" || answer.decision === "reject"
+              ? client.permission.reply({
+                  sessionID: Session.ID.make(sessionID),
+                  requestID: Permission.ID.make(requestID),
+                  decision: answer.decision,
+                  // The 2.1.1 Effect client encodes an omitted optional message as invalid null.
+                  message: "",
+                })
+              : Effect.fail(new OpenCodeError({ message: "Not a permission answer" }))
+            : answer.decision === "reply"
+              ? client.session.form.reply({
+                  sessionID,
+                  formID: Form.ID.make(requestID),
+                  answer: answer.answer,
+                })
+              : answer.decision === "cancel"
+                ? client.session.form.cancel({ sessionID, formID: Form.ID.make(requestID) })
+                : Effect.fail(new OpenCodeError({ message: "Not a question answer" }))
+          ).pipe(Effect.mapError(failed(`Could not answer ${kind} ${requestID}`))),
+        threadsWorkers: (directory, coordinatorID) =>
+          client.rpc
+            .call({
+              rpcID: "threads",
+              method: "snapshot",
+              location: { directory },
+              input: { coordinatorIDs: [coordinatorID] },
+            })
+            .pipe(
+              Effect.flatMap(Schema.decodeUnknownEffect(ThreadsSnapshot)),
+              Effect.map((result) => result.output.workers),
+              Effect.mapError(failed(`Could not read the Threads workers of ${coordinatorID}`)),
+            ),
       };
     }),
   );

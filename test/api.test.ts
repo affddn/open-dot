@@ -16,6 +16,7 @@ import {
   outbox,
   reactions,
   recentReactions,
+  requests,
   workers,
 } from "../src/schema";
 import { fakeOpenCode } from "./fake-opencode";
@@ -326,12 +327,42 @@ test("requests need the token, and only the feed works while OpenCode is down", 
 
 test("/dots lists each dot with whether it's busy and its unfinished workers", async () => {
   fake.state.active.add("ses_jojo");
-  const worker = { dot: "jojo", directory: "/w", sessionID: "ses_w", createdAt: 0 };
+  const worker = { dot: "jojo", directory: "/w", createdAt: 0 };
   db.insert(workers)
     .values([
-      { ...worker, task: "Fix the build\nIt fails on main.", state: "running" },
-      { ...worker, task: "Deploy", state: "running", waitingOn: "per_1" },
-      { ...worker, task: "Old", state: "done" },
+      {
+        ...worker,
+        sessionID: "ses_w1",
+        task: "Fix the build\nIt fails on main.",
+        state: "running",
+      },
+      { ...worker, sessionID: "ses_w2", task: "Deploy", state: "running" },
+      { ...worker, sessionID: "ses_w3", task: "Old", state: "done" },
+    ])
+    .run();
+  const request = {
+    dot: "jojo",
+    source: "worker" as const,
+    worker: 2,
+    sessionID: "ses_w2",
+    title: "Deploy",
+    directory: "/w",
+    kind: "permission" as const,
+    detail: { kind: "permission" as const, action: "shell", resources: ["ls"] },
+    createdAt: Date.now(),
+  };
+  db.insert(requests)
+    .values([
+      { ...request, requestID: "per_1", state: "escalated" },
+      { ...request, kind: "question", requestID: "frm_1", state: "open" },
+      {
+        ...request,
+        requestID: "per_0",
+        state: "answered",
+        answer: { decision: "once" },
+        queuedAt: 1,
+        goneAt: 2,
+      },
     ])
     .run();
 
@@ -341,12 +372,28 @@ test("/dots lists each dot with whether it's busy and its unfinished workers", a
       purpose: "Second brain.",
       busy: true,
       workers: [
-        { id: 1, state: "running", outcome: null, task: "Fix the build", needs: [] },
-        // A bare ID was the permission the dot was last told about, before questions counted.
-        { id: 2, state: "running", outcome: null, task: "Deploy", needs: ["permission"] },
+        {
+          id: 1,
+          state: "running",
+          outcome: null,
+          task: "Fix the build",
+          needs: [],
+          waiting: [],
+          answered: null,
+        },
+        {
+          id: 2,
+          state: "running",
+          outcome: null,
+          task: "Deploy",
+          needs: ["permission"],
+          waiting: ["question"],
+          answered: "Approved once",
+        },
       ],
+      sessions: [],
     },
-    { name: "polnareff", purpose: null, busy: false, workers: [] },
+    { name: "polnareff", purpose: null, busy: false, workers: [], sessions: [] },
   ]);
 });
 
