@@ -6,7 +6,7 @@ import { eq } from "drizzle-orm";
 import { api } from "../src/api";
 import { avatarPath, avatarRevision } from "../src/avatar";
 import { type Db, openDatabase } from "../src/db";
-import { dots, slackApps, slackConfig } from "../src/schema";
+import { dots, feed, outbox, slackApps, slackConfig, slackEvents } from "../src/schema";
 import {
   appItem,
   botItem,
@@ -776,6 +776,7 @@ test("the Slack routes need the token, check every body, save tokens only in the
   for (const [path, body] of [
     ["/slack/config", pair],
     ["/dots/jojo/slack/tokens", { kind: "bot", token: bot }],
+    ["/dots/jojo/slack/dm-check", {}],
   ] as const)
     expect((await send(path, { method: "POST", body, token: "wrong" })).status).toBe(401);
   expect((await send("/dots/jojo/slack", { token: "wrong" })).status).toBe(401);
@@ -783,7 +784,9 @@ test("the Slack routes need the token, check every body, save tokens only in the
 
   // No app yet.
   expect((await send("/dots/jojo/slack")).body).toEqual({
-    config: { state: "idle", problem: null },
+    config: { state: "idle", problem: null, saved: false },
+    ownerFeed: { items: 0, latestAt: null },
+    dmCheck: null,
     app: null,
   });
   expect((await send("/dots/nobody/slack")).status).toBe(404);
@@ -965,4 +968,156 @@ test("the notch's manifest update shows the changes first and sends only the one
   expect(sent.said).toContain("Updated jojo's app");
   expect(fake.state.updated).toHaveLength(1);
   expect(app().manifestVersion).toBe(2);
+});
+
+/** One daemon's API, whose in-memory DM checks last across its requests until it's replaced. */
+const daemonAPI = () => {
+  const handler = api(
+    db,
+    "secret",
+    fakeOpenCode().layer,
+    undefined,
+    () => time,
+    undefined,
+    fake.setup,
+  );
+  return async (path: string, method = "GET", body?: unknown) => {
+    const response = await handler(
+      new Request(`http://127.0.0.1${path}`, {
+        method,
+        headers: {
+          authorization: "Bearer secret",
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      }),
+    );
+    return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+  };
+};
+
+test("issue48: the guided install's status reads only open-dot's database, with the owner's feed apart from the bot", async () => {
+  const daemon = daemonAPI();
+  const view = async () => (await daemon("/dots/jojo/slack")).body;
+  expect(await view()).toMatchObject({
+    config: { saved: false },
+    ownerFeed: { items: 0, latestAt: null },
+    dmCheck: null,
+  });
+  for (const [source, sourceID, updatedAt] of [
+    ["slack", "D1:1", 5_000],
+    ["slack", "C1:2", 7_000],
+    ["github", "n1", 9_000],
+  ] as const)
+    db.insert(feed)
+      .values({
+        source,
+        sourceID,
+        reason: "Mentioned",
+        title: "t",
+        context: "c",
+        updatedAt,
+        state: "unread",
+        createdAt: 1,
+      })
+      .run();
+  created("jojo");
+  db.update(slackApps).set({ botUser: "UJOJOBOT" }).run();
+  const shown = await view();
+  expect(shown.ownerFeed).toEqual({ items: 2, latestAt: 7_000 });
+  expect(shown.app).toMatchObject({ state: "active", botUser: "UJOJOBOT" });
+
+  // A pair saved through the existing route marks the workspace as set up; a later block keeps it.
+  expect(await saveConfigPair(db, fake.setup, "xoxe.xoxp-1-a", "xoxe-1-b")).toBeUndefined();
+  expect(((await view()).config as { saved: boolean }).saved).toBe(true);
+  db.update(slackConfig).set({ state: "blocked", problem: "save a new pair" }).run();
+  expect((await view()).config).toEqual({
+    state: "blocked",
+    problem: "save a new pair",
+    saved: true,
+  });
+  // A save still in progress isn't counted.
+  db.update(slackConfig).set({ state: "rotating", fromIat: -1 }).run();
+  expect(((await view()).config as { saved: boolean }).saved).toBe(false);
+
+  // Reading the status asks neither Slack nor the Keychain.
+  const reads = fake.state.reads;
+  for (let read = 0; read < 3; read++) await view();
+  expect(fake.state.fetches).toBe(0);
+  expect(fake.state.reads).toBe(reads);
+});
+
+test("issue48: a DM check is pending until a reply Slack confirmed to the owner's own later DM, and sends nothing", async () => {
+  let daemon = daemonAPI();
+  const view = async () => (await daemon("/dots/jojo/slack")).body;
+  const start = () => daemon("/dots/jojo/slack/dm-check", "POST");
+  let ts = 0;
+  const dm = (values: Partial<typeof slackEvents.$inferInsert>) =>
+    db
+      .insert(slackEvents)
+      .values({
+        app: appIDs.jojo,
+        dot: "jojo",
+        kind: "dm",
+        channel: "DJOJO",
+        ts: `${Math.floor(time / 1000)}.${String(++ts).padStart(6, "0")}`,
+        user: owner,
+        replyTS: `${ts}.0002`,
+        state: "posted",
+        createdAt: time,
+        ...values,
+      })
+      .run();
+
+  // Only an active app can be checked.
+  expect((await start()).status).toBe(409);
+  created("jojo", "created");
+  expect((await start()).status).toBe(409);
+  db.update(slackApps).set({ state: "active", botID: "BJOJO", botUser: "UJOJOBOT" }).run();
+  expect((await daemon("/dots/jojo/slack/dm-check", "POST", { send: true })).status).toBe(400);
+
+  // A reply from before the check started never counts.
+  dm({ createdAt: time - 1 });
+  const outboxBefore = db.select().from(outbox).all().length;
+  const eventsBefore = db.select().from(slackEvents).all().length;
+  const started = await start();
+  expect(started.status).toBe(200);
+  expect(started.body.dmCheck).toEqual({ state: "pending", since: time, dmAt: null });
+
+  // Queued, unknown, unconfirmed, channel, outsider, other-app and other-dot rows don't either.
+  time += 1_000;
+  for (const state of ["new", "waiting", "posting", "unknown", "failed", "answered"] as const)
+    dm({ state });
+  dm({ replyTS: null });
+  dm({ kind: "mention", channel: "CGENERAL" });
+  dm({ kind: "outsider", user: "UOTHER" });
+  dm({ user: "UOTHER" });
+  dm({ app: appIDs.polnareff });
+  dm({ dot: "polnareff" });
+  dm({ ts: `${Math.floor((time - 2_000) / 1000)}.000001` });
+  dm({ ts: "not-a-timestamp" });
+  dm({ ts: null });
+  expect((await view()).dmCheck).toEqual({ state: "pending", since: time - 1_000, dmAt: null });
+
+  // The owner's own DM whose reply Slack confirmed.
+  dm({ createdAt: time + 5, ts: ((time + 5) / 1000).toFixed(6) });
+  expect((await view()).dmCheck).toEqual({
+    state: "replied",
+    since: time - 1_000,
+    dmAt: time + 5,
+  });
+
+  // Starting sent nothing, queued nothing and asked nothing of Slack or the Keychain.
+  expect(db.select().from(outbox).all().length).toBe(outboxBefore);
+  expect(db.select().from(slackEvents).all().length).toBe(eventsBefore + 16);
+  expect(fake.state.fetches).toBe(0);
+  expect(fake.state.reads).toBe(0);
+
+  // Another app forgets it, and so does a daemon restart.
+  db.update(slackApps).set({ appID: "AOTHERAPP" }).run();
+  expect((await view()).dmCheck).toBeNull();
+  db.update(slackApps).set({ appID: appIDs.jojo }).run();
+  expect((await view()).dmCheck).toMatchObject({ state: "replied" });
+  daemon = daemonAPI();
+  expect((await view()).dmCheck).toBeNull();
 });

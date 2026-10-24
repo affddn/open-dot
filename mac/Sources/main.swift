@@ -143,6 +143,11 @@ struct Notch {
     return runAlert(alert, store) == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
   }
 
+  /// A Slack pickup and any access token it holds end with the notch.
+  func applicationWillTerminate(_ notification: Notification) {
+    store.endPickup(nil)
+  }
+
   private func screenChanged() {
     guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main, let hover = panel.contentView else { return }
     let notch = Notch(screen)

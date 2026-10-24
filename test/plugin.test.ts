@@ -33,10 +33,13 @@ import {
   responsibilities,
   responsibilityRuns,
   runWorkers,
+  slackApps,
+  slackConfig,
   supervisions,
   workers,
   type Route,
 } from "../src/schema";
+import { requestApp, saveConfigPair, type Setup } from "../src/slack-setup";
 import { approveBinding, endBinding } from "../src/supervise";
 
 interface FakeTool {
@@ -2082,6 +2085,80 @@ test("issue42 cache: settling the same compaction again changes nothing, nor bri
     expect(head()?.headText).not.toContain("Lisbon");
   } finally {
     Date.now = clock;
+    db.$client.close();
+  }
+});
+
+test("issue48: connecting or disconnecting a dot's Slack app changes no tool, schema or request byte, and starts no turn", async () => {
+  const db = openDatabase(databasePath());
+  const loaded = await load(dot.directory);
+  const system: FakeMessage = { role: "system", content: [{ text: "Stable dot instructions." }] };
+  const earlier: FakeMessage = { role: "assistant", content: [{ text: "Earlier reply" }] };
+  const prompt: FakeMessage = { role: "user", content: [{ text: "Hi" }] };
+  // Only the memory tail's clock line may differ between two requests.
+  const snapshot = async () => ({
+    tools: registry(loaded.tools),
+    request: (await loaded.request(dot.sessionID, [system, earlier, prompt]))
+      .map((message) => `${message.role}\n${message.content.map((part) => part.text).join("\n")}`)
+      .join("\n---\n")
+      .replace(/^Current time: .*$/gm, "Current time: <now>"),
+  });
+  const keychain = new Map<string, string>();
+  const setup: Setup = {
+    fetch: async () => {
+      throw new Error("no Slack call in this test");
+    },
+    read: async (service: string) => keychain.get(service),
+    save: async (service: string, secret: string) => {
+      keychain.set(service, secret);
+      return true;
+    },
+    now: () => 1_000,
+  };
+  try {
+    const before = await snapshot();
+    expect(before.request).toContain("Current time: <now>");
+    const changes: [string, () => unknown][] = [
+      ["requested", () => requestApp(db, "jojo")],
+      ["pair saved", () => saveConfigPair(db, setup, "xoxe.xoxp-1-a", "xoxe-1-b")],
+      [
+        "created",
+        () =>
+          db
+            .update(slackApps)
+            .set({ state: "created", appID: "AJOJO01", teamID: "T1", ownerID: "UOWNER" })
+            .run(),
+      ],
+      [
+        "connected",
+        () => db.update(slackApps).set({ state: "active", botID: "BJOJO", botUser: "UJOJO" }).run(),
+      ],
+      [
+        "disconnected",
+        () =>
+          db
+            .update(slackApps)
+            .set({
+              state: "created",
+              botID: null,
+              botUser: null,
+              problem: "Slack refused the bot token",
+            })
+            .run(),
+      ],
+      [
+        "blocked",
+        () => db.update(slackConfig).set({ state: "blocked", problem: "save a pair" }).run(),
+      ],
+      ["removed", () => db.delete(slackApps).run()],
+    ];
+    for (const [name, change] of changes) {
+      await change();
+      expect({ name, ...(await snapshot()) }).toEqual({ name, ...before });
+    }
+    expect(loaded.turns).toEqual([]);
+  } finally {
+    await loaded.cleanup?.();
     db.$client.close();
   }
 });

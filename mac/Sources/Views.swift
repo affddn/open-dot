@@ -156,7 +156,7 @@ struct ExpandedView: View {
   }
 
   /// A dot's tab. A click shows its chat; a secondary click or Control-click opens its Memory,
-  /// Instructions, Library, Health and Slack menu, which VoiceOver reaches as actions.
+  /// Instructions, Library, Health and Connectors → Slack menu, which VoiceOver reaches as actions.
   private func dotTab(_ dot: Dot) -> some View {
     let unsaved = store.instructions[dot.name]?.dirty == true
     return Button { store.openDot(dot.name, .chat) } label: { dotTabLabel(dot, unsaved: unsaved) }
@@ -1828,9 +1828,9 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
   return menu
 }
 
-/// A dot tab's menu. Memory, Instructions, Library and Health each select the dot first, and
-/// Instructions is marked while the dot has unsaved instructions. Health isn't the dot's own: it's
-/// the daemon's whole report, reached from here so the notch needs no new navigation.
+/// A dot tab's menu. Memory, Instructions, Library, Health and Connectors → Slack each select the
+/// dot first, and Instructions is marked while the dot has unsaved instructions. Health isn't the
+/// dot's own: it's the daemon's whole report, reached from here so the notch needs no new navigation.
 /// A dot tab's menu items as VoiceOver actions.
 private struct DotTabActions: ViewModifier {
   let store: Store
@@ -1862,7 +1862,15 @@ private struct DotTabActions: ViewModifier {
   menu.addItem(instructions)
   menu.addItem(action("Library", symbol: "books.vertical", id: "dot-menu-library") { store.openDot(dot, .library) })
   menu.addItem(action("Health", symbol: "stethoscope", id: "dot-menu-health") { store.openDot(dot, .health) })
-  menu.addItem(action("Slack", symbol: "number", id: "dot-menu-slack") { store.openDot(dot, .slack) })
+  let connectors = NSMenuItem(title: "Connectors", action: nil, keyEquivalent: "")
+  connectors.image = NSImage(systemSymbolName: "point.3.connected.trianglepath.dotted", accessibilityDescription: nil)
+  connectors.identifier = NSUserInterfaceItemIdentifier("dot-menu-connectors")
+  connectors.setAccessibilityIdentifier("dot-menu-connectors")
+  let submenu = NSMenu(title: "Connectors")
+  submenu.autoenablesItems = false
+  submenu.addItem(action("Slack", symbol: "number", id: "dot-menu-slack") { store.openDot(dot, .slack) })
+  connectors.submenu = submenu
+  menu.addItem(connectors)
   return menu
 }
 

@@ -1271,6 +1271,8 @@ enum APIError: Error {
       return .said(answer.said)
     case .icon:
       return .view(try decode(SlackSetup.self, await send("POST", "\(path)/icon")))
+    case .dmCheck:
+      return .view(try decode(SlackSetup.self, await send("POST", "\(path)/dm-check")))
     }
   }
 

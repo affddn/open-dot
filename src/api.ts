@@ -69,6 +69,8 @@ import { isRecord, slackIDs } from "./slack";
 import {
   attachApp,
   Blocked,
+  type DMCheck,
+  dmCheckStatus,
   iconStatus,
   manifestVersion,
   realSetup,
@@ -77,6 +79,7 @@ import {
   saveAppToken,
   saveConfigPair,
   type Setup,
+  startDMCheck,
   updateApp,
 } from "./slack-setup";
 import { approveBinding, endBinding, openSupervisions, supervisionView } from "./supervise";
@@ -465,13 +468,30 @@ const slackBody = async (
 /**
  * A dot's Slack app as `open-dot slack status` sees it, for the notch: its state, problem, the
  * manifest and icon, and the configuration token's state. Never a token: none is kept here.
+ * `config.saved` says open-dot once saved or rotated a pair, not that one is in the Keychain now.
+ * `ownerFeed` is what the owner's own Slack feed saved, apart from the dot's bot, and `dmCheck`
+ * an owner-started DM check. Both only read open-dot's database: no Keychain, no Slack.
  */
-const slackView = (db: Db, dot: string) => {
+const slackView = (db: Db, dot: string, checks: ReadonlyMap<string, DMCheck>) => {
   const app = db.select().from(slackApps).where(eq(slackApps.dot, dot)).get();
   const config = db.select().from(slackConfig).where(eq(slackConfig.id, 1)).get();
   const ready = app?.appID && (app.state === "created" || app.state === "active");
+  const ownerFeed = db
+    .select({
+      items: sql<number>`count(*)`,
+      latestAt: sql<number | null>`max(${feed.updatedAt})`,
+    })
+    .from(feed)
+    .where(eq(feed.source, "slack"))
+    .get();
   return {
-    config: { state: config?.state ?? "idle", problem: config?.problem ?? null },
+    config: {
+      state: config?.state ?? "idle",
+      problem: config?.problem ?? null,
+      saved: (config?.fromIat ?? -1) >= 0,
+    },
+    ownerFeed: { items: ownerFeed?.items ?? 0, latestAt: ownerFeed?.latestAt ?? null },
+    dmCheck: dmCheckStatus(db, dot, checks.get(dot)),
     app: app
       ? {
           state: app.state,
@@ -528,9 +548,16 @@ const slackConfigRoute = async (db: Db, request: Request, path: string[], setup:
  * state, and POST `…/slack/connect` (`{retry?}`), `…/attach` (`{appID}`), `…/tokens`
  * (`{kind: "bot" | "app", token}`), `…/update` (`{approve?}`) and `…/icon` act on it. Creating,
  * attaching and the icon are done by the daemon's setup loop; the manifest update is sent only
- * once the owner approved exactly the changes it shows. No answer repeats a token.
+ * once the owner approved exactly the changes it shows. No answer repeats a token. `…/dm-check`
+ * starts, or restarts, a DM check of an active app; it sends nothing and starts no turn.
  */
-const slackRoute = async (db: Db, request: Request, path: string[], setup: Setup) => {
+const slackRoute = async (
+  db: Db,
+  request: Request,
+  path: string[],
+  setup: Setup,
+  checks: Map<string, DMCheck>,
+) => {
   const [, rawName = "", , action, ...extra] = path;
   const name = (() => {
     try {
@@ -545,10 +572,10 @@ const slackRoute = async (db: Db, request: Request, path: string[], setup: Setup
   if (new URL(request.url).search) return error(400, "This route takes no query.");
   if (action === undefined)
     return request.method === "GET"
-      ? Response.json(slackView(db, dot.name))
+      ? Response.json(slackView(db, dot.name, checks))
       : error(404, "Not found");
   if (request.method !== "POST") return error(404, "Not found");
-  const view = () => Response.json(slackView(db, dot.name));
+  const view = () => Response.json(slackView(db, dot.name, checks));
   switch (action) {
     case "connect": {
       const body = await slackBody(request, ["retry"]);
@@ -612,6 +639,18 @@ const slackRoute = async (db: Db, request: Request, path: string[], setup: Setup
       if (body instanceof Response) return body;
       const problem = retryIcon(db, dot.name, setup.now());
       return problem ? error(409, problem) : view();
+    }
+    case "dm-check": {
+      const body = await slackBody(request, []);
+      if (body instanceof Response) return body;
+      const check = startDMCheck(db, dot.name, setup.now());
+      if (!check)
+        return error(
+          409,
+          "Connect the dot's app first. The check watches for its reply to your own DM.",
+        );
+      checks.set(dot.name, check);
+      return view();
     }
     default:
       return error(404, "Not found");
@@ -1962,6 +2001,8 @@ export const api = (
     refreshError?: string;
   }
   const pages = new Map<string, Cached>();
+  // Owner-started DM checks, by dot. A daemon restart forgets them.
+  const dmChecks = new Map<string, DMCheck>();
   let connection: Promise<Context.Context<OpenCode>> | undefined;
   const connected = () =>
     (connection ??= Effect.runPromise(
@@ -2093,7 +2134,7 @@ export const api = (
         );
       });
     if (path[0] === "dots" && path[2] === "slack")
-      return slackRoute(db, request, path, setup).catch(() => {
+      return slackRoute(db, request, path, setup, dmChecks).catch(() => {
         console.error("Slack setup: a request from the notch failed.");
         return error(
           500,

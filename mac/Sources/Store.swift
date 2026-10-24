@@ -294,6 +294,19 @@ struct MessageWindow: Equatable {
   var slackErrors: [String: String] = [:]
   var slackNotices: [String: String] = [:]
   var slackBusy: Set<String> = []
+  /// The guided install's state, in memory only, so quitting the notch forgets it: the one armed
+  /// clipboard pickup, whose access token is held for its refresh token, the app IDs the owner
+  /// marked as waiting for an admin's approval, and the token kinds saved per app ID.
+  var slackPickup: SlackPickup?
+  var slackHolding: String?
+  var slackApproval: Set<String> = []
+  var slackSaved: [String: Set<String>] = [:]
+  @ObservationIgnored var heldAccess: HeldAccess?
+  @ObservationIgnored var pickupGeneration = 0
+  /// The clipboard, the clock pickups time out by, and the browser. Tests replace them.
+  @ObservationIgnored var clipboard: any Clipboard = SystemClipboard()
+  @ObservationIgnored var uptime: @MainActor () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+  @ObservationIgnored var openSlackPage: @MainActor (URL) -> Void = { _ = NSWorkspace.shared.open($0) }
   /// The daemon's latest health report, and why the newest read failed, if it did.
   var health: HealthReport?
   var healthError: String?
@@ -489,6 +502,7 @@ struct MessageWindow: Equatable {
   /// Switches the selected dot between its chat, its Memory tab and its Instructions tab. An
   /// unsaved instructions draft stays for when the tab is shown again.
   func show(_ pane: Pane) {
+    if pane != .slack { endPickup(nil) }
     showingMemory = pane == .memory
     showingInstructions = pane == .instructions
     showingLibrary = pane == .library
@@ -508,6 +522,7 @@ struct MessageWindow: Equatable {
   /// A click on a dot's tab shows its chat, and its menu's Memory or Instructions shows that view,
   /// selecting the dot first either way. An unsaved instructions draft stays.
   func openDot(_ name: String, _ pane: Pane) {
+    if selected != name { endPickup(nil) }
     showingFeed = false
     selected = name
     show(pane)
@@ -1053,6 +1068,7 @@ struct MessageWindow: Equatable {
   }
 
   func openFeed() {
+    endPickup(nil)
     showingFeed = true
     feedSeen = feedNewest
     Task { await refreshFeed() }
@@ -1487,7 +1503,10 @@ struct MessageWindow: Equatable {
         case .said(let said): slackNotices[name] = said
         case .confirm: slackNotices[name] = "The changes changed again, so nothing was sent. Try again."
         }
-        if case .token = action { slackNotices[name] = "Saved in the Keychain. The daemon checks it within a minute." }
+        if case .token(let kind, _) = action {
+          slackNotices[name] = "Saved in the Keychain. The daemon checks it within a minute."
+          if let appID = slackStates[name]?.app?.appID { slackSaved[appID, default: []].insert(kind) }
+        }
       } catch {
         if case .lost = error as? APIError {
           slackNotices[name] = "No response from the open-dot daemon, so it may have been done. Nothing is sent again on its own."

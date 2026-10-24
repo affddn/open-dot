@@ -10,14 +10,15 @@ final class DotMenuTests: XCTestCase {
     store.instructions["jolyne"] = draft("mine")
 
     let menu = dotMenu(store, dot: "jolyne")
-    XCTAssertEqual(menu.items.map(\.title), ["Memory", "Instructions •", "Library", "Health", "Slack"], "Unsaved instructions are marked")
+    XCTAssertEqual(menu.items.map(\.title), ["Memory", "Instructions •", "Library", "Health", "Connectors"], "Unsaved instructions are marked")
+    XCTAssertEqual(try item(menu, "dot-menu-connectors").submenu?.items.map(\.title), ["Slack"], "Slack is under Connectors")
     XCTAssertEqual(try item(menu, "dot-menu-instructions").accessibilityLabel(), "Instructions, unsaved changes")
     try choose(menu, "dot-menu-instructions")
     await eventually { store.selected == "jolyne" && store.pane == .instructions }
     XCTAssertFalse(store.showingFeed)
 
     let other = dotMenu(store, dot: "jojo")
-    XCTAssertEqual(other.items.map(\.title), ["Memory", "Instructions", "Library", "Health", "Slack"])
+    XCTAssertEqual(other.items.map(\.title), ["Memory", "Instructions", "Library", "Health", "Connectors"])
     try choose(other, "dot-menu-memory")
     await eventually { store.selected == "jojo" && store.pane == .memory }
     XCTAssertEqual(store.instructions["jolyne"]?.draft, "mine", "Switching dots keeps the draft")
@@ -159,8 +160,16 @@ private func draft(_ text: String) -> InstructionsState {
   return state
 }
 
+/// The item with that identifier, in the menu or one of its submenus.
 @MainActor private func item(_ menu: NSMenu, _ id: String) throws -> NSMenuItem {
-  try XCTUnwrap(menu.items.first { $0.identifier?.rawValue == id })
+  func find(_ menu: NSMenu) -> NSMenuItem? {
+    for each in menu.items {
+      if each.identifier?.rawValue == id { return each }
+      if let submenu = each.submenu, let found = find(submenu) { return found }
+    }
+    return nil
+  }
+  return try XCTUnwrap(find(menu))
 }
 
 /// Sends the item's own action to its own target, as choosing it does.

@@ -89,7 +89,7 @@ final class SlackTests: XCTestCase {
     XCTAssertEqual(sent, [.connect(retry: true)])
   }
 
-  @MainActor func testSlackIsTheMenusFifthItemAndAnUpdateIsSentOnlyOnceApproved() async throws {
+  @MainActor func testSlackIsUnderConnectorsAndAnUpdateIsSentOnlyOnceApproved() async throws {
     let store = try isolatedStore()
     let view = SlackSetup(config: .init(state: "idle"), app: .init(state: "active", appID: "AJOJO01", manifestOutdated: true))
     var reads = 0
@@ -111,8 +111,12 @@ final class SlackTests: XCTestCase {
     }
 
     let menu = dotMenu(store, dot: "jolyne")
-    XCTAssertEqual(menu.items.last?.identifier?.rawValue, "dot-menu-slack")
-    let item = try XCTUnwrap(menu.items.last)
+    let connectors = try XCTUnwrap(menu.items.last)
+    XCTAssertEqual(connectors.identifier?.rawValue, "dot-menu-connectors")
+    XCTAssertEqual(connectors.title, "Connectors")
+    let item = try XCTUnwrap(connectors.submenu?.items.first)
+    XCTAssertEqual(item.identifier?.rawValue, "dot-menu-slack")
+    XCTAssertEqual(item.title, "Slack")
     XCTAssertTrue(NSApplication.shared.sendAction(try XCTUnwrap(item.action), to: item.target, from: item))
     await eventually { store.selected == "jolyne" && store.pane == .slack && store.slackStates["jolyne"] == view }
     XCTAssertFalse(store.showingHealth)
@@ -149,6 +153,325 @@ final class SlackTests: XCTestCase {
     await eventually { !store.slackBusy.contains("jolyne") && store.slackNotices["jolyne"]?.hasPrefix("Not confirmed") == true }
     XCTAssertEqual(store.slackNotices["jolyne"], "Not confirmed. \(unconfirmed)")
     XCTAssertEqual(sent.count, 5, "Never sent again on its own")
+  }
+}
+
+/// The guided install's clipboard pickup, approval mark and DM check, with a fake clipboard and
+/// clock, so no test reads or clears the system clipboard, opens a page or reaches Slack.
+final class SlackPickupTests: XCTestCase {
+  // Fake tokens of each form, built from parts so they don't read as real ones anywhere.
+  private let bot = ["xoxb", "1111111111", "2222222222222", String(repeating: "a", count: 24)].joined(separator: "-")
+  private let appToken = ["xapp", "1", "AJOJO01", "3333333333333", String(repeating: "b", count: 64)].joined(separator: "-")
+  private let access = "xoxe.xoxp-1-" + String(repeating: "c", count: 120)
+  private let refresh = "xoxe-1-" + String(repeating: "d", count: 120)
+
+  func testTokenFormsAreWholeAndAnchored() {
+    XCTAssertTrue(slackTokenMatches(.bot, bot, appID: nil))
+    XCTAssertTrue(slackTokenMatches(.app, appToken, appID: "AJOJO01"))
+    XCTAssertTrue(slackTokenMatches(.access, access, appID: nil))
+    XCTAssertTrue(slackTokenMatches(.refresh, refresh, appID: nil))
+    // Each form only for its own step.
+    XCTAssertFalse(slackTokenMatches(.bot, appToken, appID: nil))
+    XCTAssertFalse(slackTokenMatches(.access, refresh, appID: nil))
+    XCTAssertFalse(slackTokenMatches(.refresh, access, appID: nil))
+    XCTAssertFalse(slackTokenMatches(.app, appToken, appID: "AOTHER01"), "An app-level token of another app")
+    XCTAssertFalse(slackTokenMatches(.app, appToken, appID: nil))
+    for text in [
+      " \(bot)", "\(bot) ", "\(bot)\n", "x\(bot)", "\(bot)x!", "\(bot)\n\(bot)", "token: \(bot)",
+      "xoxb-test", "xoxb-1-2-short", "XOXB-1111111111-2222222222222-\(String(repeating: "a", count: 24))",
+      "xoxp-1111111111-2222222222222-\(String(repeating: "a", count: 24))",
+      "xoxb-1111111111-2222222222222-\(String(repeating: "a", count: 23))é", "",
+    ] {
+      XCTAssertFalse(slackTokenMatches(.bot, text, appID: nil), text)
+    }
+    XCTAssertFalse(slackTokenMatches(.refresh, "xoxe-1-" + String(repeating: "d", count: 1100), appID: nil), "Too long")
+  }
+
+  @MainActor func testOnlyACopyMadeAfterArmingIsTakenAndOnlyThatRevisionIsCleared() async throws {
+    let (store, clipboard, sent) = try armedStore()
+    clipboard.copy(bot)
+    clipboard.copy("an unrelated note")
+    store.slackPickup = nil
+    // Copies before arming never count.
+    store.armPickup("jojo", .bot)
+    store.checkPickup()
+    XCTAssertEqual(clipboard.reads, 0)
+    // An unrelated copy is read once, ignored and not kept.
+    clipboard.copy("dinner at 8")
+    store.checkPickup()
+    store.checkPickup()
+    XCTAssertEqual(clipboard.reads, 1)
+    XCTAssertEqual(store.slackPickup?.mismatched, true)
+    XCTAssertEqual(clipboard.contents, "dinner at 8", "Only a captured copy is cleared")
+    XCTAssertEqual(sent.actions, [])
+    // Only the exact whole token is captured, without trimming a larger clipboard value.
+    clipboard.copy("\(bot)\n")
+    store.checkPickup()
+    XCTAssertNotNil(store.slackPickup)
+    XCTAssertEqual(sent.actions, [])
+    clipboard.copy(bot)
+    store.checkPickup()
+    XCTAssertNil(store.slackPickup)
+    XCTAssertEqual(clipboard.cleared, [clipboard.revision])
+    XCTAssertNil(clipboard.contents)
+    await eventually { !store.slackBusy.contains("jojo") }
+    XCTAssertEqual(sent.actions, [.token(kind: "bot", token: bot)])
+    XCTAssertEqual(store.slackSaved["AJOJO01"], ["bot"])
+    XCTAssertFalse(slackSummary(try XCTUnwrap(store.slackStates["jojo"]), dot: "jojo").contains("Connected"), "Saved isn't connected")
+
+    // A clipboard revision changing during the read is not captured or cleared.
+    store.armPickup("jojo", .app)
+    clipboard.copy(appToken)
+    clipboard.afterRead = { clipboard.copy("copied later") }
+    store.checkPickup()
+    clipboard.afterRead = {}
+    XCTAssertEqual(clipboard.contents, "copied later")
+    XCTAssertNotNil(store.slackPickup)
+    XCTAssertEqual(sent.actions.count, 1)
+    clipboard.copy(appToken)
+    store.checkPickup()
+    await eventually { !store.slackBusy.contains("jojo") }
+    XCTAssertEqual(sent.actions.last, .token(kind: "app", token: appToken))
+    let reads = clipboard.reads
+    clipboard.copy(bot)
+    store.checkPickup()
+    XCTAssertEqual(clipboard.reads, reads)
+    XCTAssertEqual(sent.actions.count, 2)
+    for notice in store.slackNotices.values { XCTAssertFalse(notice.contains("xox") || notice.contains("xapp")) }
+  }
+
+  @MainActor func testAPickupEndsOnTimeoutLeavingTheViewAnotherDotANewAppOrStop() async throws {
+    let (store, clipboard, sent) = try armedStore()
+    sent.now += 119
+    store.checkPickup()
+    XCTAssertNotNil(store.slackPickup)
+    sent.now += 1
+    store.checkPickup()
+    XCTAssertNil(store.slackPickup)
+    XCTAssertTrue(store.slackNotices["jojo"]?.contains("within 2 minutes") == true)
+
+    let ends: [(String, @MainActor () -> Void)] = [
+      ("chat", { store.show(.chat) }),
+      ("feed", { store.openFeed() }),
+      ("other dot", { store.openDot("jolyne", .slack) }),
+      ("new app", { store.slackStates["jojo"] = created("AOTHER01") }),
+      ("stop", { store.stopPickup() }),
+      ("teardown", { store.endPickup(nil) }),
+    ]
+    for (why, end) in ends {
+      store.selected = "jojo"
+      store.showingFeed = false
+      store.show(.slack)
+      store.slackStates["jojo"] = created("AJOJO01")
+      store.armPickup("jojo", .bot)
+      XCTAssertEqual(store.slackPickup?.dot, "jojo", why)
+      end()
+      clipboard.copy(bot)
+      store.checkPickup()
+      XCTAssertNil(store.slackPickup, why)
+    }
+    XCTAssertEqual(clipboard.reads, 0, "A pickup that ended never reads")
+    XCTAssertEqual(sent.actions, [])
+
+    // One owner at a time: arming another dot's pickup replaces this one.
+    store.openDot("jojo", .slack)
+    store.slackStates["jojo"] = created("AJOJO01")
+    store.armPickup("jojo", .bot)
+    store.openDot("jolyne", .slack)
+    store.armPickup("jolyne", .access)
+    XCTAssertEqual(store.slackPickup?.dot, "jolyne")
+    XCTAssertEqual(store.slackPickup?.step, .access)
+  }
+
+  @MainActor func testAnAccessTokenIsHeldOnlyUntilItsRefreshTokenAndDroppedOtherwise() async throws {
+    let (store, clipboard, sent) = try armedStore()
+    store.endPickup(nil)
+
+    store.armPickup("jojo", .refresh)
+    XCTAssertNil(store.slackPickup, "The refresh step waits for the access token")
+    XCTAssertEqual(store.slackNotices["jojo"], "Pick up the access token first.")
+
+    store.armPickup("jojo", .access)
+    clipboard.copy(refresh)
+    store.checkPickup()
+    XCTAssertNotNil(store.slackPickup, "A refresh token isn't an access token")
+    clipboard.copy(access)
+    store.checkPickup()
+    XCTAssertEqual(store.slackHolding, "jojo")
+    XCTAssertNil(clipboard.contents)
+    XCTAssertEqual(sent.actions, [], "Nothing is saved until both are")
+    store.armPickup("jojo", .refresh)
+    clipboard.copy(refresh)
+    store.checkPickup()
+    XCTAssertNil(store.heldAccess)
+    XCTAssertNil(store.slackHolding)
+    await eventually { !store.slackBusy.contains("jojo") }
+    XCTAssertEqual(sent.actions, [.config(token: access, refreshToken: refresh)])
+
+    // Dropped when its two minutes pass, on leaving the view, or when another step is armed.
+    let drops: [(String, @MainActor () -> Void)] = [
+      ("expiry", { sent.now += 120 }),
+      ("navigation", { store.show(.chat) }),
+      ("another step", { store.armPickup("jojo", .bot) }),
+      ("stop", { store.stopPickup() }),
+    ]
+    for (why, drop) in drops {
+      store.show(.slack)
+      store.armPickup("jojo", .access)
+      clipboard.copy(access)
+      store.checkPickup()
+      XCTAssertEqual(store.slackHolding, "jojo", why)
+      drop()
+      store.checkPickup()
+      XCTAssertNil(store.heldAccess, why)
+      XCTAssertNil(store.slackHolding, why)
+      store.endPickup(nil)
+    }
+    XCTAssertEqual(sent.actions.count, 1, "Nothing more was saved")
+
+    store.show(.slack)
+    store.armPickup("jojo", .access)
+    clipboard.copy(access)
+    store.checkPickup()
+    sent.now += 120
+    store.armPickup("jojo", .refresh)
+    XCTAssertNil(store.heldAccess, "Rearming cannot extend an expired access-token hold")
+    XCTAssertNil(store.slackPickup)
+  }
+
+  @MainActor func testAFailedSaveIsReportedOnceAndAPickupWaitsWhileBusy() async throws {
+    let (store, clipboard, sent) = try armedStore()
+    sent.failure = APIError.server("Couldn't confirm the token was saved in the Keychain item open-dot-slack-jojo-bot. It may or may not be there: check the item, or save the token again.")
+    store.slackBusy.insert("jojo")
+    clipboard.copy(bot)
+    store.checkPickup()
+    XCTAssertEqual(clipboard.reads, 0, "Nothing is read while an action runs")
+    store.slackBusy.remove("jojo")
+    store.checkPickup()
+    await eventually { !store.slackBusy.contains("jojo") && store.slackNotices["jojo"] != nil }
+    XCTAssertTrue(store.slackNotices["jojo"]?.hasPrefix("Not confirmed.") == true)
+    XCTAssertFalse(store.slackNotices["jojo"]?.contains(bot) ?? true)
+    XCTAssertNil(store.slackSaved["AJOJO01"], "An unconfirmed save isn't shown as saved")
+    clipboard.copy(bot)
+    store.checkPickup()
+    XCTAssertEqual(sent.actions.count, 1, "Never sent again on its own")
+
+    sent.failure = APIError.lost
+    store.armPickup("jojo", .bot)
+    clipboard.copy(bot)
+    store.checkPickup()
+    await eventually { !store.slackBusy.contains("jojo") && store.slackNotices["jojo"]?.hasPrefix("No response") == true }
+    XCTAssertEqual(sent.actions.count, 2)
+  }
+
+  @MainActor func testWaitingForApprovalIsTheOwnersMarkAndResumeOpensTheSameApp() throws {
+    let (store, _, sent) = try armedStore()
+    var opened: [URL] = []
+    store.openSlackPage = { opened.append($0) }
+    store.markApproval("jojo", waiting: true)
+    XCTAssertEqual(store.slackApproval, ["AJOJO01"])
+    let setup = try XCTUnwrap(store.slackStates["jojo"])
+    XCTAssertEqual(setup.app?.state, "created", "A mark changes nothing about the app")
+    XCTAssertFalse(slackSummary(setup, dot: "jojo").contains("Connected"))
+    store.resumeInstall("jojo")
+    XCTAssertEqual(opened.map(\.absoluteString), ["https://api.slack.com/apps/AJOJO01/install-on-team"])
+    XCTAssertEqual(store.slackApproval, [])
+    XCTAssertEqual(sent.actions, [])
+    // Only Slack's app pages open.
+    store.openSlack(try XCTUnwrap(URL(string: "https://evil.com/apps/AJOJO01")))
+    store.openSlack(try XCTUnwrap(URL(string: "https://api.slack.com/apps")))
+    XCTAssertEqual(opened.count, 2)
+  }
+
+  @MainActor func testTheDMCheckSaysPendingUntilAConfirmedReplyAndTheFeedStaysApart() async throws {
+    let old = try API.decode(SlackSetup.self, Data(#"{"config":{"state":"idle"},"app":null}"#.utf8), log: { _ in })
+    XCTAssertNil(old.dmCheck)
+    XCTAssertNil(old.ownerFeed)
+    XCTAssertNil(old.config.saved)
+    XCTAssertTrue(slackNeedsConfig(old), "An older daemon's view shows the bootstrap")
+    XCTAssertFalse(slackNeedsConfig(created("AJOJO01")), "A later dot skips it")
+    XCTAssertTrue(slackNeedsConfig(SlackSetup(config: .init(state: "blocked", saved: true))))
+    XCTAssertTrue(slackDMCheckLine(nil, dot: "jojo").contains("not started"))
+    let pending = try API.decode(
+      SlackSetup.self,
+      Data(#"{"config":{"state":"idle","problem":null,"saved":true},"ownerFeed":{"items":0,"latestAt":null},"dmCheck":{"state":"pending","since":1800000000000,"dmAt":null},"app":{"state":"active","appID":"AJOJO01","botUser":"UBOT","manifestOutdated":false}}"#.utf8),
+      log: { _ in })
+    let line = slackDMCheckLine(pending.dmCheck, dot: "jojo")
+    XCTAssertTrue(line.contains("pending"))
+    XCTAssertFalse(line.contains("replied"))
+    XCTAssertTrue(line.contains("Nothing is sent") || line.contains("yourself"))
+    XCTAssertTrue(slackDMCheckLine(.init(state: "replied", since: 1, dmAt: 2), dot: "jojo").contains("replied"))
+    XCTAssertTrue(slackDMCheckLine(.init(state: "replied", since: 1, dmAt: nil), dot: "jojo").contains("pending"))
+    let feed = slackOwnerFeedLine(pending.ownerFeed)
+    XCTAssertTrue(feed.contains("separate from this bot"))
+    XCTAssertTrue(feed.contains("doesn't check its token"))
+    XCTAssertTrue(slackOwnerFeedLine(.init(items: 3, latestAt: 1_800_000_000_000)).contains("3 Slack items"))
+
+    let (store, _, sent) = try armedStore()
+    sent.view = pending
+    store.runSlack("jojo", .dmCheck)
+    await eventually { !store.slackBusy.contains("jojo") }
+    XCTAssertEqual(sent.actions, [.dmCheck])
+    XCTAssertEqual(store.slackStates["jojo"]?.dmCheck?.state, "pending")
+  }
+
+  /// A store showing jojo's Slack view of a created app, with a fake clipboard and a fake daemon
+  /// that records each action. A bot pickup is armed.
+  @MainActor private func armedStore() throws -> (Store, FakeClipboard, Sent) {
+    let store = try isolatedStore()
+    let clipboard = FakeClipboard()
+    let sent = Sent()
+    store.clipboard = clipboard
+    store.uptime = { sent.now }
+    store.openSlackPage = { _ in XCTFail("No page opens in this test") }
+    store.slackRead = { _ in sent.view }
+    store.slackSend = { _, action in
+      sent.actions.append(action)
+      if let failure = sent.failure { throw failure }
+      return .view(sent.view)
+    }
+    store.showingSlack = true
+    store.slackStates["jojo"] = created("AJOJO01")
+    store.armPickup("jojo", .bot)
+    XCTAssertEqual(store.slackPickup?.step, .bot)
+    return (store, clipboard, sent)
+  }
+}
+
+@MainActor private final class Sent {
+  var actions: [SlackAction] = []
+  var failure: Error?
+  var view = created("AJOJO01")
+  var now: TimeInterval = 1_000
+}
+
+private func created(_ appID: String) -> SlackSetup {
+  SlackSetup(config: .init(state: "idle", saved: true), app: .init(state: "created", appID: appID, manifestOutdated: false))
+}
+
+/// The clipboard in memory: each copy is a new revision, and a clear empties only the revision given.
+@MainActor private final class FakeClipboard: Clipboard {
+  var revision = 0
+  var contents: String?
+  var reads = 0
+  var cleared: [Int] = []
+  var afterRead: @MainActor () -> Void = {}
+
+  func copy(_ text: String) {
+    revision += 1
+    contents = text
+  }
+
+  func text() -> String? {
+    reads += 1
+    defer { afterRead() }
+    return contents
+  }
+
+  func clear(revision: Int) {
+    guard revision == self.revision else { return }
+    contents = nil
+    cleared.append(revision)
   }
 }
 

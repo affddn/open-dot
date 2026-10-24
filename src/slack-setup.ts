@@ -1,10 +1,10 @@
-import { and, eq, inArray, isNull, lt } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNotNull, isNull, like, lt } from "drizzle-orm";
 import { Option, Schema } from "effect";
 import { avatarPath, avatarRevision, readAvatar } from "./avatar";
 import type { Db } from "./db";
 import { findDot } from "./dots";
 import { type Fetch, output } from "./feed";
-import { type SlackApp, type SuggestedPrompt, slackApps, slackConfig } from "./schema";
+import { type SlackApp, type SuggestedPrompt, slackApps, slackConfig, slackEvents } from "./schema";
 import { isRecord, type Slack, slackCode, slackIDs } from "./slack";
 
 /** The Keychain item holding the owner's app configuration token pair, as JSON. */
@@ -1108,6 +1108,52 @@ export function configSaved(db: Db) {
     .set({ state: "idle", fromIat: 0, problem: null, updatedAt: now })
     .where(eq(slackConfig.id, 1))
     .run();
+}
+
+/** An owner-started DM check of a dot's app. The daemon keeps it in memory only. */
+export interface DMCheck {
+  readonly appID: string;
+  readonly owner: string;
+  readonly since: number;
+}
+
+/** Starts a DM check of an active app. It sends nothing and starts no turn. */
+export function startDMCheck(db: Db, dot: string, now: number): DMCheck | undefined {
+  const app = db.select().from(slackApps).where(eq(slackApps.dot, dot)).get();
+  if (app?.state !== "active" || !app.appID || !app.ownerID) return undefined;
+  return { appID: app.appID, owner: app.ownerID, since: now };
+}
+
+/**
+ * Where an owner-started DM check stands: "replied" only once open-dot saved a reply as posted,
+ * which it does after Slack confirmed it, to a DM the owner sent this same app since the check
+ * began. A queued or unknown reply stays "pending". It only reads open-dot's own database.
+ */
+export function dmCheckStatus(db: Db, dot: string, check: DMCheck | undefined) {
+  const app = db.select().from(slackApps).where(eq(slackApps.dot, dot)).get();
+  if (!check || app?.appID !== check.appID || app.ownerID !== check.owner) return null;
+  const replied = db
+    .select({ ts: slackEvents.ts })
+    .from(slackEvents)
+    .where(
+      and(
+        eq(slackEvents.app, check.appID),
+        eq(slackEvents.dot, dot),
+        eq(slackEvents.kind, "dm"),
+        eq(slackEvents.user, check.owner),
+        eq(slackEvents.state, "posted"),
+        isNotNull(slackEvents.replyTS),
+        like(slackEvents.channel, "D%"),
+        gte(slackEvents.createdAt, check.since),
+      ),
+    )
+    .orderBy(asc(slackEvents.createdAt))
+    .all()
+    .map(({ ts }) => (ts && /^\d{1,16}\.\d{1,6}$/.test(ts) ? Number(ts) * 1000 : -1))
+    .find((sentAt) => sentAt >= check.since);
+  return replied !== undefined
+    ? { state: "replied" as const, since: check.since, dmAt: replied }
+    : { state: "pending" as const, since: check.since, dmAt: null };
 }
 
 const save = (item: string) => `security add-generic-password -U -a "$USER" -s ${item} -w`;
