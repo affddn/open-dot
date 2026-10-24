@@ -17,8 +17,8 @@ final class LibraryTests: XCTestCase {
     store.chooseExport = { _ in XCTFail("Opening the Library shows no save panel"); return nil }
 
     let menu = dotMenu(store, dot: "jolyne")
-    XCTAssertEqual(menu.items.map { $0.identifier?.rawValue }, ["dot-menu-memory", "dot-menu-instructions", "dot-menu-library"])
-    let item = try XCTUnwrap(menu.items.last)
+    XCTAssertEqual(menu.items.map { $0.identifier?.rawValue }, ["dot-menu-memory", "dot-menu-instructions", "dot-menu-library", "dot-menu-health"])
+    let item = try XCTUnwrap(menu.items.first { $0.identifier?.rawValue == "dot-menu-library" })
     XCTAssertTrue(NSApplication.shared.sendAction(try XCTUnwrap(item.action), to: item.target, from: item))
     await eventually { store.selected == "jolyne" && store.pane == .library && store.libraries["jolyne"]?.rows.count == 1 }
     XCTAssertEqual(reads, ["jolyne latest"])

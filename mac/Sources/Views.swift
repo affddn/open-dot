@@ -102,6 +102,8 @@ struct ExpandedView: View {
           } else if store.showingLibrary {
             LibraryView(store: store, name: name)
               .id("library-\(name)")
+          } else if store.showingHealth {
+            HealthView(store: store)
           } else {
             Conversation(store: store, name: name)
               .id(name)
@@ -176,13 +178,14 @@ struct ExpandedView: View {
             .contentShape(Capsule())
           }
           .buttonStyle(.plain)
-          // A secondary click or Control-click opens its Memory, Instructions and Library menu.
+          // A secondary click or Control-click opens its Memory, Instructions, Library and Health menu.
           .background(MenuAnchor(id: "dot-menu-\(dot.name)", store: store) { _ in dotMenu(store, dot: dot.name) })
           .help(dot.purpose ?? "")
           .accessibilityIdentifier("dot-tab-\(dot.name)")
           .accessibilityAction(named: "Memory") { store.openDot(dot.name, .memory) }
           .accessibilityAction(named: unsaved ? "Instructions, unsaved changes" : "Instructions") { store.openDot(dot.name, .instructions) }
           .accessibilityAction(named: "Library") { store.openDot(dot.name, .library) }
+          .accessibilityAction(named: "Health") { store.openDot(dot.name, .health) }
         }
       }
     }
@@ -214,6 +217,7 @@ struct ExpandedView: View {
     switch store.pane {
     case .memory: "Memory"
     case .library: "Library"
+    case .health: "Health"
     default: "Instructions"
     }
   }
@@ -1818,8 +1822,9 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
   return menu
 }
 
-/// A dot tab's menu. Memory, Instructions and Library each select the dot first, and Instructions
-/// is marked while the dot has unsaved instructions.
+/// A dot tab's menu. Memory, Instructions, Library and Health each select the dot first, and
+/// Instructions is marked while the dot has unsaved instructions. Health isn't the dot's own: it's
+/// the daemon's whole report, reached from here so the notch needs no new navigation.
 @MainActor func dotMenu(_ store: Store, dot: String) -> NSMenu {
   let menu = NSMenu()
   menu.autoenablesItems = false
@@ -1834,6 +1839,7 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
   }
   menu.addItem(instructions)
   menu.addItem(action("Library", symbol: "books.vertical", id: "dot-menu-library") { store.openDot(dot, .library) })
+  menu.addItem(action("Health", symbol: "stethoscope", id: "dot-menu-health") { store.openDot(dot, .health) })
   return menu
 }
 

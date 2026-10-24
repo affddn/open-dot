@@ -3,10 +3,18 @@ import { randomBytes } from "node:crypto";
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { Effect, Schedule } from "effect";
-import { api } from "./api";
+import { api, spawnRun } from "./api";
 import { avatarPath, setAvatar } from "./avatar";
 import { daemonLoops } from "./daemon";
 import { backupDatabase, claimDaemon, openDatabase, restoreDatabase } from "./db";
+import {
+  daemonHealth,
+  databaseSampler,
+  describeReport,
+  doctor,
+  type Observations,
+  observe,
+} from "./doctor";
 import { createDot, ensureSession, findDot, listDots, pickDot } from "./dots";
 import { collect, github, linear } from "./feed";
 import { apiPath, databasePath } from "./home";
@@ -48,6 +56,7 @@ const usage = `Usage:
   open-dot avatar <name> <file>      Set a dot's avatar from a square PNG or JPEG
   open-dot instructions <name>       Print the path of a dot's AGENTS.md, to edit it in an editor
   open-dot daemon                    Deliver reminders and run workers until stopped
+  open-dot doctor [--json]           Check setup and runtime health, read only; starts nothing
   open-dot backup                    Back up the database without migrating it
   open-dot restore <file>            Restore a backup while the daemon is stopped
   open-dot slack config              Save your Slack app configuration tokens, typed without echo
@@ -68,6 +77,24 @@ const usage = `Usage:
   open-dot watch revoke <id>         End a supervision or decline a request`;
 
 const [command, ...args] = process.argv.slice(2);
+// Before anything opens the database, which would migrate it: doctor only reads.
+if (command === "doctor") {
+  const json = args.length === 1 && args[0] === "--json";
+  if (args.length > (json ? 1 : 0)) {
+    console.error(usage);
+    process.exit(1);
+  }
+  try {
+    const report = await doctor();
+    const text = json ? JSON.stringify(report, null, 2) : describeReport(report);
+    // Written in full before exiting, even into a pipe.
+    await Bun.write(Bun.stdout, `${text}\n`);
+    process.exit(report.checks.some((check) => check.status === "failed") ? 1 : 0);
+  } catch {
+    console.error("The health check itself failed. Nothing was changed.");
+    process.exit(2);
+  }
+}
 if (command === "backup" || command === "restore") {
   try {
     if (command === "backup" && args.length === 0) console.log(backupDatabase(databasePath()));
@@ -357,7 +384,13 @@ const list = Effect.sync(() => {
 
 /** Serves the notch app's API on a fresh port and token, then saves both where only the owner can read them. */
 const apiToken = randomBytes(32).toString("hex");
-const notchAPI = api(db, apiToken, OpenCode.layer);
+/** Each feed source's latest finished pass, for GET /health. Kept in memory only. */
+const feedPasses: Observations = new Map();
+/** GET /health reads only this pinned sample, which the daemon's ticks take, never the database. */
+const databaseSample = databaseSampler(db.$client);
+const notchAPI = api(db, apiToken, OpenCode.layer, spawnRun, Date.now, () =>
+  daemonHealth(databaseSample.current(), feedPasses),
+);
 const serve = Effect.sync(() => {
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -404,16 +437,24 @@ const tellOutsiders = logged("Slack notes", outsiders);
 const gather = Effect.promise(() =>
   Promise.all(
     sources.map((source) =>
-      collect(db, source, Date.now()).catch((error: unknown) =>
-        console.error(
-          `Feed from ${source.name}: ${error instanceof Error ? error.message : String(error)}`,
-        ),
+      collect(db, source, Date.now()).then(
+        (polled) =>
+          observe(feedPasses, source.name, polled ? "polled" : "not_configured", Date.now()),
+        (error: unknown) => {
+          observe(feedPasses, source.name, "failed", Date.now());
+          console.error(
+            `Feed from ${source.name}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        },
       ),
     ),
   ),
 );
 
-const daemon = Effect.sync(() => console.log(`open-dot daemon watching ${databasePath()}`)).pipe(
+const daemon = Effect.sync(() => {
+  console.log(`open-dot daemon watching ${databasePath()}`);
+  databaseSample.tick();
+}).pipe(
   Effect.andThen(serve),
   Effect.andThen(
     Effect.all(
@@ -422,6 +463,7 @@ const daemon = Effect.sync(() => console.log(`open-dot daemon watching ${databas
         Effect.repeat(
           Effect.sync(() => {
             void notchAPI.refresh();
+            databaseSample.tick();
           }),
           Schedule.spaced("1 second"),
         ),

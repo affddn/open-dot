@@ -6,6 +6,7 @@ import { type Context, Effect, Layer, Result } from "effect";
 import { avatarRevision, readAvatar } from "./avatar";
 import { stopWorker } from "./daemon";
 import type { Db } from "./db";
+import type { HealthReport } from "./doctor";
 import { findDot, listDots } from "./dots";
 import { dismiss, dismissAll, handedOffFeed, unreadFeed } from "./feed";
 import {
@@ -1641,6 +1642,18 @@ const requestRoute = (db: Db, request: Request, path: string[], run: Run): Promi
   return openSession({ ...row, label: `request #${row.id}` }, run, process.env);
 };
 
+/** `GET /health`: the same read-only report as `open-dot doctor`, from inside the daemon. */
+const healthRoute = (request: Request, health: (() => Promise<HealthReport>) | undefined) =>
+  request.method !== "GET" || !health
+    ? Promise.resolve(error(404, "Not found"))
+    : health().then(
+        (report) => Response.json(report, { headers: { "cache-control": "no-store" } }),
+        () => {
+          console.error("Health: the check itself failed.");
+          return error(500, "Couldn't run the health check.");
+        },
+      );
+
 /**
  * The daemon's local API for the notch app. Every request needs the token, which only the owner's
  * account can read from api.json, so other local users and web pages can't call it.
@@ -1652,6 +1665,7 @@ export const api = (
   layer: Layer.Layer<OpenCode, OpenCodeError>,
   run: Run = spawnRun,
   now: () => number = Date.now,
+  health?: () => Promise<HealthReport>,
 ) => {
   interface Cached {
     sessionID: string;
@@ -1785,6 +1799,7 @@ export const api = (
     if (request.headers.get("authorization") !== `Bearer ${token}`)
       return Promise.resolve(error(401, "Unauthorized"));
     const path = new URL(request.url).pathname.split("/").filter(Boolean);
+    if (path[0] === "health" && path.length === 1) return healthRoute(request, health);
     if (path[0] === "feed") return Promise.resolve(feedRoute(db, request, path.slice(1)));
     if (path[0] === "workers") return workerRoute(db, request, path.slice(1), layer, run);
     if (path[0] === "requests") return requestRoute(db, request, path.slice(1), run);

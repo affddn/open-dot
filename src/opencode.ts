@@ -129,6 +129,25 @@ const ended = (
 
 const failed = (message: string) => (cause: unknown) => new OpenCodeError({ message, cause });
 
+/** A service `Service.discover()` found, which it only reads and never starts. */
+export type Endpoint = NonNullable<Awaited<ReturnType<typeof Service.discover>>>;
+
+/** The public client for a discovered service, sending its auth header with every request. */
+export const connect = ({ url, auth }: Endpoint) =>
+  Client.make({ baseUrl: url }).pipe(
+    Effect.provide(
+      Layer.effect(
+        HttpClient.HttpClient,
+        Effect.map(
+          HttpClient.HttpClient,
+          HttpClient.mapRequest(
+            HttpClientRequest.setHeaders(Service.headers(auth ? { url, auth } : { url }) ?? {}),
+          ),
+        ),
+      ).pipe(Layer.provide(FetchHttpClient.layer)),
+    ),
+  );
+
 export interface SessionInput {
   readonly id: string;
   readonly directory: string;
@@ -476,19 +495,7 @@ export class OpenCode extends Context.Service<
           message: "OpenCode is not running. Start OpenCode, then try again.",
         });
       }
-      const { url, auth } = endpoint;
-      const headers = Service.headers(auth ? { url, auth } : { url }) ?? {};
-      const client = yield* Client.make({ baseUrl: url }).pipe(
-        Effect.provide(
-          Layer.effect(
-            HttpClient.HttpClient,
-            Effect.map(
-              HttpClient.HttpClient,
-              HttpClient.mapRequest(HttpClientRequest.setHeaders(headers)),
-            ),
-          ).pipe(Layer.provide(FetchHttpClient.layer)),
-        ),
-      );
+      const client = yield* connect(endpoint);
 
       /**
        * Visits a session's items of one type newest first, page by page, until `visit` returns

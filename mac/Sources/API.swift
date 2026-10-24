@@ -1009,6 +1009,11 @@ enum APIError: Error {
     try await send("GET", "/dots/\(escape(dot))/library/\(id)/content")
   }
 
+  /// The daemon's health report, the same as `open-dot doctor --json`. It only reads.
+  func health() async throws -> HealthReport {
+    try decode(HealthReport.self, await send("GET", "/health"))
+  }
+
   /// A page of a responsibility's scheduled runs, newest first, older than `before` if given. The daemon only reads.
   func runs(_ key: RunListKey, before: Int? = nil) async throws -> RunPage {
     let query = before.map { "?before=\($0)" } ?? ""

@@ -226,6 +226,43 @@ Load it the same way. It restarts the app if it crashes, but not after you quit 
 
 open-dot keeps its data in `~/.opendot`. Set `OPEN_DOT_HOME` to use another directory.
 
+## Check health
+
+When a dot seems quiet, run:
+
+```sh
+open-dot doctor          # one line per check, with a next step
+open-dot doctor --json   # the same report for scripts
+```
+
+It reports the daemon (through `api.json`), the database schema, OpenCode, each dot's saved
+session, queued and unknown sends, each feed source's last pass, and Slack setup. Each check is
+`healthy`, `stale`, `failed`, `unknown`, `not_configured` or `disabled`. It exits 1 when any check
+failed. The notch shows the same report under Health in a dot tab's right-click menu.
+
+doctor only reads, and never opens the database file with SQLite. When no connection holds the
+database (no `-wal`, `-shm` or `-journal` file beside it), it copies the file into memory and reads
+the copy; a file that changes while it's copied is reported as unknown. While the daemon or
+OpenCode's plugin holds the database, doctor doesn't read it. The running daemon instead reports
+the snapshot it takes itself, at most every 15 seconds from a tick it already runs, never because
+someone asked. The report's `sampledAt` says when its database checks were sampled, apart from
+`checkedAt`. When the daemon has no snapshot yet, its last one is over a minute old, or its latest
+attempt failed, `sampleUnavailable` says `missing`, `expired` or `failed` instead, and every
+database check is unknown with no counts; a failure hides the older snapshot until a new one
+succeeds. With the daemon stopped and the database held, the database checks read as unknown. No table is read unless the migration ledger matches
+this version exactly. It never starts, stops or reloads the daemon or OpenCode: it finds OpenCode
+with `Service.discover()` and makes only public reads, all within three seconds, after which no
+read starts; it waits five seconds for the daemon's report, whose own OpenCode reads end within
+three. It reads no Keychain item and sends no message.
+Its words are fixed text with counts: no names, tokens, paths, session or Slack IDs, message text
+or raw errors, and none of the daemon's own words. `open-dot slack status` still gives Slack's full
+explanation; a Slack app saved as active is reported as unknown, since a saved state isn't a
+working connection.
+
+Feed passes are known only to a running daemon, in memory, so they read as unknown while it's
+stopped and until its first pass after a start. A send whose outcome was lost stays unknown until
+open-dot looks it up by ID; doctor sends nothing.
+
 ## Back up and restore
 
 Before applying pending migrations, every database opener (plugin, daemon or CLI) makes a

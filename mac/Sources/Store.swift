@@ -282,10 +282,14 @@ struct MessageWindow: Equatable {
   }
   var feedStatus: String?
   var showingFeed = false
-  /// The selected dot's Memory, Instructions or Library tab is open instead of its chat. At most one is.
+  /// The selected dot's Memory, Instructions, Library or Health tab is open instead of its chat. At most one is.
   var showingMemory = false
   var showingInstructions = false
   var showingLibrary = false
+  var showingHealth = false
+  /// The daemon's latest health report, and why the newest read failed, if it did.
+  var health: HealthReport?
+  var healthError: String?
   /// Each dot's Library pages, deliverables being exported, and what each export last said.
   var libraries: [String: LibraryState] = [:]
   var exportingArtifacts: Set<Int> = []
@@ -348,6 +352,9 @@ struct MessageWindow: Equatable {
   @ObservationIgnored var libraryPage: @MainActor (String, Int?) async throws -> ArtifactPage = { _, _ in throw APIError.unreachable }
   @ObservationIgnored var artifactBytes: @MainActor (String, Int) async throws -> Data = { _, _ in throw APIError.unreachable }
   @ObservationIgnored var chooseExport: @MainActor (String) -> URL? = { _ in nil }
+  /// The health read. Tests replace it.
+  @ObservationIgnored var healthReport: @MainActor () async throws -> HealthReport = { throw APIError.unreachable }
+  @ObservationIgnored private var healthReads = 0
   private var seen: [String: Double] = [:]
   private var newest: [String: Double] = [:]
   private var feedSeen: Double?
@@ -364,6 +371,7 @@ struct MessageWindow: Equatable {
     libraryPage = { try await api.library($0, before: $1) }
     artifactBytes = { try await api.artifactContent($0, $1) }
     chooseExport = { [unowned self] name in savePanel(name, self) }
+    healthReport = { try await api.health() }
   }
 
   var showsIndicator: Bool { dotsBusy || dotsUnread || feedUnread }
@@ -430,6 +438,7 @@ struct MessageWindow: Equatable {
     if let name = selected, showingMemory { Task { await refreshMemory(name) } }
     if let name = selected, showingInstructions { loadInstructions(name, discarding: false) }
     if let name = selected, showingLibrary { Task { await refreshLibrary(name) } }
+    if selected != nil, showingHealth { Task { await refreshHealth() } }
   }
 
   func select(_ name: String) {
@@ -442,9 +451,11 @@ struct MessageWindow: Equatable {
     if showingLibrary { Task { await refreshLibrary(name) } }
   }
 
-  enum Pane: Hashable { case chat, memory, instructions, library }
+  enum Pane: Hashable { case chat, memory, instructions, library, health }
 
-  var pane: Pane { showingInstructions ? .instructions : showingMemory ? .memory : showingLibrary ? .library : .chat }
+  var pane: Pane {
+    showingInstructions ? .instructions : showingMemory ? .memory : showingLibrary ? .library : showingHealth ? .health : .chat
+  }
 
   /// Switches the selected dot between its chat, its Memory tab and its Instructions tab. An
   /// unsaved instructions draft stays for when the tab is shown again.
@@ -452,12 +463,14 @@ struct MessageWindow: Equatable {
     showingMemory = pane == .memory
     showingInstructions = pane == .instructions
     showingLibrary = pane == .library
+    showingHealth = pane == .health
     guard let name = selected else { return }
     switch pane {
     case .chat: seen[name] = newest[name]
     case .memory: Task { await refreshMemory(name) }
     case .instructions: loadInstructions(name, discarding: false)
     case .library: Task { await refreshLibrary(name) }
+    case .health: Task { await refreshHealth() }
     }
   }
 
@@ -467,7 +480,7 @@ struct MessageWindow: Equatable {
     showingFeed = false
     selected = name
     show(pane)
-    Task { await refreshMessages(name) }
+    if pane != .health { Task { await refreshMessages(name) } }
   }
 
   /// Escape goes back to the chat from Memory or Instructions, keeping any draft, and Command-1, 2
@@ -745,6 +758,7 @@ struct MessageWindow: Equatable {
     showingMemory = false
     showingInstructions = false
     showingLibrary = false
+    showingHealth = false
     select(first)
   }
 
@@ -1359,6 +1373,22 @@ struct MessageWindow: Equatable {
         shown = .failed("Not shown. \(Self.describe(error)) No automatic retry.")
       }
       runEvidence.finish(key, generation, shown)
+    }
+  }
+
+  /// Reads the daemon's health report. Only the newest read's answer is shown, and a failure keeps
+  /// the last report with the error above it. It only reads: nothing is repaired or restarted.
+  func refreshHealth() async {
+    healthReads += 1
+    let read = healthReads
+    do {
+      let report = try await healthReport()
+      guard read == healthReads else { return }
+      health = report
+      healthError = nil
+    } catch {
+      guard read == healthReads else { return }
+      healthError = "Couldn't run the health check. \(Self.describe(error))"
     }
   }
 

@@ -25,11 +25,11 @@ export type Source = {
  * Saves the source's unread items, and marks what the owner dismissed as read at its source.
  * An item the source no longer lists was read there or is too old, so it leaves the feed until
  * the source lists it again. A dismissed or handed-off item comes back only with new activity, and
- * one handed off keeps the dots it went to.
+ * one handed off keeps the dots it went to. False when the source isn't set up, so it read nothing.
  */
 export async function collect(db: Db, source: Source, now: number) {
   const items = await source.unread(now - window);
-  if (!items) return;
+  if (!items) return false;
   const listed = new Map(items.map((item) => [item.sourceID, item.updatedAt]));
   const dismissed = db
     .select()
@@ -76,6 +76,7 @@ export async function collect(db: Db, source: Source, now: number) {
       )
       .run();
   });
+  return true;
 }
 
 /** Unread items, oldest first, so the newest sit at the bottom like a chat. */
