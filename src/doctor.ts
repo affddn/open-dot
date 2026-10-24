@@ -649,20 +649,84 @@ const opencodeCheck = (found: OpenCodeState): HealthCheck => {
 
 // open-dot's database, read only.
 
-let migrations: readonly { readonly when: number; readonly hash: string }[] | undefined;
+let migrations:
+  | readonly { readonly when: number; readonly hash: string; readonly sql: string }[]
+  | undefined;
 
 /** Each migration this code knows, hashed as drizzle's migrator records it in the ledger. */
 const known = () =>
-  (migrations ??= journal.entries.map((entry) => ({
-    when: entry.when,
-    hash: createHash("sha256")
-      .update(readFileSync(join(import.meta.dir, "..", "drizzle", `${entry.tag}.sql`), "utf8"))
-      .digest("hex"),
-  })));
+  (migrations ??= journal.entries.map((entry) => {
+    const sql = readFileSync(join(import.meta.dir, "..", "drizzle", `${entry.tag}.sql`), "utf8");
+    return { when: entry.when, hash: createHash("sha256").update(sql).digest("hex"), sql };
+  }));
 
 /**
- * Compares the migration ledger with this code's migrations, exactly, by time and hash. Only a
- * matching ledger lets the other checks read tables.
+ * 0015's ledger hash from its unfinished draft, which lacked `slack_threads.rescan`; databases it
+ * migrated had that column added at the end afterwards (#47). Only this hash, only at 0015's time,
+ * and only while 0015 is its finished file and the database's `slack_threads` matches that file.
+ */
+const draft0015 = {
+  when: 1792600000000,
+  hash: "fe72d1f09d8da72982f3bd71ef974d1d3640c5fbdfd22614c280bfe274d4efad",
+  finished: "a10db035d7dd0ae04c0d55fa3f215cb13ddfdf27d835d9c111abc782bbc577fc",
+};
+
+/**
+ * A `CREATE TABLE slack_threads` statement's column definitions and constraints, whitespace,
+ * keyword case and the quotes around each column's name aside, sorted so column order doesn't
+ * matter. Undefined for anything else, a table option such as STRICT included.
+ */
+const threadDefinitions = (sql: string) =>
+  /^[\t\n\r\x20-\x7e]*$/.test(sql)
+    ? /^\s*CREATE\s+TABLE\s+[`"]?slack_threads[`"]?\s*\(([\s\S]*)\)\s*;?\s*$/i
+        .exec(sql)?.[1]
+        ?.split(",")
+        .map((definition) =>
+          definition
+            .trim()
+            .replace(/\s+/g, " ")
+            .replace(/^[`"](\w+)[`"] /, "$1 ")
+            .toLowerCase(),
+        )
+        .toSorted()
+    : undefined;
+
+/**
+ * Whether `slack_threads` has exactly the columns and constraints the finished 0015 creates, and
+ * nothing else on it: only its primary key's own index, no other index or trigger.
+ */
+function threadsFinished(sqlite: Database, finished: string): boolean {
+  const statement = finished
+    .split("--> statement-breakpoint")
+    .find((part) => part.includes("CREATE TABLE `slack_threads`"));
+  const expected = statement && threadDefinitions(statement);
+  const objects = sqlite
+    .query<{ type: string; name: string; sql: string | null }, []>(
+      "SELECT type, name, sql FROM sqlite_master WHERE tbl_name = 'slack_threads' COLLATE NOCASE",
+    )
+    .all();
+  const table = objects.find(
+    (object) => object.type === "table" && object.name === "slack_threads",
+  );
+  const actual = table?.sql ? threadDefinitions(table.sql) : undefined;
+  return (
+    !!expected &&
+    !!actual &&
+    objects.length === 2 &&
+    objects.some(
+      (object) =>
+        object.type === "index" &&
+        object.name === "sqlite_autoindex_slack_threads_1" &&
+        object.sql === null,
+    ) &&
+    JSON.stringify(actual) === JSON.stringify(expected)
+  );
+}
+
+/**
+ * Compares the migration ledger with this code's migrations, exactly, by time and hash, except
+ * 0015's draft hash over a matching `slack_threads`. Only a matching ledger lets the other checks
+ * read tables.
  */
 export function schemaCheck(sqlite: Database): HealthCheck {
   const expected = known();
@@ -683,7 +747,18 @@ export function schemaCheck(sqlite: Database): HealthCheck {
         .all()
         .map((row) => ({ hash: String(row.hash), when: Number(row.created_at) }))
     : [];
-  const byTime = new Map(expected.map((migration) => [migration.when, migration.hash]));
+  const byTime = new Map(expected.map((migration) => [migration.when, migration]));
+  const matches = (row: { hash: string; when: number }) => {
+    const migration = byTime.get(row.when);
+    if (!migration) return false;
+    if (migration.hash === row.hash) return true;
+    return (
+      row.when === draft0015.when &&
+      row.hash === draft0015.hash &&
+      migration.hash === draft0015.finished &&
+      threadsFinished(sqlite, migration.sql)
+    );
+  };
   const times = new Set(applied.map((row) => row.when));
   const newest = Math.max(0, ...applied.map((row) => row.when));
   const missing = expected.filter((migration) => !times.has(migration.when));
@@ -692,8 +767,7 @@ export function schemaCheck(sqlite: Database): HealthCheck {
     known: expected.length,
     pending: missing.filter((migration) => migration.when > newest).length,
     unknown: applied.filter((row) => !byTime.has(row.when)).length,
-    changed: applied.filter((row) => byTime.has(row.when) && byTime.get(row.when) !== row.hash)
-      .length,
+    changed: applied.filter((row) => byTime.has(row.when) && !matches(row)).length,
     skipped: missing.filter((migration) => migration.when <= newest).length,
   };
   const status =

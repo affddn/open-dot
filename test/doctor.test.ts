@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Service } from "@opencode/client/service";
+import journal from "../drizzle/meta/_journal.json";
 import { api } from "../src/api";
 import { type Db, openDatabase } from "../src/db";
 import {
@@ -22,6 +23,7 @@ import {
   openCodeProbe,
   type OpenCodeProbe,
   parseReport,
+  schemaCheck,
 } from "../src/doctor";
 import {
   dots,
@@ -889,6 +891,172 @@ test("pending migrations are counted exactly and never applied", async () => {
     counts: { pending: 1, applied: 32, known: 33 },
   });
   expect(files()).toEqual(before);
+});
+
+const when0015 = 1792600000000;
+const draftHash = "fe72d1f09d8da72982f3bd71ef974d1d3640c5fbdfd22614c280bfe274d4efad";
+const rescan = "`rescan` integer DEFAULT false NOT NULL";
+
+/**
+ * Remakes `slack_threads` as 0015's draft created it, then adds `rescan` (or another definition)
+ * at the end, as the live database had it, and records the draft's hash for 0015.
+ */
+const draftThreads = (db: Db, ...added: string[]) => {
+  db.$client.run("DROP TABLE slack_threads");
+  db.$client.run(`CREATE TABLE \`slack_threads\` (
+  \`key\` text PRIMARY KEY NOT NULL,
+  \`route\` text NOT NULL,
+  \`parent\` text,
+  \`oldest\` text NOT NULL,
+  \`newest\` text NOT NULL,
+  \`cursor\` text DEFAULT '' NOT NULL,
+  \`active_at\` integer NOT NULL,
+  \`polled_at\` integer DEFAULT 0 NOT NULL
+);`);
+  for (const definition of added)
+    db.$client.run(`ALTER TABLE \`slack_threads\` ADD ${definition};`);
+  db.$client.run(
+    `UPDATE __drizzle_migrations SET hash = '${draftHash}' WHERE created_at = ${when0015}`,
+  );
+};
+
+/** schemaCheck on a fresh migrated database after `edit`. */
+const schemaAfter = (edit: (db: Db) => void) => {
+  const db = openDatabase(":memory:");
+  try {
+    edit(db);
+    return schemaCheck(db.$client);
+  } finally {
+    db.$client.close();
+  }
+};
+
+test("0015's draft hash passes over its real reordered slack_threads, and the other checks read", async () => {
+  seed((db) => draftThreads(db, rescan));
+  const columns = fixture?.$client
+    .query<{ name: string }, []>("SELECT name FROM pragma_table_info('slack_threads')")
+    .all()
+    .map((column) => column.name);
+  expect(columns?.at(-1)).toBe("rescan");
+  expect(columns?.indexOf("rescan")).toBeGreaterThan(columns?.indexOf("active_at") ?? Infinity);
+
+  const before = files();
+  const sessions = probe();
+  const report = await run({ opencode: sessions.run });
+  expect(check(report, "database")).toMatchObject({
+    status: "healthy",
+    counts: { changed: 0, unknown: 0, skipped: 0, pending: 0, applied: 33, known: 33 },
+  });
+  expect(check(report, "sessions").status).toBe("healthy");
+  expect(check(report, "deliveries").status).toBe("healthy");
+  expect(sessions.calls).toEqual([["ses_jojoSECRET", "ses_jolyneSECRET"]]);
+  expect(files()).toEqual(before);
+});
+
+test("0015's draft hash fails over any other slack_threads, and other hashes never pass", () => {
+  const changed = { status: "failed", counts: { changed: 1, unknown: 0, skipped: 0 } };
+  const when0014 = journal.entries.find((entry) => entry.tag.startsWith("0014"))?.when;
+  expect(when0014).toBeNumber();
+  const cases: [string, (db: Db) => void][] = [
+    ["rescan never added", (db) => draftThreads(db)],
+    ["another default", (db) => draftThreads(db, "`rescan` integer DEFAULT true NOT NULL")],
+    ["nullable", (db) => draftThreads(db, "`rescan` integer DEFAULT false")],
+    ["another type", (db) => draftThreads(db, "`rescan` text DEFAULT false NOT NULL")],
+    [
+      "a check",
+      (db) =>
+        draftThreads(db, "`rescan` integer DEFAULT false NOT NULL CHECK (`rescan` IN (0, 1))"),
+    ],
+    ["an extra column", (db) => draftThreads(db, rescan, "`extra` text")],
+    [
+      "non-SQL whitespace in a type is not a constraint",
+      (db) => {
+        draftThreads(db, rescan);
+        const table = db.$client
+          .query<{ sql: string }, []>("SELECT sql FROM sqlite_master WHERE name = 'slack_threads'")
+          .get();
+        if (!table) throw new Error("Missing fixture table");
+        db.$client.run("DROP TABLE slack_threads");
+        db.$client.run(
+          table.sql.replace("`route` text NOT NULL", "`route` text\u00a0NOT\u00a0NULL"),
+        );
+        expect(
+          db.$client
+            .query<{ notnull: number }, []>(
+              "SELECT \"notnull\" FROM pragma_table_info('slack_threads') WHERE name = 'route'",
+            )
+            .get()?.notnull,
+        ).toBe(0);
+      },
+    ],
+    [
+      "an extra index",
+      (db) => {
+        draftThreads(db, rescan);
+        db.$client.run("CREATE INDEX threads_route ON slack_threads (route)");
+      },
+    ],
+    [
+      "a trigger",
+      (db) => {
+        draftThreads(db, rescan);
+        db.$client.run(
+          "CREATE TRIGGER threads_touch AFTER INSERT ON slack_threads BEGIN SELECT 1; END",
+        );
+      },
+    ],
+    [
+      "another hash at 0015",
+      (db) => {
+        draftThreads(db, rescan);
+        db.$client.run(
+          `UPDATE __drizzle_migrations SET hash = '${"f".repeat(64)}' WHERE created_at = ${when0015}`,
+        );
+      },
+    ],
+    [
+      "the draft hash at 0014",
+      (db) =>
+        db.$client.run(
+          `UPDATE __drizzle_migrations SET hash = '${draftHash}' WHERE created_at = ${when0014}`,
+        ),
+    ],
+  ];
+  for (const [name, edit] of cases)
+    expect({ name, ...schemaAfter(edit) }).toMatchObject({ name, ...changed });
+});
+
+test("with 0015's draft accepted, duplicate, unknown, skipped and pending migrations still count", () => {
+  const newest = Math.max(...journal.entries.map((entry) => entry.when));
+  const when0014 = journal.entries.find((entry) => entry.tag.startsWith("0014"))?.when;
+  expect(
+    schemaAfter((db) => {
+      draftThreads(db, rescan);
+      db.$client.run(
+        `INSERT INTO __drizzle_migrations (hash, created_at) VALUES ('${draftHash}', ${when0015})`,
+      );
+    }),
+  ).toMatchObject({ status: "failed", counts: { changed: 0, applied: 34 } });
+  expect(
+    schemaAfter((db) => {
+      draftThreads(db, rescan);
+      db.$client.run(
+        "INSERT INTO __drizzle_migrations (hash, created_at) VALUES ('future', 9999999999999)",
+      );
+    }),
+  ).toMatchObject({ status: "failed", counts: { unknown: 1, changed: 0 } });
+  expect(
+    schemaAfter((db) => {
+      draftThreads(db, rescan);
+      db.$client.run(`DELETE FROM __drizzle_migrations WHERE created_at = ${when0014}`);
+    }),
+  ).toMatchObject({ status: "failed", counts: { skipped: 1, changed: 0 } });
+  expect(
+    schemaAfter((db) => {
+      draftThreads(db, rescan);
+      db.$client.run(`DELETE FROM __drizzle_migrations WHERE created_at = ${newest}`);
+    }),
+  ).toMatchObject({ status: "stale", counts: { pending: 1, changed: 0 } });
 });
 
 test("every probe is bounded", async () => {
