@@ -2,12 +2,12 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
-import { openDatabase } from "../src/db";
+import { openDatabase, restoreDatabase } from "../src/db";
 import { readMemory } from "../src/memory";
 import {
   feed,
@@ -51,13 +51,26 @@ function sameColumns(sqlite: Database, name: string, before: unknown[]) {
   const after = sqlite.query(`pragma table_info("${name}")`).all();
   expect(name === "slack_apps" ? after.slice(0, before.length) : after).toEqual(before);
 }
-// 0026, 0027 and 0028 add these tables, so earlier migrations' tests leave them out.
+// 0030 adds the archive, its settings and cursors, and the full-text index with its shadow tables.
+const archiveTables = [
+  "archive",
+  "archive_cursors",
+  "memory_fts",
+  "memory_fts_config",
+  "memory_fts_content",
+  "memory_fts_data",
+  "memory_fts_docsize",
+  "memory_fts_idx",
+  "memory_settings",
+];
+// 0026, 0027, 0028 and 0030 add these tables, so earlier migrations' tests leave them out.
 const later = [
   "feed_triggers",
   "trigger_occurrences",
   "responsibility_runs",
   "run_workers",
   "artifacts",
+  ...archiveTables,
 ];
 
 type LedgerRow = { seq: number; id: unknown; hash: string; created_at: number };
@@ -881,7 +894,7 @@ test("0020 adds memory versions that legacy writers still advance, and keeps eve
       );
     const triggers = db.$client
       .query<{ name: string }, []>(
-        "select name from sqlite_master where type='trigger' order by name",
+        "select name from sqlite_master where type='trigger' and name not like 'fts\\_%' escape '\\' order by name",
       )
       .all();
     expect(triggers.map((trigger) => trigger.name)).toEqual([
@@ -954,10 +967,11 @@ test("0020 adds memory versions that legacy writers still advance, and keeps eve
   }
 });
 
+// 0030's full-text triggers on notes and archive are checked by its own test.
 const triggerSQL = (sqlite: Database) =>
   sqlite
     .query<{ name: string; sql: string }, []>(
-      "select name, sql from sqlite_master where type='trigger' order by name",
+      "select name, sql from sqlite_master where type='trigger' and name not like 'fts\\_%' escape '\\' order by name",
     )
     .all();
 
@@ -1482,7 +1496,7 @@ test("0027 adds only the run tables, keeps every 0026 table, row and trigger, an
   let db = openDatabase(path);
   try {
     expect(tableNames(db.$client)).toEqual(
-      [...tables, "artifacts", "responsibility_runs", "run_workers"].toSorted(),
+      [...tables, "artifacts", "responsibility_runs", "run_workers", ...archiveTables].toSorted(),
     );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     expect(rows(db.$client)).toEqual(before);
@@ -1537,7 +1551,7 @@ test("0028 adds only the artifacts table, keeps every 0027 table, row and trigge
   old.close();
   let db = openDatabase(path);
   try {
-    expect(tableNames(db.$client)).toEqual([...tables, "artifacts"].toSorted());
+    expect(tableNames(db.$client)).toEqual([...tables, "artifacts", ...archiveTables].toSorted());
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     expect(rows(db.$client)).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
@@ -1594,7 +1608,7 @@ test("0029 appends only nullable icon columns to slack_apps and keeps every 0028
   old.close();
   let db = openDatabase(path);
   try {
-    expect(tableNames(db.$client)).toEqual(tables);
+    expect(tableNames(db.$client)).toEqual([...tables, ...archiveTables].toSorted());
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     const added = db.$client
       .query<{ name: string; notnull: number; dflt_value: unknown }, []>(
@@ -1620,6 +1634,96 @@ test("0029 appends only nullable icon columns to slack_apps and keeps every 0028
     db.$client.close();
     db = openDatabase(path);
     expectLedger(db.$client, ledger, "0029");
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0030 adds the archive and an index of every note, kept by triggers for legacy writers", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-archive-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0030");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run("insert into notes (dot,text,created_at) values ('jojo','We chose SQLite.',1)");
+  old.run("insert into notes (dot,text,created_at) values ('jojo','Tea, not coffee.',2)");
+  old.run(
+    "insert into outbox (session_id,message_id,text,state,created_at) values ('ses_jojo','msg_old','Hi','sent',1)",
+  );
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+  const before = rows(old);
+  const ledger = ledgerOf(old);
+  const triggers = triggerSQL(old);
+  old.close();
+  let db = openDatabase(path);
+  const indexed = (term: string) =>
+    db.$client
+      .query<{ id: number }, [string]>(
+        "select -rowid as id from memory_fts where memory_fts match ? and rowid < 0 order by id",
+      )
+      .all(`"${term}"`)
+      .map((row) => row.id);
+  try {
+    expect(tableNames(db.$client)).toEqual([...tables, ...archiveTables].toSorted());
+    for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
+    expect(rows(db.$client)).toEqual(before);
+    expect(triggerSQL(db.$client)).toEqual(triggers);
+    expectLedger(db.$client, ledger, "0030");
+    // Every layer starts off, and nothing is archived or read.
+    expect(db.$client.query("select * from memory_settings").all()).toEqual([]);
+    expect(db.$client.query("select * from archive").all()).toEqual([]);
+    expect(db.$client.query("select * from archive_cursors").all()).toEqual([]);
+    // Old notes are indexed, and a writer that knows nothing of the index keeps it right.
+    expect(indexed("sqlite")).toEqual([1]);
+    db.$client.run("insert into notes (dot,text,created_at) values ('jojo','sqlite again',3)");
+    db.$client.run("update notes set text = 'Postgres after all.' where id = 1");
+    db.$client.run("delete from notes where id = 2");
+    expect(indexed("sqlite")).toEqual([3]);
+    expect(indexed("postgres")).toEqual([1]);
+    expect(indexed("coffee")).toEqual([]);
+    // The version trigger still advances on that legacy edit.
+    expect(db.$client.query("select version from notes where id = 1").get()).toEqual({
+      version: 2,
+    });
+    db.$client.close();
+    db = openDatabase(path);
+    expectLedger(db.$client, ledger, "0030");
+    expect(indexed("postgres")).toEqual([1]);
+    db.$client.close();
+    // Rolling back to the backup taken before 0030 gives the old database exactly; reopening
+    // migrates it again and indexes its notes afresh.
+    const [backup] = readdirSync(join(directory, "backups")).filter((name) =>
+      name.endsWith("-before-0030_archive.db"),
+    );
+    assert(backup, "Missing the backup taken before 0030");
+    restoreDatabase(path, join(directory, "backups", backup));
+    const restored = new Database(path);
+    try {
+      expect(tableNames(restored)).toEqual(tables);
+      expect(rows(restored)).toEqual(before);
+      expect(triggerSQL(restored)).toEqual(triggers);
+      expect(ledgerOf(restored)).toEqual(ledger);
+    } finally {
+      restored.close();
+    }
+    db = openDatabase(path);
+    expectLedger(db.$client, ledger, "0030");
+    expect(indexed("sqlite")).toEqual([1]);
+    expect(indexed("coffee")).toEqual([2]);
   } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });

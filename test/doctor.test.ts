@@ -886,7 +886,7 @@ test("pending migrations are counted exactly and never applied", async () => {
   const report = await run();
   expect(check(report, "database")).toMatchObject({
     status: "stale",
-    counts: { pending: 1, applied: 29, known: 30 },
+    counts: { pending: 1, applied: 30, known: 31 },
   });
   expect(files()).toEqual(before);
 });

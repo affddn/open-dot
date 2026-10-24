@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { SessionMessage } from "@opencode/client/effect";
 import { and, asc, eq, gt, inArray, isNull, lte, ne, or, isNotNull } from "drizzle-orm";
 import { Effect, Exit, type Layer, Result, Schedule, Semaphore } from "effect";
+import { archiveAll, archivingDots } from "./archive";
 import type { Db } from "./db";
 import { outputDirectory, worktreeDirectory } from "./home";
 import {
@@ -1259,10 +1260,10 @@ const report = (error: { readonly message: string }) =>
 /**
  * The daemon's repeating work, each loop on its own fiber so one that waits can't stall another.
  * Reminders, schedules and worker requests' local settling are database-only and run without
- * OpenCode. The worker, supervision and delivery pass, the answer pass, the Threads pass and the
- * scheduled run pass each connect on their own, the answer pass only when an answer is queued and
- * the run pass only while a run is open. Only the answer loop sends answers, one at a time, so
- * none is sent twice.
+ * OpenCode. The worker, supervision and delivery pass, the answer pass, the Threads pass, the
+ * scheduled run pass and the archive pass each connect on their own, the answer pass only when an
+ * answer is queued, the run pass only while a run is open and the archive pass only while some
+ * dot's archive is on. Only the answer loop sends answers, one at a time, so none is sent twice.
  */
 export const daemonLoops = (db: Db, layer: Layer.Layer<OpenCode, OpenCodeError>) => {
   const work = Effect.suspend(() => {
@@ -1292,6 +1293,15 @@ export const daemonLoops = (db: Db, layer: Layer.Layer<OpenCode, OpenCodeError>)
         )
       : Effect.void,
   );
+  // Only reads OpenCode, and only while some dot's owner has its archive on.
+  const archiving = Effect.suspend(() =>
+    archivingDots(db).length
+      ? archiveAll(db).pipe(
+          Effect.provide(layer),
+          Effect.catch(() => Effect.void),
+        )
+      : Effect.void,
+  );
   return Effect.all(
     [
       Effect.repeat(work, Schedule.spaced("1 second")),
@@ -1299,6 +1309,7 @@ export const daemonLoops = (db: Db, layer: Layer.Layer<OpenCode, OpenCodeError>)
       Effect.repeat(answers, Schedule.spaced("1 second")),
       Effect.repeat(threads, Schedule.spaced("5 seconds")),
       Effect.repeat(runs, Schedule.spaced("5 seconds")),
+      Effect.repeat(archiving, Schedule.spaced("10 seconds")),
     ],
     { concurrency: "unbounded", discard: true },
   );

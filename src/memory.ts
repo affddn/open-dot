@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, ne, type SQL, sql } from "drizzle-orm";
 import type { Db } from "./db";
 import {
   type Note,
@@ -51,7 +51,7 @@ export const searchDefaultLimit = 20;
 const snippetLength = 160;
 
 /** Lowercases code point by code point, keeping where each folded unit came from in `text`. */
-const fold = (text: string) => {
+export const fold = (text: string) => {
   let folded = "";
   const origin: number[] = [];
   let at = 0;
@@ -66,7 +66,7 @@ const fold = (text: string) => {
 };
 
 /** Up to 160 characters of the note around its first match, on one line. */
-const snippet = (text: string, start: number) => {
+export const snippet = (text: string, start: number) => {
   let from = Math.max(0, Math.min(start - 60, text.length - snippetLength));
   let to = Math.min(text.length, from + snippetLength);
   // Never split a surrogate pair.
@@ -87,16 +87,43 @@ export function parseSearch(value: unknown): string[] | Invalid {
   return words;
 }
 
+const phrase = (word: string) => `"${word.replaceAll('"', '""')}"`;
+
+/**
+ * Search words as full-text index phrases, for recall. The index (an FTS5 trigram tokenizer that
+ * ignores case and diacritics, migration 0030) can match only a word that still has three
+ * characters once its combining marks are gone; each phrase matches anywhere inside a word, and
+ * every one must match.
+ */
+export const indexTerms = (words: readonly string[]) =>
+  words.filter((word) => Array.from(word.replace(/\p{M}/gu, "")).length >= 3).map(phrase);
+
+/**
+ * The words that may narrow an exact note search: printable ASCII only, at least three long. A
+ * note whose case-folded text contains such a word is always in the index's matches, since only
+ * U+0130 and U+212A lowercase to ASCII outside ASCII and the index folds both the same way. Other
+ * words could fold or lose combining marks differently, so they never narrow the search.
+ */
+const exactTerms = (words: readonly string[]) =>
+  words.filter((word) => /^[\x21-\x7e]{3,}$/.test(word)).map(phrase);
+
+/** The dot's notes in the full-text index whose text may contain every term, as note IDs. */
+const indexedNotes = (dot: string, terms: readonly string[]): SQL =>
+  sql`${notes.id} IN (SELECT -rowid FROM memory_fts WHERE memory_fts MATCH ${terms.join(" AND ")} AND dot = ${dot} AND rowid < 0)`;
+
 /**
  * The dot's saved notes that contain every word, ignoring case, most recently changed first, each
- * with a snippet. It reads the notes table itself, so there's no index to go stale: an edit or
- * delete shows in the next search, and rebuilding it means reading the notes again.
+ * with a snippet. The full-text index (migration 0030), kept by triggers on `notes` for every
+ * writer, narrows the notes by their ASCII words of three or more characters; each candidate's
+ * text is then checked word by word, code point by code point, so results are exactly the ones a
+ * scan finds. A search with no such word reads the dot's notes.
  */
 export function searchNotes(db: Db, dot: string, words: readonly string[], limit: number) {
+  const terms = exactTerms(words);
   const matched = db
     .select()
     .from(notes)
-    .where(eq(notes.dot, dot))
+    .where(and(eq(notes.dot, dot), terms.length ? indexedNotes(dot, terms) : undefined))
     .orderBy(desc(sql`coalesce(${notes.updatedAt}, ${notes.createdAt})`), desc(notes.id))
     .all()
     .flatMap((row) => {

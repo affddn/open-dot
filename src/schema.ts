@@ -295,6 +295,71 @@ export const notes = sqliteTable("notes", {
 
 export type Note = typeof notes.$inferSelect;
 
+/**
+ * The owner's memory switches for a dot. A dot without a row has every layer off. `archive` lets
+ * the daemon copy the bound conversation's owner and dot text into `archive`; without `backfill`
+ * only messages from `archive_since` on are copied.
+ */
+export const memorySettings = sqliteTable("memory_settings", {
+  dot: text()
+    .primaryKey()
+    .references(() => dots.name),
+  archive: integer({ mode: "boolean" }).notNull().default(false),
+  backfill: integer({ mode: "boolean" }).notNull().default(false),
+  // When the archive was last switched on; earlier messages are copied only with backfill.
+  archiveSince: integer("archive_since"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+/** An assistant message the walk saw unfinished, read again by ID until it's done. */
+export interface PendingMessage {
+  readonly id: string;
+  // A turn end came after it in history, so its text won't change.
+  readonly ended: boolean;
+}
+
+/**
+ * Where the daemon's archive walk of a dot's bound session is. `cursor` is OpenCode's opaque
+ * history cursor after `anchor`, the last message read; `revision` advances with every write, so
+ * a walk that read an older row saves nothing.
+ */
+export const archiveCursors = sqliteTable("archive_cursors", {
+  dot: text()
+    .primaryKey()
+    .references(() => dots.name),
+  sessionID: text("session_id").notNull(),
+  cursor: text(),
+  anchor: text(),
+  pending: text({ mode: "json" }).$type<readonly PendingMessage[]>().notNull().default([]),
+  revision: integer().notNull().default(0),
+  checkedAt: integer("checked_at"),
+});
+
+/**
+ * The owner's and the dot's own text from a dot's bound conversation, copied from OpenCode's
+ * public history: no reasoning, tool calls, attachments, notices or other dots' messages. Rows are
+ * never changed; a rebound dot reads only its current session's rows.
+ */
+export const archive = sqliteTable(
+  "archive",
+  {
+    id: integer().primaryKey({ autoIncrement: true }),
+    dot: text()
+      .notNull()
+      .references(() => dots.name),
+    sessionID: text("session_id").notNull(),
+    messageID: text("message_id").notNull(),
+    role: text({ enum: ["owner", "dot"] }).notNull(),
+    text: text().notNull(),
+    // When OpenCode created the message.
+    createdAt: integer("created_at").notNull(),
+    archivedAt: integer("archived_at").notNull(),
+  },
+  (table) => [unique().on(table.dot, table.sessionID, table.messageID)],
+);
+
+export type Archived = typeof archive.$inferSelect;
+
 export const responsibilityStatuses = ["active", "done", "dropped"] as const;
 
 /** Ongoing goals a dot owns, with the next thing it plans to do about each. */

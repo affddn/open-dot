@@ -4,6 +4,7 @@ import {
   type Attachment,
   type Delivery,
   type Entry,
+  type HistoryItem,
   OpenCode,
   OpenCodeError,
   type PromptTurn,
@@ -91,6 +92,12 @@ export function fakeOpenCode() {
     threadsCalls: [] as { directory: string; coordinatorID: string }[],
     superviseFailure: false,
     history: new Map<string, Entry[]>(),
+    // Each session's full history as the archive pages it, in processing order.
+    items: new Map<string, HistoryItem[]>(),
+    // Every archive page read, by its cursor. With `repeatCursor` a page hands back its own cursor.
+    pages: [] as (string | undefined)[],
+    repeatCursor: false,
+    onPage: () => {},
     create: "ok" as "ok" | "fail",
     prompt: "ok" as "ok" | "fail" | "lost",
   };
@@ -216,6 +223,27 @@ export function fakeOpenCode() {
               state.onMessage();
               return item;
             }),
+      ),
+    // Like OpenCode, a cursor names the last item read, and one whose item is gone reads nothing.
+    historyPage: (sessionID, limit, cursor) =>
+      Effect.suspend(() => {
+        state.pages.push(cursor);
+        state.onPage();
+        if (state.readFailure) return broken("history unavailable");
+        const items = state.items.get(sessionID) ?? [];
+        const start = cursor ? items.findIndex((item) => `after:${item.id}` === cursor) + 1 : 0;
+        const page = cursor && start === 0 ? [] : items.slice(start, start + limit);
+        const last = page.at(-1);
+        return Effect.succeed({
+          items: page,
+          next: last ? (state.repeatCursor && cursor ? cursor : `after:${last.id}`) : undefined,
+        });
+      }),
+    historyItem: ({ sessionID, messageID }) =>
+      Effect.suspend(() =>
+        state.readFailure
+          ? broken("history unavailable")
+          : Effect.succeed(state.items.get(sessionID)?.find((item) => item.id === messageID)),
       ),
     sessionDirectory: (sessionID) =>
       Effect.suspend(() =>

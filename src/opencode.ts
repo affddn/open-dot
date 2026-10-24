@@ -360,6 +360,36 @@ export interface Entry {
   readonly time: number;
 }
 
+/**
+ * A history item as the archive reads it: a user message's own text, or an assistant message's
+ * text parts, never reasoning, tool calls or attachments. Any other item is "other", except the
+ * idle that ends a turn.
+ */
+export interface HistoryItem {
+  readonly id: string;
+  readonly type: "user" | "assistant" | "idle" | "other";
+  readonly text: string;
+  /** False for an assistant message OpenCode hasn't finished, whose text may still grow. */
+  readonly complete: boolean;
+  readonly time: number;
+}
+
+const historyItem = (item: SessionMessage.Info): HistoryItem => {
+  const base = { id: item.id, time: DateTime.toEpochMillis(item.time.created), complete: true };
+  if (item.type === "user") return { ...base, type: "user", text: item.text };
+  if (item.type === "assistant")
+    return {
+      ...base,
+      type: "assistant",
+      text: item.content
+        .flatMap((part) => (part.type === "text" ? [part.text] : []))
+        .join("\n")
+        .trim(),
+      complete: item.time.completed !== undefined,
+    };
+  return { ...base, type: item.type === "idle" ? "idle" : "other", text: "" };
+};
+
 const entry = (item: SessionMessage.Info): Entry[] =>
   item.type === "user"
     ? [
@@ -444,6 +474,19 @@ export class OpenCode extends Context.Service<
       limit: number,
       cursor?: string,
     ) => Effect.Effect<{ entries: readonly Entry[]; next: string | undefined }, OpenCodeError>;
+    /**
+     * One page of the session's history in processing order, oldest first: from the start, or
+     * after the item an earlier page's `next` cursor names. `next` is absent for an empty page.
+     */
+    readonly historyPage: (
+      sessionID: string,
+      limit: number,
+      cursor?: string,
+    ) => Effect.Effect<{ items: readonly HistoryItem[]; next: string | undefined }, OpenCodeError>;
+    /** One history item by ID, or undefined once OpenCode doesn't have it. */
+    readonly historyItem: (
+      ref: MessageRef,
+    ) => Effect.Effect<HistoryItem | undefined, OpenCodeError>;
     /** The session's directory, or undefined once OpenCode says the session doesn't exist. */
     readonly sessionDirectory: (
       sessionID: string,
@@ -753,6 +796,31 @@ export class OpenCode extends Context.Service<
             })
             .pipe(
               Effect.map((item) => entry(item)[0]),
+              Effect.catchTag("MessageNotFoundError", () => Effect.succeed(undefined)),
+              Effect.mapError(failed(`Could not read message ${messageID}`)),
+            ),
+        historyPage: (sessionID, limit, cursor) =>
+          client.message
+            .list(
+              cursor
+                ? { sessionID: Session.ID.make(sessionID), cursor, limit }
+                : { sessionID: Session.ID.make(sessionID), order: "asc", limit },
+            )
+            .pipe(
+              Effect.map((page) => ({
+                items: page.data.map(historyItem),
+                next: page.data.length ? page.cursor.next : undefined,
+              })),
+              Effect.mapError(failed(`Could not read session ${sessionID}`)),
+            ),
+        historyItem: ({ sessionID, messageID }) =>
+          client.session.message
+            .get({
+              sessionID: Session.ID.make(sessionID),
+              messageID: SessionMessage.ID.make(messageID),
+            })
+            .pipe(
+              Effect.map(historyItem),
               Effect.catchTag("MessageNotFoundError", () => Effect.succeed(undefined)),
               Effect.mapError(failed(`Could not read message ${messageID}`)),
             ),

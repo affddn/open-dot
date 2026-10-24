@@ -3,6 +3,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { SessionMessage } from "@opencode/client/effect";
 import { and, desc, eq, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { type Context, Effect, Layer, Result } from "effect";
+import { archiveStatus, parseArchiveSettings, saveArchiveSettings } from "./archive";
 import { avatarRevision, readAvatar } from "./avatar";
 import { stopWorker } from "./daemon";
 import type { Db } from "./db";
@@ -1424,6 +1425,23 @@ const search = (db: Db, dot: string, request: Request) => {
   return Response.json({ query: words.join(" "), ...searchNotes(db, dot, words, limit) });
 };
 
+/**
+ * `GET …/memory/archive` shows the dot's archive switches and progress; `PUT` with
+ * `{ archive?, backfill? }` changes them. Both are off until the owner turns them on. Neither
+ * needs OpenCode or starts a turn; the daemon's archive pass reads history on its own.
+ */
+const archiveRoute = async (db: Db, dot: Dot, request: Request, rawID: string | undefined) => {
+  if (rawID !== undefined) return error(404, "Not found");
+  if (request.method === "PUT") {
+    const value = await messageBody(request, 1024).catch(() => undefined);
+    if (value instanceof Response) return value;
+    const change = parseArchiveSettings(value);
+    if ("invalid" in change) return error(400, change.invalid);
+    saveArchiveSettings(db, dot.name, change, Date.now());
+  } else if (request.method !== "GET") return error(404, "Not found");
+  return Response.json(archiveStatus(db, dot));
+};
+
 /** How much of a source message's text is shown. */
 const sourceTextLimit = 4000;
 
@@ -1532,6 +1550,7 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
     return rawID === undefined && method === "GET"
       ? search(db, dot.name, request)
       : error(404, "Not found");
+  if (kind === "archive") return archiveRoute(db, dot, request, rawID);
   if (kind !== "notes" && kind !== "responsibilities" && kind !== "reminders")
     return error(404, "Not found");
   const body = async () => {

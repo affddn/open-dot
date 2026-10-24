@@ -117,6 +117,63 @@ test("searches are bounded and snippets stay short around the first match", () =
   expect(searchNotes(db, "jojo", words("target"), 20).results[0]?.snippet).toContain("İ target z");
 });
 
+test("the index never hides a note an exact scan would find, whatever its Unicode", () => {
+  // Every character whose lowercase holds ASCII outside ASCII (U+0130 and U+212A today).
+  const toASCII = Array.from({ length: 0x110000 - 0x80 }, (_, at) => at + 0x80)
+    .filter((cp) => cp < 0xd800 || cp > 0xdfff)
+    .map((cp) => String.fromCodePoint(cp))
+    .filter((char) => Array.from(char.toLowerCase()).some((unit) => unit.charCodeAt(0) < 0x80));
+  expect(toASCII.length).toBeGreaterThan(0);
+  const texts = [
+    "xa\u0301by",
+    "ab",
+    "café",
+    "cafe\u0301 noir",
+    "naïve plan",
+    "İstanbul trip",
+    "\u212Aelvin scale",
+    "Straße",
+    "ΣΑΣ",
+    "한국어 회의",
+    "ǅungla",
+    ...toASCII.map((char) => `za${char}zz`),
+  ];
+  const saved = texts.map((text) => note("jojo", text).id);
+  const queries = [
+    "a\u0301b",
+    "\u0061\u0301\u0062",
+    "xa\u0301by",
+    "ab",
+    "café",
+    "cafe",
+    "cafe\u0301",
+    "naïve",
+    "naive",
+    "istanbul",
+    "i\u0307stanbul",
+    "kelvin",
+    "kel",
+    "straße",
+    "σας",
+    "한국",
+    "한국어",
+    "ǆungla",
+    "zz",
+    ...toASCII.map((char) => `za${char.toLowerCase()}`.slice(0, 3)),
+  ];
+  for (const query of queries) {
+    const terms = words(query);
+    // What a scan of every note finds, word by word, code point by code point.
+    const scanned = saved.filter((_, at) => {
+      const folded = Array.from(texts[at] ?? "", (char) => char.toLowerCase()).join("");
+      return terms.every((word) => folded.includes(word));
+    });
+    expect([query, find("jojo", query).toSorted((a, b) => a - b)]).toEqual([query, scanned]);
+  }
+  // The reported case: a, a combining acute and b match only the note that holds them.
+  expect(find("jojo", "a\u0301b")).toEqual(saved.slice(0, 1));
+});
+
 test("edits and deletes change the very next search, and reopening reads the same notes", () => {
   const directory = mkdtempSync(join(tmpdir(), "open-dot-search-"));
   const path = join(directory, "open-dot.db");
