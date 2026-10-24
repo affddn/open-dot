@@ -36,6 +36,13 @@ import {
   searchNotes,
   searchResultLimit,
 } from "./memory";
+import {
+  artifactView,
+  attachmentDisposition,
+  findArtifact,
+  listArtifacts,
+  readArtifact,
+} from "./library";
 import { type Attachment, OpenCode, type Entry, OpenCodeError } from "./opencode";
 import {
   currentReactions,
@@ -276,6 +283,71 @@ const avatarRoute = (db: Db, request: Request, path: string[]) => {
     headers: {
       "content-type": avatar.mime,
       "x-content-type-options": "nosniff",
+      "cache-control": "no-store",
+    },
+  });
+};
+
+/**
+ * The dot's read-only Library: `GET /dots/<name>/library[?before=<id>]` pages it newest first,
+ * `GET …/library/<id>` checks one copy's digest, and `GET …/library/<id>/content` downloads it.
+ * Only by artifact ID, never a path, and only this dot's. A download is always an attachment of
+ * `application/octet-stream`, never rendered, and only bytes that still match the saved digest.
+ * Nothing here starts a turn or needs OpenCode.
+ */
+const libraryRoute = (db: Db, request: Request, path: string[]) => {
+  const [, rawName = "", , rawID, action, ...extra] = path;
+  if (request.method !== "GET" || extra.length || (action !== undefined && action !== "content"))
+    return error(404, "Not found");
+  const name = (() => {
+    try {
+      return decodeURIComponent(rawName);
+    } catch {
+      return undefined;
+    }
+  })();
+  const dot = name === undefined ? undefined : findDot(db, name);
+  if (!dot) return error(404, "There's no such dot.");
+  const query = new URL(request.url).searchParams;
+  if (rawID === undefined) {
+    const before = query.getAll("before");
+    if (
+      [...query.keys()].some((key) => key !== "before") ||
+      before.length > 1 ||
+      (before[0] !== undefined &&
+        (!positive.test(before[0]) || !Number.isSafeInteger(Number(before[0]))))
+    )
+      return error(400, "before must be a deliverable ID.");
+    return Response.json(
+      listArtifacts(db, dot.name, before[0] === undefined ? undefined : Number(before[0])),
+    );
+  }
+  if ([...query.keys()].length) return error(400, "This route takes no query.");
+  const id = positive.test(rawID) ? Number(rawID) : Number.NaN;
+  const row = Number.isSafeInteger(id) ? findArtifact(db, dot.name, id) : undefined;
+  if (!row) return error(404, "There's no such deliverable.");
+  const read = readArtifact(row);
+  if (action === undefined)
+    return Response.json({
+      artifact: artifactView(row, "bytes" in read ? "verified" : read.status),
+    });
+  if (!("bytes" in read))
+    return Response.json(
+      {
+        error:
+          read.status === "missing"
+            ? "This deliverable's copy is missing."
+            : "This deliverable's copy no longer matches what was saved, so it isn't served.",
+        artifact: artifactView(row, read.status),
+      },
+      { status: read.status === "missing" ? 410 : 422 },
+    );
+  return new Response(read.bytes, {
+    headers: {
+      "content-type": "application/octet-stream",
+      "content-disposition": attachmentDisposition(row.name),
+      "x-content-type-options": "nosniff",
+      "content-security-policy": "default-src 'none'; sandbox",
       "cache-control": "no-store",
     },
   });
@@ -1720,6 +1792,13 @@ export const api = (
       return Promise.resolve(requestAudit(db, request, path));
     if (path[0] === "dots" && path[2] === "avatar")
       return Promise.resolve(avatarRoute(db, request, path));
+    if (path[0] === "dots" && path[2] === "library")
+      return Promise.resolve()
+        .then(() => libraryRoute(db, request, path))
+        .catch((cause) => {
+          console.error(`Library: ${cause instanceof Error ? cause.message : String(cause)}`);
+          return error(500, "Couldn't read the dot's Library.");
+        });
     if (path[0] === "dots" && path[2] === "instructions")
       return instructionsRoute(db, request, path).catch((cause) => {
         console.error(`Instructions: ${cause instanceof Error ? cause.message : String(cause)}`);

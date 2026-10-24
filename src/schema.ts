@@ -420,6 +420,42 @@ export const runWorkers = sqliteTable("run_workers", {
   assistantMessage: text("assistant_message").notNull(),
 });
 
+/**
+ * A deliverable a dot added to its Library from one of its own workers' output directories: a
+ * private, immutable copy in `library/<dot>/<file>`, never the worker's file itself. The worker and
+ * its session come from the `workers` row, never from what the dot said.
+ */
+export const artifacts = sqliteTable(
+  "artifacts",
+  {
+    id: integer().primaryKey({ autoIncrement: true }),
+    dot: text()
+      .notNull()
+      .references(() => dots.name),
+    worker: integer()
+      .notNull()
+      .references(() => workers.id),
+    // The worker's session when it was added.
+    sessionID: text("session_id").notNull(),
+    // Where it was, relative to the worker's output directory; its last segment is the name.
+    path: text().notNull(),
+    name: text().notNull(),
+    mime: text({ enum: ["text/plain", "text/markdown", "text/csv", "application/pdf"] }).notNull(),
+    size: integer().notNull(),
+    sha256: text().notNull(),
+    // The copy's file name in the dot's library directory, random and never reused.
+    file: text().notNull().unique(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [
+    // Adding the same bytes from the same place again finds the first copy.
+    unique("artifacts_origin").on(table.dot, table.worker, table.path, table.sha256),
+    index("artifacts_page").on(table.dot, table.id),
+  ],
+);
+
+export type Artifact = typeof artifacts.$inferSelect;
+
 /** What a worker's permission request or question showed when open-dot first read it. */
 export type RequestDetail =
   | {

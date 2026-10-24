@@ -282,9 +282,14 @@ struct MessageWindow: Equatable {
   }
   var feedStatus: String?
   var showingFeed = false
-  /// The selected dot's Memory or Instructions tab is open instead of its chat. At most one is.
+  /// The selected dot's Memory, Instructions or Library tab is open instead of its chat. At most one is.
   var showingMemory = false
   var showingInstructions = false
+  var showingLibrary = false
+  /// Each dot's Library pages, deliverables being exported, and what each export last said.
+  var libraries: [String: LibraryState] = [:]
+  var exportingArtifacts: Set<Int> = []
+  var libraryNotices: [Int: String] = [:]
   var memories: [String: MemoryState] = [:]
   /// Each dot's AGENTS.md editor, kept while the notch folds or another dot or view is shown.
   var instructions: [String: InstructionsState] = [:]
@@ -339,6 +344,10 @@ struct MessageWindow: Equatable {
   @ObservationIgnored var latestPage: @MainActor (String) async throws -> MessagePage = { _ in throw APIError.unreachable }
   @ObservationIgnored var oneMessage: @MainActor (MessageKey, String) async throws -> Message = { _, _ in throw APIError.unreachable }
   @ObservationIgnored var saveReaction: @MainActor (MessageKey, String?) async throws -> (reaction: Reaction, recent: [String]?) = { _, _ in throw APIError.unreachable }
+  /// The Library reads and the export's save panel. Tests replace them.
+  @ObservationIgnored var libraryPage: @MainActor (String, Int?) async throws -> ArtifactPage = { _, _ in throw APIError.unreachable }
+  @ObservationIgnored var artifactBytes: @MainActor (String, Int) async throws -> Data = { _, _ in throw APIError.unreachable }
+  @ObservationIgnored var chooseExport: @MainActor (String) -> URL? = { _ in nil }
   private var seen: [String: Double] = [:]
   private var newest: [String: Double] = [:]
   private var feedSeen: Double?
@@ -352,6 +361,9 @@ struct MessageWindow: Equatable {
     latestPage = { try await api.messages($0) }
     oneMessage = { try await api.message($0, session: $1) }
     saveReaction = { try await api.react($0, emoji: $1) }
+    libraryPage = { try await api.library($0, before: $1) }
+    artifactBytes = { try await api.artifactContent($0, $1) }
+    chooseExport = { [unowned self] name in savePanel(name, self) }
   }
 
   var showsIndicator: Bool { dotsBusy || dotsUnread || feedUnread }
@@ -417,6 +429,7 @@ struct MessageWindow: Equatable {
     if let name = selected { Task { await refreshMessages(name) } }
     if let name = selected, showingMemory { Task { await refreshMemory(name) } }
     if let name = selected, showingInstructions { loadInstructions(name, discarding: false) }
+    if let name = selected, showingLibrary { Task { await refreshLibrary(name) } }
   }
 
   func select(_ name: String) {
@@ -426,22 +439,25 @@ struct MessageWindow: Equatable {
     Task { await refreshMessages(name) }
     if showingMemory { Task { await refreshMemory(name) } }
     if showingInstructions { loadInstructions(name, discarding: false) }
+    if showingLibrary { Task { await refreshLibrary(name) } }
   }
 
-  enum Pane: Hashable { case chat, memory, instructions }
+  enum Pane: Hashable { case chat, memory, instructions, library }
 
-  var pane: Pane { showingInstructions ? .instructions : showingMemory ? .memory : .chat }
+  var pane: Pane { showingInstructions ? .instructions : showingMemory ? .memory : showingLibrary ? .library : .chat }
 
   /// Switches the selected dot between its chat, its Memory tab and its Instructions tab. An
   /// unsaved instructions draft stays for when the tab is shown again.
   func show(_ pane: Pane) {
     showingMemory = pane == .memory
     showingInstructions = pane == .instructions
+    showingLibrary = pane == .library
     guard let name = selected else { return }
     switch pane {
     case .chat: seen[name] = newest[name]
     case .memory: Task { await refreshMemory(name) }
     case .instructions: loadInstructions(name, discarding: false)
+    case .library: Task { await refreshLibrary(name) }
     }
   }
 
@@ -728,6 +744,7 @@ struct MessageWindow: Equatable {
     }
     showingMemory = false
     showingInstructions = false
+    showingLibrary = false
     select(first)
   }
 
@@ -1345,6 +1362,64 @@ struct MessageWindow: Equatable {
     }
   }
 
+  /// Reads the newest Library page again, keeping older pages already loaded. It only reads, and
+  /// starts no turn.
+  func refreshLibrary(_ name: String) async {
+    var state = libraries[name] ?? LibraryState()
+    let read = state.startRead()
+    libraries[name] = state
+    do {
+      libraries[name]?.apply(read, try await libraryPage(name, nil), older: false)
+    } catch {
+      libraries[name]?.fail(read, "Couldn't read the Library. \(Self.describe(error))", older: false)
+    }
+  }
+
+  /// Reads the next older Library page, once at a time.
+  func loadOlderLibrary(_ name: String) {
+    guard var state = libraries[name], let before = state.older, !state.loadingOlder else { return }
+    state.loadingOlder = true
+    let read = state.startRead()
+    libraries[name] = state
+    Task {
+      do {
+        libraries[name]?.apply(read, try await libraryPage(name, before), older: true)
+      } catch {
+        libraries[name]?.fail(read, "Couldn't read older deliverables. \(Self.describe(error))", older: true)
+      }
+    }
+  }
+
+  /// Exports a deliverable: reads its bytes by ID, refuses any that don't match the size and
+  /// SHA-256 the Library listed, then writes them where the owner chose in a save panel. The file
+  /// is never opened or run, and a failure is never retried on its own.
+  func exportArtifact(_ name: String, _ artifact: Artifact) {
+    guard artifact.available, exportingArtifacts.insert(artifact.id).inserted else { return }
+    libraryNotices[artifact.id] = nil
+    Task {
+      defer { exportingArtifacts.remove(artifact.id) }
+      let data: Data
+      do {
+        data = try await artifactBytes(name, artifact.id)
+      } catch {
+        libraryNotices[artifact.id] = "Not exported. \(Self.describe(error)) No automatic retry."
+        await refreshLibrary(name)
+        return
+      }
+      guard matchesArtifact(data, artifact) else {
+        libraryNotices[artifact.id] = "Not exported: the bytes didn't match the Library's SHA-256."
+        return
+      }
+      guard let url = chooseExport(exportFilename(artifact)) else { return }
+      do {
+        try data.write(to: url, options: .atomic)
+        libraryNotices[artifact.id] = "Exported to \(url.path)."
+      } catch {
+        libraryNotices[artifact.id] = "Not exported. \(error.localizedDescription)"
+      }
+    }
+  }
+
   private func refreshMemory(_ name: String) async {
     let read = memories[name, default: MemoryState()].startRead()
     do {
@@ -1670,4 +1745,17 @@ struct MessageWindow: Equatable {
     picker = nil
     done?(timedOut)
   }
+}
+
+/// The save panel an export writes through, holding the notch open while it's up. Nil when the
+/// owner cancels. Nothing is opened afterwards.
+@MainActor private func savePanel(_ name: String, _ store: Store) -> URL? {
+  let panel = NSSavePanel()
+  panel.nameFieldStringValue = name
+  panel.canCreateDirectories = true
+  panel.isExtensionHidden = false
+  store.hold()
+  defer { store.release() }
+  NSApp.activate()
+  return panel.runModal() == .OK ? panel.url : nil
 }

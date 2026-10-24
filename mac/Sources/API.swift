@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// "permission", "question" or both, as a row says them.
@@ -783,6 +784,72 @@ func instructionsOutcome(status: Int, data: Data) throws -> InstructionsOutcome 
   }
 }
 
+/// A deliverable in a dot's Library: the daemon's private copy of a file one of its workers saved.
+/// A list says "present" when the copy is there, private and of its size, without checking its
+/// SHA-256; a detail read says "verified" once it has. "missing" and "corrupt" can't be exported.
+struct Artifact: Decodable, Equatable, Identifiable {
+  let id: Int
+  let name: String
+  let mime: String
+  let size: Int
+  let sha256: String
+  let createdAt: Double
+  let worker: Int
+  let sessionID: String
+  let path: String
+  let status: String
+
+  var kind: String {
+    switch mime {
+    case "text/markdown": "Markdown"
+    case "text/csv": "CSV"
+    case "application/pdf": "PDF"
+    default: "Text"
+    }
+  }
+
+  var available: Bool { status == "present" || status == "verified" }
+
+  var statusText: String? {
+    switch status {
+    case "present", "verified": nil
+    case "missing": "Missing: its saved copy is gone, so it can't be exported."
+    default: "Corrupt: its saved copy no longer matches, so it can't be exported."
+    }
+  }
+}
+
+/// One page of a dot's Library. `next`, when there may be more, is where the next older page starts.
+struct ArtifactPage: Decodable, Equatable {
+  let artifacts: [Artifact]
+  var next: Int? = nil
+}
+
+/// The Library pages the notch has read for one dot.
+typealias LibraryState = NewestFirstPages<Artifact>
+
+extension NewestFirstPages where Row == Artifact {
+  mutating func apply(_ read: Read, _ page: ArtifactPage, older isOlder: Bool) {
+    apply(read, rows: page.artifacts, next: page.next, older: isOlder)
+  }
+}
+
+/// The name an export is offered under: the deliverable's own name without anything a file name
+/// can't safely hold, such as a path separator, a colon, a control character or a leading dot.
+func exportFilename(_ artifact: Artifact) -> String {
+  let cleaned = String(String.UnicodeScalarView(artifact.name.unicodeScalars.map { scalar in
+    scalar == "/" || scalar == ":" || scalar == "\\" || CharacterSet.controlCharacters.contains(scalar) ? "_" : scalar
+  }))
+  let trimmed = String(cleaned.drop { $0 == "." || $0.isWhitespace })
+  return trimmed.isEmpty ? "deliverable-\(artifact.id)" : trimmed
+}
+
+/// True only when the bytes are exactly the deliverable the Library listed: its size and SHA-256.
+func matchesArtifact(_ data: Data, _ artifact: Artifact) -> Bool {
+  data.count == artifact.size
+    && SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() == artifact.sha256
+}
+
 enum APIError: Error {
   case unreachable
   case lost
@@ -928,6 +995,18 @@ enum APIError: Error {
   func requests(_ dot: String, before: Int? = nil) async throws -> RequestAuditPage {
     let query = before.map { "?before=\($0)" } ?? ""
     return try decode(RequestAuditPage.self, await send("GET", "/dots/\(escape(dot))/requests\(query)"))
+  }
+
+  /// A page of the dot's Library, newest first, older than `before` if given. The daemon only reads.
+  func library(_ dot: String, before: Int? = nil) async throws -> ArtifactPage {
+    let query = before.map { "?before=\($0)" } ?? ""
+    return try decode(ArtifactPage.self, await send("GET", "/dots/\(escape(dot))/library\(query)"))
+  }
+
+  /// A deliverable's bytes, by its ID in that dot's Library, never by a path. The daemon serves
+  /// them only while they match the saved digest, and the notch checks them again.
+  func artifactContent(_ dot: String, _ id: Int) async throws -> Data {
+    try await send("GET", "/dots/\(escape(dot))/library/\(id)/content")
   }
 
   /// A page of a responsibility's scheduled runs, newest first, older than `before` if given. The daemon only reads.

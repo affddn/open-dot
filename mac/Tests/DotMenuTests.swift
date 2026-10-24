@@ -10,14 +10,14 @@ final class DotMenuTests: XCTestCase {
     store.instructions["jolyne"] = draft("mine")
 
     let menu = dotMenu(store, dot: "jolyne")
-    XCTAssertEqual(menu.items.map(\.title), ["Memory", "Instructions •"], "Unsaved instructions are marked")
+    XCTAssertEqual(menu.items.map(\.title), ["Memory", "Instructions •", "Library"], "Unsaved instructions are marked")
     XCTAssertEqual(try item(menu, "dot-menu-instructions").accessibilityLabel(), "Instructions, unsaved changes")
     try choose(menu, "dot-menu-instructions")
     await eventually { store.selected == "jolyne" && store.pane == .instructions }
     XCTAssertFalse(store.showingFeed)
 
     let other = dotMenu(store, dot: "jojo")
-    XCTAssertEqual(other.items.map(\.title), ["Memory", "Instructions"])
+    XCTAssertEqual(other.items.map(\.title), ["Memory", "Instructions", "Library"])
     try choose(other, "dot-menu-memory")
     await eventually { store.selected == "jojo" && store.pane == .memory }
     XCTAssertEqual(store.instructions["jolyne"]?.draft, "mine", "Switching dots keeps the draft")
@@ -29,7 +29,7 @@ final class DotMenuTests: XCTestCase {
   }
 
   @MainActor func testMenuViewsKeepChatUnreadUntilChatIsOpened() async throws {
-    for (id, pane) in [("dot-menu-memory", Store.Pane.memory), ("dot-menu-instructions", .instructions)] {
+    for (id, pane) in [("dot-menu-memory", Store.Pane.memory), ("dot-menu-instructions", .instructions), ("dot-menu-library", .library)] {
       let store = try isolatedStore()
       store.instructions["jolyne"] = draft("mine")
       var time = 1.0
@@ -65,7 +65,7 @@ final class DotMenuTests: XCTestCase {
   @MainActor func testBackToChatKeepsTheSelectedDotAndDraft() throws {
     let store = try isolatedStore()
     store.instructions["jolyne"] = draft("mine")
-    for pane in [Store.Pane.memory, .instructions] {
+    for pane in [Store.Pane.memory, .instructions, .library] {
       store.openDot("jolyne", pane)
       // The header's Back to chat button calls this exact action.
       store.show(.chat)

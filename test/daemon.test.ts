@@ -7,7 +7,7 @@ import { eq } from "drizzle-orm";
 import { Effect } from "effect";
 import { claimDue, step } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
-import { worktreeDirectory } from "../src/home";
+import { outputDirectory, worktreeDirectory } from "../src/home";
 import { editResponsibility } from "../src/memory";
 import {
   dots,
@@ -333,6 +333,10 @@ test("a worker in a git repo gets its own worktree, and one that can't get a who
   expect(fake.state.created.map((session) => session.directory)).toEqual([join(root, "src")]);
   expect(fake.state.texts.find((sent) => sent.sessionID === "ses_w1")?.text).toContain(
     "branch dot/jojo-1",
+  );
+  // The task names the worker's own output directory for deliverables, not a shared one.
+  expect(fake.state.texts.find((sent) => sent.sessionID === "ses_w1")?.text).toContain(
+    `your own output directory, ${outputDirectory("jojo", 1)},`,
   );
   for (const id of [2, 3]) {
     expect(db.select().from(workers).where(eq(workers.id, id)).get()).toMatchObject({

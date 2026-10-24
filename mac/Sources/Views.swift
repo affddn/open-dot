@@ -99,6 +99,9 @@ struct ExpandedView: View {
           } else if store.showingMemory {
             MemoryView(store: store, name: name)
               .id("memory-\(name)")
+          } else if store.showingLibrary {
+            LibraryView(store: store, name: name)
+              .id("library-\(name)")
           } else {
             Conversation(store: store, name: name)
               .id(name)
@@ -173,19 +176,20 @@ struct ExpandedView: View {
             .contentShape(Capsule())
           }
           .buttonStyle(.plain)
-          // A secondary click or Control-click opens its Memory and Instructions menu.
+          // A secondary click or Control-click opens its Memory, Instructions and Library menu.
           .background(MenuAnchor(id: "dot-menu-\(dot.name)", store: store) { _ in dotMenu(store, dot: dot.name) })
           .help(dot.purpose ?? "")
           .accessibilityIdentifier("dot-tab-\(dot.name)")
           .accessibilityAction(named: "Memory") { store.openDot(dot.name, .memory) }
           .accessibilityAction(named: unsaved ? "Instructions, unsaved changes" : "Instructions") { store.openDot(dot.name, .instructions) }
+          .accessibilityAction(named: "Library") { store.openDot(dot.name, .library) }
         }
       }
     }
     .scrollIndicators(.hidden)
   }
 
-  /// Above Memory or Instructions: the dot, the view, and the way back to its chat, which Escape
+  /// Above Memory, Instructions or Library: the dot, the view, and the way back to its chat, which Escape
   /// also takes. Going back keeps an unsaved instructions draft.
   private func paneHeader(_ name: String) -> some View {
     HStack(spacing: 8) {
@@ -197,13 +201,21 @@ struct ExpandedView: View {
       .help("Back to \(name)'s chat (Escape)")
       .accessibilityLabel("Back to chat")
       .accessibilityIdentifier("pane-back")
-      Text(verbatim: "\(name) · \(store.pane == .memory ? "Memory" : "Instructions")")
+      Text(verbatim: "\(name) · \(paneTitle)")
         .foregroundStyle(.secondary)
         .lineLimit(1)
         .accessibilityIdentifier("pane-title")
       Spacer()
     }
     .font(.caption.weight(.semibold))
+  }
+
+  private var paneTitle: String {
+    switch store.pane {
+    case .memory: "Memory"
+    case .library: "Library"
+    default: "Instructions"
+    }
   }
 
   private func workers(_ name: String, _ dot: Dot) -> some View {
@@ -1806,8 +1818,8 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
   return menu
 }
 
-/// A dot tab's menu. Memory and Instructions each select the dot first, and Instructions is
-/// marked while the dot has unsaved instructions.
+/// A dot tab's menu. Memory, Instructions and Library each select the dot first, and Instructions
+/// is marked while the dot has unsaved instructions.
 @MainActor func dotMenu(_ store: Store, dot: String) -> NSMenu {
   let menu = NSMenu()
   menu.autoenablesItems = false
@@ -1821,6 +1833,7 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
     instructions.setAccessibilityLabel("Instructions, unsaved changes")
   }
   menu.addItem(instructions)
+  menu.addItem(action("Library", symbol: "books.vertical", id: "dot-menu-library") { store.openDot(dot, .library) })
   return menu
 }
 

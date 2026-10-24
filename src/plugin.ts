@@ -6,7 +6,14 @@ import { and, asc, count, desc, eq, gt, isNull, ne, or } from "drizzle-orm";
 import { Schema } from "effect";
 import { type Db, openDatabase } from "./db";
 import { unreadFeed } from "./feed";
-import { databasePath, workDirectory, worktreeDirectory } from "./home";
+import { databasePath, outputDirectory, workDirectory, worktreeDirectory } from "./home";
+import {
+  addDeliverable,
+  artifactCountLimit,
+  artifactSizeLimit,
+  artifactTotalLimit,
+  prepareOutput,
+} from "./library";
 import {
   parseSearch,
   searchDefaultLimit,
@@ -600,8 +607,33 @@ ${dataJSON(
           const worktree = row.source
             ? `, a new git worktree of ${row.source} on branch ${row.branch}`
             : "";
+          const output = outputDirectory(name, row.id);
+          const outputNote = prepareOutput(name, row.id)
+            ? `It's told to save file deliverables in its own output directory, ${output}; add one to your owner's Library with dot_library_add.`
+            : `Its output directory, ${output}, couldn't be made, so nothing it makes can be added to your owner's Library.`;
           return {
-            content: `Worker #${row.id} is queued to run in ${row.directory}${worktree}, session ${row.sessionID}. It hasn't started yet, and its report will arrive here.`,
+            content: `Worker #${row.id} is queued to run in ${row.directory}${worktree}, session ${row.sessionID}. It hasn't started yet, and its report will arrive here. ${outputNote}`,
+          };
+        },
+      });
+      editor.add({
+        name: "dot_library_add",
+        description: `Add a file one of your own workers saved in its output directory to your Library, where your owner can find and export it. Only .txt, .md, .markdown, .csv and .pdf files, each at most ${artifactSizeLimit / 1024 / 1024} MiB, a regular file and not a link; at most ${artifactCountLimit} files and ${artifactTotalLimit / 1024 / 1024} MiB in all. The Library keeps a private copy, so later changes to the file don't reach it. Adding the same file again unchanged finds the first copy.`,
+        input: Schema.Struct({
+          worker: id("The worker's number"),
+          path: text(
+            "The file's path relative to that worker's output directory, such as report.md, or its absolute path inside that directory",
+          ),
+        }),
+        options: { codemode: false },
+        execute: async (input, call) => {
+          if (!bound(call.sessionID))
+            throw new Error(`Only ${name}'s exact bound conversation can add to its Library.`);
+          const added = addDeliverable(db, name, input.worker, input.path);
+          if ("error" in added) throw new Error(`Not added. ${added.error}`);
+          const { artifact } = added;
+          return {
+            content: `${added.added ? "Added" : "Already in your Library as"} deliverable #${artifact.id}: ${dataJSON({ name: artifact.name, type: artifact.mime, bytes: artifact.size, sha256: artifact.sha256, worker: artifact.worker, session: artifact.sessionID })}`,
           };
         },
       });

@@ -4,7 +4,7 @@ import { SessionMessage } from "@opencode/client/effect";
 import { and, asc, eq, gt, inArray, isNull, lte, ne, or, isNotNull } from "drizzle-orm";
 import { Effect, Exit, type Layer, Result, Schedule, Semaphore } from "effect";
 import type { Db } from "./db";
-import { worktreeDirectory } from "./home";
+import { outputDirectory, worktreeDirectory } from "./home";
 import {
   OpenCode,
   type OpenCodeError,
@@ -469,6 +469,8 @@ const worktreeNote = (worker: Worker) =>
 const taskPrompt = (
   worker: Worker,
 ) => `You are a worker for the dot "${worker.dot}". Do this task without asking questions. When something is unclear, make a reasonable assumption and say so. Finish with a concise summary of what you did and found.${worktreeNote(worker)}
+
+Save any file deliverable, such as a report as .md, .txt, .csv or .pdf, in your own output directory, ${outputDirectory(worker.dot, worker.id)}, and name each one in your summary by its path there, so your dot can add it to its owner's Library.
 
 Task:
 ${worker.task}`;

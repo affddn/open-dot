@@ -16,3 +16,10 @@ export const workDirectory = (name: string) => join(home(), "work", name);
 /** The git worktree of a worker that runs in a repository. */
 export const worktreeDirectory = (dot: string, id: number) =>
   join(home(), "worktrees", dot, String(id));
+
+/** Where a worker saves files its dot may add to its Library. Only this worker's, never shared. */
+export const outputDirectory = (dot: string, id: number) =>
+  join(home(), "outputs", dot, String(id));
+
+/** The dot's Library: private, immutable copies of the deliverables it added. */
+export const libraryDirectory = (dot: string) => join(home(), "library", dot);

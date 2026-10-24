@@ -35,8 +35,14 @@ const repoMigrations = join(import.meta.dir, "..", "drizzle");
 
 // 0024 and 0025 append columns to these, so earlier migrations' tests compare only their first columns.
 const polished = ["slack_apps", "slack_events", "notes"];
-// 0026 and 0027 add these tables, so earlier migrations' tests leave them out.
-const later = ["feed_triggers", "trigger_occurrences", "responsibility_runs", "run_workers"];
+// 0026, 0027 and 0028 add these tables, so earlier migrations' tests leave them out.
+const later = [
+  "feed_triggers",
+  "trigger_occurrences",
+  "responsibility_runs",
+  "run_workers",
+  "artifacts",
+];
 
 type LedgerRow = { seq: number; id: unknown; hash: string; created_at: number };
 
@@ -1452,7 +1458,7 @@ test("0027 adds only the run tables, keeps every 0026 table, row and trigger, an
   let db = openDatabase(path);
   try {
     expect(tableNames(db.$client)).toEqual(
-      [...tables, "responsibility_runs", "run_workers"].toSorted(),
+      [...tables, "artifacts", "responsibility_runs", "run_workers"].toSorted(),
     );
     for (const name of tables)
       expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(
@@ -1474,6 +1480,63 @@ test("0027 adds only the run tables, keeps every 0026 table, row and trigger, an
     db.$client.close();
     db = openDatabase(path);
     expectLedger(db.$client, ledger, "0027");
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0028 adds only the artifacts table, keeps every 0027 table, row and trigger, and invents no deliverable", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-library-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0028");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  // A finished worker whose report named a file before the Library existed.
+  old.run(
+    "insert into workers (dot,task,directory,session_id,state,outcome,created_at) values ('jojo','Write report.md','/work','ses_w','done','succeeded',1)",
+  );
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+  const before = rows(old);
+  const ledger = ledgerOf(old);
+  const triggers = triggerSQL(old);
+  old.close();
+  let db = openDatabase(path);
+  try {
+    expect(tableNames(db.$client)).toEqual([...tables, "artifacts"].toSorted());
+    for (const name of tables)
+      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(
+        columns.get(name) ?? [],
+      );
+    expect(rows(db.$client)).toEqual(before);
+    expect(triggerSQL(db.$client)).toEqual(triggers);
+    expectLedger(db.$client, ledger, "0028");
+    expect(db.$client.query("select * from artifacts").all()).toEqual([]);
+    const add = (origin: string, sha: string, file: string) =>
+      db.$client.run(
+        `insert into artifacts (dot,worker,session_id,path,name,mime,size,sha256,file,created_at) values ('jojo',1,'ses_w','${origin}','report.md','text/markdown',1,'${sha}','${file}',2)`,
+      );
+    add("report.md", "a", "f1");
+    // The same bytes from the same place are one deliverable, and a copy's name is never reused.
+    expect(() => add("report.md", "a", "f2")).toThrow();
+    expect(() => add("other/report.md", "a", "f1")).toThrow();
+    add("report.md", "b", "f2");
+    db.$client.close();
+    db = openDatabase(path);
+    expectLedger(db.$client, ledger, "0028");
   } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });

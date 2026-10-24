@@ -1,5 +1,5 @@
 import { beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Plugin } from "@opencode/plugin";
@@ -7,11 +7,12 @@ import { eq } from "drizzle-orm";
 import { Effect } from "effect";
 import { openDatabase } from "../src/db";
 import { createDot, findDot } from "../src/dots";
-import { databasePath, home } from "../src/home";
+import { databasePath, home, outputDirectory } from "../src/home";
 import { cancelReminder, editNote, editResponsibility } from "../src/memory";
 import plugin from "../src/plugin";
 import { saveReaction } from "../src/reactions";
 import {
+  artifacts,
   dots,
   feed,
   hiddenMessages,
@@ -538,6 +539,59 @@ test("a delegated task waits as an unfinished worker in the dot's memory", async
   expect(memory).toContain("Summarize the README.");
   expect(memory).toContain(`${join(home(), "worktrees/jojo/2/src")} on branch dot/jojo-2`);
   await loaded.cleanup?.();
+});
+
+test("a dot adds only its own workers' outputs to its Library, from its own conversation", async () => {
+  const db = openDatabase(databasePath());
+  const loaded = await load(dot.directory);
+  try {
+    const delegated = await loaded.call("dot_delegate", { task: "Write the report." });
+    const output = outputDirectory("jojo", 1);
+    expect(String(delegated.content)).toContain(output);
+    expect(statSync(output).mode & 0o777).toBe(0o700);
+    writeFileSync(join(output, "report.md"), "# Report\n");
+    Effect.runSync(createDot(db, "polnareff", "Other."));
+    db.insert(workers)
+      .values({
+        dot: "polnareff",
+        task: "Theirs.",
+        directory: "/work",
+        sessionID: "ses_theirs",
+        state: "done",
+        createdAt: 0,
+      })
+      .run();
+
+    expect(
+      await fails(loaded.call("dot_library_add", { worker: 1, path: "report.md" }, "ses_side")),
+    ).toBe(true);
+    expect(await fails(loaded.call("dot_library_add", { worker: 2, path: "report.md" }))).toBe(
+      true,
+    );
+    expect(
+      await fails(
+        loaded.call("dot_library_add", { worker: 1, path: "https://example.com/report.md" }),
+      ),
+    ).toBe(true);
+    expect(db.select().from(artifacts).all()).toEqual([]);
+
+    const result = await loaded.call("dot_library_add", { worker: 1, path: "report.md" });
+    expect(String(result.content)).toContain("Added deliverable #1");
+    const worker = db.select().from(workers).where(eq(workers.id, 1)).get();
+    expect(db.select().from(artifacts).all()).toEqual([
+      expect.objectContaining({ dot: "jojo", worker: 1, sessionID: worker?.sessionID }),
+    ]);
+    const again = await loaded.call("dot_library_add", { worker: 1, path: "report.md" });
+    expect(String(again.content)).toContain("Already in your Library as deliverable #1");
+
+    db.update(dots).set({ sessionState: "creating" }).where(eq(dots.name, "jojo")).run();
+    expect(await fails(loaded.call("dot_library_add", { worker: 1, path: "report.md" }))).toBe(
+      true,
+    );
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
 });
 
 test("a dot messages another dot through the outbox, up to a cap per hour", async () => {
