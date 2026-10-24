@@ -1,5 +1,8 @@
-import { beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Effect, Fiber, Layer } from "effect";
 import { advanceWorkers, claimDue, step } from "../src/daemon";
@@ -92,6 +95,8 @@ function fakeSlack() {
     exported: new Map<string, unknown>(),
     // An error Slack gives every bot token's auth.test, as during an outage.
     botCheck: undefined as string | undefined,
+    // An error Slack gives every bots.info, when set.
+    botsInfo: undefined as string | undefined,
     // Tokens Slack has revoked, which every method refuses.
     revoked: new Set<string>(),
     // While set, apps.manifest.export waits for it before answering.
@@ -162,6 +167,7 @@ function fakeSlack() {
           ? json({ ok: true, user_id: bot.user, bot_id: bot.bot, team_id: bot.team })
           : json({ ok: false, error: "invalid_auth" });
       case "bots.info": {
+        if (state.botsInfo) return json({ ok: false, error: state.botsInfo });
         const found = [...state.bots.values()].find((candidate) => candidate.bot === params.bot);
         return found
           ? json({ ok: true, bot: { id: found.bot, app_id: found.app, user_id: found.user } })
@@ -401,6 +407,21 @@ const setup = () => ({
   now: () => time,
 });
 
+// No dot has an avatar here, so app setup never reads one from the owner's real open-dot home.
+let previousHome: string | undefined;
+let home: string;
+beforeEach(() => {
+  previousHome = process.env.OPEN_DOT_HOME;
+  home = mkdtempSync(join(tmpdir(), "open-dot-slack-agents-"));
+  process.env.OPEN_DOT_HOME = home;
+});
+
+afterEach(() => {
+  rmSync(home, { recursive: true, force: true });
+  if (previousHome === undefined) delete process.env.OPEN_DOT_HOME;
+  else process.env.OPEN_DOT_HOME = previousHome;
+});
+
 beforeEach(() => {
   db = openDatabase(":memory:");
   opencode = fakeOpenCode();
@@ -582,7 +603,9 @@ test("a create with a lost answer is never repeated on its own; the owner attach
   requestApp(db, "polnareff");
   await provision(db, shared, setup());
   expect(app("polnareff")).toMatchObject({ state: "failed" });
-  expect(app("polnareff")?.problem).toContain("bad scope");
+  // Only Slack's error code is kept, never its own words about the manifest.
+  expect(app("polnareff")?.problem).toContain("invalid_manifest");
+  expect(app("polnareff")?.problem).not.toContain("bad scope");
   fake.state.create = "lost";
   requestApp(db, "polnareff");
   await provision(db, shared, setup());
@@ -683,6 +706,52 @@ test("an app connects only when its tokens show its own app, workspace and bot",
     expect(JSON.stringify(errors.mock.calls)).not.toContain("ticket");
   } finally {
     errors.mockRestore();
+  }
+});
+
+test("a bot check's odd errors or IDs from Slack are never saved, logged or connected", async () => {
+  const logged: unknown[] = [];
+  const errors = spyOn(console, "error").mockImplementation((...args) => logged.push(...args));
+  const logs = spyOn(console, "log").mockImplementation((...args) => logged.push(...args));
+  const leak = "xoxp-LEAKED <script>";
+  try {
+    db.insert(slackApps)
+      .values({
+        dot: "jotaro",
+        state: "created",
+        appID,
+        teamID: team,
+        ownerID: owner,
+        createdAt: 0,
+        updatedAt: 0,
+      })
+      .run();
+    fake.state.keychain.set("open-dot-slack-jotaro-app", "xapp-jotaro");
+    // auth.test names a bot and user not of Slack's form.
+    fake.state.bots.set("xoxb-hostile", { user: leak, bot: leak, team, app: appID });
+    fake.state.keychain.set("open-dot-slack-jotaro-bot", "xoxb-hostile");
+    await tick();
+    expect(app()?.problem).toContain("waiting for this app's bot token");
+    // auth.test refuses in Slack's own words.
+    fake.state.keychain.set("open-dot-slack-jotaro-bot", "xoxb-jotaro");
+    fake.state.botCheck = leak;
+    time += 60_000;
+    await tick();
+    fake.state.botCheck = undefined;
+    // bots.info refuses in Slack's own words.
+    fake.state.botsInfo = leak;
+    time += 60_000;
+    await tick();
+    expect(logged.map(String).join("\n")).toContain("slack_error");
+
+    expect(app()).toMatchObject({ state: "created", botID: null, botUser: null });
+    expect(fake.sockets).toHaveLength(0);
+    const shown = `${everything()}\n${logged.map(String).join("\n")}`;
+    expect(shown).not.toContain("LEAKED");
+    expect(shown).not.toContain("<script>");
+  } finally {
+    errors.mockRestore();
+    logs.mockRestore();
   }
 });
 

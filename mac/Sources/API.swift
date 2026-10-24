@@ -850,6 +850,17 @@ func matchesArtifact(_ data: Data, _ artifact: Artifact) -> Bool {
     && SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() == artifact.sha256
 }
 
+/// Answers every redirect with no request, so the redirect itself comes back as the response
+/// and nothing, neither the token nor a body, is sent on to where it points.
+final class NoRedirects: NSObject, URLSessionTaskDelegate, Sendable {
+  func urlSession(
+    _ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest
+  ) async -> URLRequest? {
+    nil
+  }
+}
+
 enum APIError: Error {
   case unreachable
   case lost
@@ -871,15 +882,36 @@ enum APIError: Error {
   }
 
   private let file: URL
-  private let session = URLSession(configuration: .ephemeral)
+  private let session: URLSession
   private var endpoint: Endpoint?
 
-  init() {
+  /// `file` and `protocols` are for tests: another api.json, and fake URL loading in place of a daemon.
+  init(file: URL? = nil, protocols: [AnyClass] = []) {
     let home = ProcessInfo.processInfo.environment["OPEN_DOT_HOME"].map {
       URL(fileURLWithPath: NSString(string: $0).expandingTildeInPath)
     }
-    file = (home ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: ".opendot"))
-      .appending(path: "api.json")
+    self.file = file
+      ?? (home ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: ".opendot"))
+        .appending(path: "api.json")
+    // Every request carries the token, and some a Slack token, so none goes through a proxy or
+    // follows a redirect.
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.connectionProxyDictionary = [:]
+    configuration.protocolClasses = protocols + (configuration.protocolClasses ?? [])
+    session = URLSession(configuration: configuration, delegate: NoRedirects(), delegateQueue: nil)
+  }
+
+  /// The daemon's address from api.json, only as the daemon writes it: plain http to 127.0.0.1 or
+  /// [::1] with a port, and nothing else, so the token never goes anywhere but this Mac's daemon.
+  nonisolated static func loopback(_ address: String) -> URL? {
+    guard let parts = URLComponents(string: address), parts.scheme == "http",
+      let host = parts.percentEncodedHost, ["127.0.0.1", "::1", "[::1]"].contains(host),
+      let port = parts.port, (1...65535).contains(port),
+      parts.percentEncodedUser == nil, parts.percentEncodedPassword == nil,
+      parts.percentEncodedPath.isEmpty, parts.percentEncodedQuery == nil,
+      parts.percentEncodedFragment == nil
+    else { return nil }
+    return URL(string: address)
   }
 
   func dots() async throws -> [Dot] {
@@ -1140,10 +1172,47 @@ enum APIError: Error {
     return item
   }
 
+  /// The dot's Slack app, as `open-dot slack status` shows it. Never a token.
+  func slack(_ dot: String) async throws -> SlackSetup {
+    try decode(SlackSetup.self, await send("GET", "/dots/\(escape(dot))/slack"))
+  }
+
+  /// Sends one Slack action. A token goes only in this request's body, to the daemon, which saves
+  /// it in the Keychain; no answer repeats it. A manifest update rotates a token and calls Slack
+  /// twice, so it may take up to a minute.
+  func slackAction(_ dot: String, _ action: SlackAction) async throws -> SlackOutcome {
+    let path = "/dots/\(escape(dot))/slack"
+    switch action {
+    case .config(let token, let refreshToken):
+      let body = try JSONSerialization.data(withJSONObject: ["token": token, "refreshToken": refreshToken])
+      _ = try await send("POST", "/slack/config", body: body)
+      return .saved
+    case .connect(let retry):
+      let body = try JSONSerialization.data(withJSONObject: ["retry": retry])
+      return .view(try decode(SlackSetup.self, await send("POST", "\(path)/connect", body: body)))
+    case .attach(let appID):
+      let body = try JSONSerialization.data(withJSONObject: ["appID": appID])
+      return .view(try decode(SlackSetup.self, await send("POST", "\(path)/attach", body: body)))
+    case .token(let kind, let token):
+      let body = try JSONSerialization.data(withJSONObject: ["kind": kind, "token": token])
+      return .view(try decode(SlackSetup.self, await send("POST", "\(path)/tokens", body: body)))
+    case .update(let approve):
+      struct Answer: Decodable { let said: String; let confirm: [String]? }
+      var object: [String: Any] = [:]
+      if let approve { object["approve"] = approve }
+      let body = try JSONSerialization.data(withJSONObject: object)
+      let answer = try decode(Answer.self, await send("POST", "\(path)/update", body: body, timeout: 90))
+      if let changes = answer.confirm { return .confirm(changes) }
+      return .said(answer.said)
+    case .icon:
+      return .view(try decode(SlackSetup.self, await send("POST", "\(path)/icon")))
+    }
+  }
+
   // The daemon picks a new port and token on every start, so a failed connection or a 401
   // drops the cached endpoint and the next request reads api.json again.
-  private func send(_ method: String, _ path: String, body: Data? = nil) async throws -> Data {
-    let (status, data) = try await exchange(method, path, body: body)
+  private func send(_ method: String, _ path: String, body: Data? = nil, timeout: TimeInterval = 10) async throws -> Data {
+    let (status, data) = try await exchange(method, path, body: body, timeout: timeout)
     guard (200..<300).contains(status) else {
       struct Failure: Decodable { let error: String }
       let text = (try? JSONDecoder().decode(Failure.self, from: data))?.error
@@ -1152,11 +1221,13 @@ enum APIError: Error {
     return data
   }
 
-  private func exchange(_ method: String, _ path: String, body: Data? = nil) async throws -> (Int, Data) {
-    guard let endpoint = endpoint ?? load(), let url = URL(string: endpoint.url + path) else {
+  private func exchange(_ method: String, _ path: String, body: Data? = nil, timeout: TimeInterval = 10) async throws -> (Int, Data) {
+    guard let endpoint = endpoint ?? load(), Self.loopback(endpoint.url) != nil,
+      let url = URL(string: endpoint.url + path)
+    else {
       throw APIError.unreachable
     }
-    var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+    var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
     request.httpMethod = method
     request.setValue("Bearer \(endpoint.token)", forHTTPHeaderField: "Authorization")
     if let body {
@@ -1176,11 +1247,18 @@ enum APIError: Error {
     }
     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
     if status == 401 { self.endpoint = nil }
+    // The daemon never redirects, so an answer that tries is no daemon's.
+    if (300..<400).contains(status) {
+      self.endpoint = nil
+      throw APIError.unreachable
+    }
     return (status, data)
   }
 
+  /// Reads api.json, keeping it only when its address is the loopback daemon's.
   private func load() -> Endpoint? {
-    endpoint = try? JSONDecoder().decode(Endpoint.self, from: Data(contentsOf: file))
+    let read = try? JSONDecoder().decode(Endpoint.self, from: Data(contentsOf: file))
+    endpoint = read.flatMap { Self.loopback($0.url) == nil ? nil : $0 }
     return endpoint
   }
 

@@ -725,6 +725,18 @@ export const slackApps = sqliteTable("slack_apps", {
   updateAt: integer("update_at"),
   // What the owner should do after it, such as reinstalling to approve new events.
   updateNote: text("update_note"),
+  // The avatar revision the daemon last set as the app's icon with apps.icon.set.
+  iconRevision: text("icon_revision"),
+  // The latest icon attempt, for the avatar revision in `icon_attempt`. "setting" is saved just
+  // before the call. "refused" is Slack's permanent refusal, kept until a new avatar or the owner's
+  // retry. "waiting" is a rate limit or a lost answer, tried again from `icon_retry_at`.
+  iconState: text("icon_state", { enum: ["setting", "refused", "waiting"] }),
+  iconAttempt: text("icon_attempt"),
+  // Slack's error code for a refusal or wait, never its whole answer.
+  iconError: text("icon_error"),
+  // Stamped by every move of an icon attempt, so a late answer about an older one changes nothing.
+  iconAt: integer("icon_at"),
+  iconRetryAt: integer("icon_retry_at"),
   createdAt: integer("created_at").notNull(),
   updatedAt: integer("updated_at").notNull(),
 });
@@ -743,8 +755,9 @@ export type SlackApp = typeof slackApps.$inferSelect;
  */
 export const slackConfig = sqliteTable("slack_config", {
   id: integer().primaryKey(),
-  // "rotating": a rotation may be in flight. "blocked": its outcome or its save was lost, and the
-  // owner saves a new token pair with `open-dot slack config`.
+  // "rotating": a rotation, or the owner's save of a new pair (with from_iat -1), may be writing
+  // the Keychain item. "blocked": a rotation's outcome or its save was lost, and the owner saves a
+  // new token pair with `open-dot slack config` or the notch.
   state: text({ enum: ["idle", "rotating", "blocked"] }).notNull(),
   // When the saved pair was issued, so a recovered rotation can tell whether its pair was saved.
   fromIat: integer("from_iat"),

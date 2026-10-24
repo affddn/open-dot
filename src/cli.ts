@@ -4,7 +4,7 @@ import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { Effect, Schedule } from "effect";
 import { api, spawnRun } from "./api";
-import { avatarPath, setAvatar } from "./avatar";
+import { avatarPath, iconSizeWarning, setAvatar } from "./avatar";
 import { daemonLoops } from "./daemon";
 import { backupDatabase, claimDaemon, openDatabase, restoreDatabase } from "./db";
 import {
@@ -35,7 +35,6 @@ import {
   attachApp,
   checkPrompts,
   configItem,
-  configSaved,
   describe,
   noticesLine,
   promptsOf,
@@ -43,7 +42,7 @@ import {
   readHidden,
   realSetup,
   requestApp,
-  saveSecret,
+  saveConfigPair,
   setNotices,
   setPrompts,
   updateApp,
@@ -150,22 +149,15 @@ const saveConfig = Effect.suspend(() => {
   if (token === undefined) return fail(hiddenFailure);
   const refresh = readHidden("Refresh token (xoxe-…):");
   if (refresh === undefined) return fail(hiddenFailure);
-  if (!token.startsWith("xoxe.") || !refresh.startsWith("xoxe-"))
-    return fail(
-      "Those don't look like a configuration access token and refresh token. Nothing was saved.",
-    );
-  return Effect.promise(() =>
-    saveSecret(configItem, JSON.stringify({ token, refresh_token: refresh })),
-  ).pipe(
-    Effect.andThen((saved) =>
-      saved
-        ? Effect.sync(() => {
-            configSaved(db);
+  return Effect.promise(() => saveConfigPair(db, realSetup, token, refresh)).pipe(
+    Effect.andThen((problem) =>
+      problem
+        ? fail(problem)
+        : Effect.sync(() =>
             console.log(
               `Saved in the Keychain item ${configItem}. The daemon rotates the pair before each use.`,
-            );
-          })
-        : fail(`Couldn't save the Keychain item ${configItem}. Nothing was changed in open-dot.`),
+            ),
+          ),
     ),
   );
 });
@@ -358,11 +350,13 @@ const avatar = (name: string, file: string) =>
     const image = setAvatar(name, file);
     if (typeof image === "string")
       return fail(`Couldn't use ${file}: ${image} ${name}'s avatar is unchanged.`);
-    return Effect.sync(() =>
+    return Effect.sync(() => {
       console.log(
         `Saved ${name}'s avatar (${image.mime === "image/png" ? "PNG" : "JPEG"}, ${image.width}×${image.height}) at ${avatarPath(name)}. The notch shows it within a few seconds.`,
-      ),
-    );
+      );
+      const warning = iconSizeWarning(image);
+      if (warning) console.log(warning);
+    });
   });
 
 /** Only the path, so `$EDITOR "$(open-dot instructions jojo)"` works. */

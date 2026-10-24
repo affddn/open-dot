@@ -158,6 +158,15 @@ export function checkAvatar(bytes: Buffer): AvatarImage | string {
   return image;
 }
 
+/**
+ * Why Slack would refuse this avatar as a dot's app icon, since apps.icon.set takes 512 to 2000
+ * pixels a side, or undefined when it fits.
+ */
+export const iconSizeWarning = ({ width, height }: AvatarImage) =>
+  Math.min(width, height) < 512 || Math.max(width, height) > 2000
+    ? `Warning: Slack app icons must be 512 to 2000 pixels a side, so Slack will refuse this ${width}×${height} image as the dot's app icon (invalid_icon_size). Use one within that size for its Slack app.`
+    : undefined;
+
 const isDirectory = (path: string) => {
   try {
     return lstatSync(path).isDirectory();

@@ -1,6 +1,6 @@
 import { SessionMessage } from "@opencode/client/effect";
 import { and, asc, desc, eq, inArray, gte, or, ne } from "drizzle-orm";
-import { Cause, Effect, type Layer, Schema } from "effect";
+import { Cause, Effect, type Layer, Option, Schema } from "effect";
 import type { Db } from "./db";
 import { listDots } from "./dots";
 import { quoted, quoteText, replyPrompt } from "./replies";
@@ -34,6 +34,67 @@ export const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
 
 const failure = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/**
+ * The Slack error codes open-dot repeats, saves or logs. Any other answer is "slack_error", so
+ * nothing Slack sends back, which could be anything, reaches the database, a log or the notch.
+ */
+const slackErrors = new Set([
+  "access_denied",
+  "accesslimited",
+  "account_inactive",
+  "app_not_found",
+  "app_not_owned_by_manager_app",
+  "bot_not_found",
+  "deprecated_endpoint",
+  "ekm_access_denied",
+  "enterprise_is_restricted",
+  "error_bad_format",
+  "fatal_error",
+  "icon_not_accessible",
+  "internal_error",
+  "invalid_app",
+  "invalid_app_id",
+  "invalid_arg_name",
+  "invalid_arguments",
+  "invalid_auth",
+  "invalid_charset",
+  "invalid_form_data",
+  "invalid_icon_size",
+  "invalid_manifest",
+  "invalid_parameters",
+  "invalid_post_type",
+  "invalid_refresh_token",
+  "method_deprecated",
+  "missing_arguments",
+  "missing_post_type",
+  "missing_scope",
+  "no_permission",
+  "not_allowed_token_type",
+  "not_authed",
+  "org_login_required",
+  "ratelimited",
+  "request_timeout",
+  "service_unavailable",
+  "team_access_not_granted",
+  "team_added_to_org",
+  "token_expired",
+  "token_revoked",
+  "two_factor_setup_required",
+  "unable_to_open_file",
+]);
+
+/** A Slack error as open-dot may show it: a known code, or "slack_error". */
+export const slackCode = (error: unknown) =>
+  typeof error === "string" && slackErrors.has(error) ? error : "slack_error";
+
+/** Slack's ID forms. Anything else from Slack is never saved or shown. */
+export const slackIDs = {
+  app: /^A[A-Z0-9]{6,31}$/,
+  bot: /^B[A-Z0-9]{1,31}$/,
+  team: /^[TE][A-Z0-9]{1,31}$/,
+  user: /^[UW][A-Z0-9]{1,31}$/,
+} as const;
 
 // Errors that mean the token itself is bad or the wrong one, so the Keychain is read again.
 const revoked = new Set([
@@ -199,12 +260,21 @@ export function slackClient(
    */
   const identify = async (token: string): Promise<Answer | boolean> => {
     const checked = await send("bot", token, "auth.test", {});
-    // The call itself never left, so a lost check means only "not now".
-    if (checked.kind === "refused") return checked;
+    // The call itself never left, so a lost check means only "not now". A refusal is passed on,
+    // and logged, only as a known code.
+    if (checked.kind === "refused") return { kind: "refused", error: slackCode(checked.error) };
     if (checked.kind !== "ok") return false;
     const body = checked.body;
     if (typeof body.bot_id !== "string" || typeof body.user_id !== "string")
       return wrong("holds a token that isn't a bot's");
+    // IDs not of Slack's form are never kept, so none reaches the database or a log.
+    if (
+      !slackIDs.bot.test(body.bot_id) ||
+      !slackIDs.user.test(body.user_id) ||
+      (body.team_id !== undefined &&
+        (typeof body.team_id !== "string" || !slackIDs.team.test(body.team_id)))
+    )
+      return wrong("holds a token Slack describes with unrecognized IDs");
     if (options.expected) {
       const expected = current();
       if (!expected) return false;
@@ -214,7 +284,7 @@ export function slackClient(
         (!want.botID || body.bot_id === want.botID);
       if (!pinned(expected)) return wrong("holds a token for another bot");
       const info = await send("bot", token, "bots.info", { bot: body.bot_id });
-      if (info.kind === "refused") return info;
+      if (info.kind === "refused") return { kind: "refused", error: slackCode(info.error) };
       if (info.kind !== "ok") return false;
       const found = isRecord(info.body.bot) ? info.body.bot : {};
       if (found.app_id !== expected.app || found.user_id !== body.user_id)
@@ -272,14 +342,28 @@ export function slackClient(
   /** The owner's Slack user ID, from the user token. */
   const ownerID = async () => {
     if (owner) return owner;
-    const body = await read("user", "auth.test");
-    if (!body) return undefined;
-    const identity = Schema.decodeUnknownSync(Auth)(body);
+    const answer = await call("user", "auth.test");
+    if (!answer) return undefined;
+    // Only a known code, or IDs of Slack's form, ever leave here.
+    if (answer.kind !== "ok")
+      throw new Error(
+        answer.kind === "refused" ? `auth.test: ${slackCode(answer.error)}` : answer.reason,
+      );
+    const decoded = Schema.decodeUnknownOption(Auth)(answer.body);
+    const identity = Option.isSome(decoded) ? decoded.value : undefined;
+    if (
+      !identity ||
+      !slackIDs.user.test(identity.user_id) ||
+      (identity.team_id !== undefined && !slackIDs.team.test(identity.team_id))
+    )
+      throw new Error(
+        "Slack's auth.test answer for the user token names no usable user or workspace",
+      );
     owner = identity.user_id;
     ownerName = identity.user;
     team = identity.team_id;
     // Whoever owns the user token can instruct the dots, so say who that is.
-    if (owner !== announced) console.log(`Slack: acting for ${identity.user ?? "?"} (${owner})`);
+    if (owner !== announced) console.log(`Slack: acting for ${owner}`);
     announced = owner;
     return owner;
   };

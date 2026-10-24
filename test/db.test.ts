@@ -33,8 +33,24 @@ import {
 
 const repoMigrations = join(import.meta.dir, "..", "drizzle");
 
-// 0024 and 0025 append columns to these, so earlier migrations' tests compare only their first columns.
+// 0024, 0025 and 0029 append columns to these, so earlier migrations' tests compare only their first columns.
 const polished = ["slack_apps", "slack_events", "notes"];
+
+// What 0029 appends to slack_apps.
+const iconColumns = [
+  "icon_revision",
+  "icon_state",
+  "icon_attempt",
+  "icon_error",
+  "icon_at",
+  "icon_retry_at",
+];
+
+// A table's columns are the ones it had, but 0029 appends icon columns to slack_apps.
+function sameColumns(sqlite: Database, name: string, before: unknown[]) {
+  const after = sqlite.query(`pragma table_info("${name}")`).all();
+  expect(name === "slack_apps" ? after.slice(0, before.length) : after).toEqual(before);
+}
 // 0026, 0027 and 0028 add these tables, so earlier migrations' tests leave them out.
 const later = [
   "feed_triggers",
@@ -1236,7 +1252,15 @@ test("0024 appends nullable Slack polish columns, keeps every 0023 row, and leav
       const added = after.slice(stored.length).map((column) => column.name);
       expect(added).toEqual(
         name === "slack_apps"
-          ? ["prompts", "manifest_version", "update_state", "update_at", "update_note"]
+          ? // 0029 then adds the icon columns.
+            [
+              "prompts",
+              "manifest_version",
+              "update_state",
+              "update_at",
+              "update_note",
+              ...iconColumns,
+            ]
           : name === "slack_events"
             ? ["status_at", "stream", "stream_id", "stream_ts", "stream_text", "title"]
             : // 0025 then adds where a note was saved from.
@@ -1319,7 +1343,10 @@ test("0025 appends nullable note sources, keeps every 0024 row and trigger, and 
               { name: "source_session", notnull: 0, dflt_value: null, pk: 0 },
               { name: "source_message", notnull: 0, dflt_value: null, pk: 0 },
             ]
-          : [],
+          : // 0029 then appends nullable icon columns to slack_apps.
+            name === "slack_apps"
+            ? iconColumns.map((column) => ({ name: column, notnull: 0, dflt_value: null, pk: 0 }))
+            : [],
       );
     }
     expect(tables.map((name) => [name, rows(db.$client, name)])).toEqual(before);
@@ -1390,10 +1417,7 @@ test("0026 adds only the feed trigger tables, keeps every 0025 table, row and tr
   let db = openDatabase(path);
   try {
     expect(tableNames(db.$client)).toEqual([...tables, ...later].toSorted());
-    for (const name of tables)
-      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(
-        columns.get(name) ?? [],
-      );
+    for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     expect(rows(db.$client)).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
     expectLedger(db.$client, ledger, "0026");
@@ -1460,10 +1484,7 @@ test("0027 adds only the run tables, keeps every 0026 table, row and trigger, an
     expect(tableNames(db.$client)).toEqual(
       [...tables, "artifacts", "responsibility_runs", "run_workers"].toSorted(),
     );
-    for (const name of tables)
-      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(
-        columns.get(name) ?? [],
-      );
+    for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     expect(rows(db.$client)).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
     expectLedger(db.$client, ledger, "0027");
@@ -1517,10 +1538,7 @@ test("0028 adds only the artifacts table, keeps every 0027 table, row and trigge
   let db = openDatabase(path);
   try {
     expect(tableNames(db.$client)).toEqual([...tables, "artifacts"].toSorted());
-    for (const name of tables)
-      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(
-        columns.get(name) ?? [],
-      );
+    for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     expect(rows(db.$client)).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
     expectLedger(db.$client, ledger, "0028");
@@ -1537,6 +1555,71 @@ test("0028 adds only the artifacts table, keeps every 0027 table, row and trigge
     db.$client.close();
     db = openDatabase(path);
     expectLedger(db.$client, ledger, "0028");
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+/** A row without 0029's icon columns. */
+const withoutIcons = (row: Record<string, unknown>) =>
+  Object.fromEntries(Object.entries(row).filter(([key]) => !key.startsWith("icon_")));
+
+test("0029 appends only nullable icon columns to slack_apps and keeps every 0028 row", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-icon-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0029");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run(
+    "insert into slack_apps (dot,state,app_id,team_id,owner_id,bot_user,manifest_version,created_at,updated_at) values ('jojo','active','A0123456','T1','U1','UBOT',2,1,1)",
+  );
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+  const before = rows(old);
+  const ledger = ledgerOf(old);
+  const triggers = triggerSQL(old);
+  old.close();
+  let db = openDatabase(path);
+  try {
+    expect(tableNames(db.$client)).toEqual(tables);
+    for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
+    const added = db.$client
+      .query<{ name: string; notnull: number; dflt_value: unknown }, []>(
+        'pragma table_info("slack_apps")',
+      )
+      .all()
+      .slice(columns.get("slack_apps")?.length);
+    expect(added.map(({ name, notnull, dflt_value }) => ({ name, notnull, dflt_value }))).toEqual(
+      iconColumns.map((name) => ({ name, notnull: 0, dflt_value: null })),
+    );
+    expect(
+      rows(db.$client).map(([name, list]) => [
+        name,
+        (list as Record<string, unknown>[]).map(withoutIcons),
+      ]),
+    ).toEqual(before);
+    // The old app knows no icon, so the daemon sets it from the avatar once.
+    expect(
+      db.$client.query("select icon_revision, icon_state, icon_at from slack_apps").all(),
+    ).toEqual([{ icon_revision: null, icon_state: null, icon_at: null }]);
+    expect(triggerSQL(db.$client)).toEqual(triggers);
+    expectLedger(db.$client, ledger, "0029");
+    db.$client.close();
+    db = openDatabase(path);
+    expectLedger(db.$client, ledger, "0029");
   } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });

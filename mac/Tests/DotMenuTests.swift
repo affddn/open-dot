@@ -10,14 +10,14 @@ final class DotMenuTests: XCTestCase {
     store.instructions["jolyne"] = draft("mine")
 
     let menu = dotMenu(store, dot: "jolyne")
-    XCTAssertEqual(menu.items.map(\.title), ["Memory", "Instructions •", "Library", "Health"], "Unsaved instructions are marked")
+    XCTAssertEqual(menu.items.map(\.title), ["Memory", "Instructions •", "Library", "Health", "Slack"], "Unsaved instructions are marked")
     XCTAssertEqual(try item(menu, "dot-menu-instructions").accessibilityLabel(), "Instructions, unsaved changes")
     try choose(menu, "dot-menu-instructions")
     await eventually { store.selected == "jolyne" && store.pane == .instructions }
     XCTAssertFalse(store.showingFeed)
 
     let other = dotMenu(store, dot: "jojo")
-    XCTAssertEqual(other.items.map(\.title), ["Memory", "Instructions", "Library", "Health"])
+    XCTAssertEqual(other.items.map(\.title), ["Memory", "Instructions", "Library", "Health", "Slack"])
     try choose(other, "dot-menu-memory")
     await eventually { store.selected == "jojo" && store.pane == .memory }
     XCTAssertEqual(store.instructions["jolyne"]?.draft, "mine", "Switching dots keeps the draft")
@@ -29,7 +29,7 @@ final class DotMenuTests: XCTestCase {
   }
 
   @MainActor func testMenuViewsKeepChatUnreadUntilChatIsOpened() async throws {
-    for (id, pane) in [("dot-menu-memory", Store.Pane.memory), ("dot-menu-instructions", .instructions), ("dot-menu-library", .library), ("dot-menu-health", .health)] {
+    for (id, pane) in [("dot-menu-memory", Store.Pane.memory), ("dot-menu-instructions", .instructions), ("dot-menu-library", .library), ("dot-menu-health", .health), ("dot-menu-slack", .slack)] {
       let store = try isolatedStore()
       store.instructions["jolyne"] = draft("mine")
       var time = 1.0

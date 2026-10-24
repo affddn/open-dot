@@ -1,11 +1,11 @@
 import { and, eq, inArray, isNull, lt } from "drizzle-orm";
 import { Option, Schema } from "effect";
-import { avatarPath, avatarRevision } from "./avatar";
+import { avatarPath, avatarRevision, readAvatar } from "./avatar";
 import type { Db } from "./db";
 import { findDot } from "./dots";
 import { type Fetch, output } from "./feed";
 import { type SlackApp, type SuggestedPrompt, slackApps, slackConfig } from "./schema";
-import { isRecord, type Slack } from "./slack";
+import { isRecord, type Slack, slackCode, slackIDs } from "./slack";
 
 /** The Keychain item holding the owner's app configuration token pair, as JSON. */
 export const configItem = "open-dot-slack-config";
@@ -155,6 +155,8 @@ const Pair = Schema.Struct({
   token: Schema.optionalKey(Schema.String),
   refresh_token: Schema.String,
   iat: Schema.optionalKey(Schema.Number),
+  // The claim time of the owner's save that wrote this pair, which proves that save finished.
+  saved: Schema.optionalKey(Schema.Number),
 });
 
 const Rotated = Schema.Struct({
@@ -246,28 +248,66 @@ export const realSetup: Setup = {
 
 type Answer =
   | { readonly kind: "ok"; readonly body: Record<string, unknown> }
-  | { readonly kind: "refused"; readonly error: string; readonly body: Record<string, unknown> }
+  | {
+      readonly kind: "refused";
+      // One of `slackErrors`, or "slack_error": never Slack's own words.
+      readonly error: string;
+      // Seconds, from Slack's Retry-After header on a rate limit.
+      readonly retryAfter?: number;
+    }
   | { readonly kind: "lost" };
 
-/** One call to Slack's configuration API. Its answers can carry secrets, so none is logged. */
+/** An ID to print in a message: itself when it has Slack's form, else fixed words. */
+const shownID = (id: string, form: RegExp) => (form.test(id) ? id : "an unrecognized ID");
+
+/** An image to send as the multipart `file` field. */
+interface Upload {
+  readonly name: string;
+  readonly mime: string;
+  readonly bytes: Buffer;
+}
+
+/**
+ * One call to Slack's configuration API. Its answers can carry secrets, so none is logged. With
+ * a file, the call is multipart and the token goes in the Authorization header instead.
+ */
 async function configCall(
   setup: Setup,
   method: string,
   params: Record<string, string>,
+  file?: Upload,
 ): Promise<Answer> {
   const base = process.env.OPEN_DOT_SLACK_URL ?? "https://slack.com/api";
+  let request: RequestInit;
+  if (file) {
+    const { token, ...fields } = params;
+    const form = new FormData();
+    for (const [key, value] of Object.entries(fields)) form.append(key, value);
+    form.append("file", new Blob([new Uint8Array(file.bytes)], { type: file.mime }), file.name);
+    request = { headers: { authorization: `Bearer ${token ?? ""}` }, body: form };
+  } else
+    request = {
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(params).toString(),
+    };
   try {
     const response = await setup.fetch(`${base}/${method}`, {
       method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams(params).toString(),
+      ...request,
       signal: AbortSignal.timeout(20_000),
     });
-    if (response.status === 429) return { kind: "refused", error: "ratelimited", body: {} };
+    if (response.status === 429) {
+      const after = Number(response.headers.get("retry-after"));
+      return {
+        kind: "refused",
+        error: "ratelimited",
+        ...(Number.isFinite(after) && after > 0 ? { retryAfter: after } : {}),
+      };
+    }
     const body: unknown = await response.json().catch(() => undefined);
     if (response.status < 500 && isRecord(body)) {
       if (body.ok === true) return { kind: "ok", body };
-      if (typeof body.error === "string") return { kind: "refused", error: body.error, body };
+      if (typeof body.error === "string") return { kind: "refused", error: slackCode(body.error) };
     }
   } catch {
     // Whatever went wrong, the call may have taken effect.
@@ -283,7 +323,8 @@ const maybeDone = new Set([
   "request_timeout",
 ]);
 
-class Blocked extends Error {}
+/** A configuration token problem the owner has to fix, or a wait. Its words carry no secret. */
+export class Blocked extends Error {}
 
 const configRow = (db: Db, now: number) => {
   db.insert(slackConfig)
@@ -295,15 +336,29 @@ const configRow = (db: Db, now: number) => {
   return row;
 };
 
-type ConfigState = (typeof slackConfig.$inferSelect)["state"];
+type ConfigRow = typeof slackConfig.$inferSelect;
 
-const setConfig = (db: Db, set: Partial<typeof slackConfig.$inferInsert>, from: ConfigState[]) =>
+/**
+ * Moves the configuration row on only from the very state, time and `from_iat` it was read
+ * with, so an answer about an older rotation or save never touches a newer claim.
+ */
+const setConfigFrom = (db: Db, seen: ConfigRow, set: Partial<typeof slackConfig.$inferInsert>) =>
   db
     .update(slackConfig)
     .set(set)
-    .where(and(eq(slackConfig.id, 1), inArray(slackConfig.state, from)))
+    .where(
+      and(
+        eq(slackConfig.id, 1),
+        eq(slackConfig.state, seen.state),
+        eq(slackConfig.updatedAt, seen.updatedAt),
+        seen.fromIat === null ? isNull(slackConfig.fromIat) : eq(slackConfig.fromIat, seen.fromIat),
+      ),
+    )
     .returning({ id: slackConfig.id })
     .get() !== undefined;
+
+/** How long a claim on the configuration item holds before another may take it over. */
+const claimStale = 60_000;
 
 const readPair = async (setup: Setup) => {
   const saved = await setup.read(configItem);
@@ -317,30 +372,41 @@ const readPair = async (setup: Setup) => {
   }
 };
 
+const superseded =
+  "the configuration tokens changed while they were being rotated, so this rotation's tokens weren't used. Trying again later.";
+
 /**
  * A fresh app configuration token for the owner, rotated just now so Slack says whose it is.
  * The intent is saved before the rotation and the new pair goes straight to the Keychain. A
  * rotation whose outcome or save is lost blocks every later one until the owner saves a new pair,
- * because Slack may already have used up the old refresh token.
+ * because Slack may already have used up the old refresh token. Every move is conditional on the
+ * claim this rotation made, renewed just before its pair is saved, so a rotation that outlived
+ * its claim, which the owner's save may have taken over, saves nothing and returns no token. This
+ * guards against open-dot's own processes, within the Keychain calls' time limits, not against a
+ * process suspended past a minute or another program writing the item.
  */
 export async function freshConfig(db: Db, setup: Setup, owner: { id: string; team: string }) {
   const now = setup.now();
   let row = configRow(db, now);
-  if (row.state === "rotating" && now - row.updatedAt > 60_000) {
-    // A daemon stopped mid-rotation. Only a saved newer pair shows that it finished.
+  if (row.state === "rotating" && now - row.updatedAt > claimStale) {
+    // A process stopped mid-rotation or mid-save. Only the pair it meant to save shows that it
+    // finished: a newer rotated one, or the owner's marked with that save's claim time.
     const pair = await readPair(setup).catch(() => undefined);
-    const finished = (pair?.iat ?? 0) > (row.fromIat ?? 0);
-    setConfig(
+    const finished =
+      row.fromIat === -1 ? pair?.saved === row.updatedAt : (pair?.iat ?? 0) > (row.fromIat ?? 0);
+    setConfigFrom(
       db,
+      row,
       finished
-        ? { state: "idle", problem: null, updatedAt: now }
+        ? { state: "idle", problem: null, updatedAt: Math.max(now, row.updatedAt + 1) }
         : {
             state: "blocked",
             problem:
-              "a configuration token rotation was interrupted, so its new tokens may be lost. Generate a new configuration token pair and save it with: open-dot slack config",
-            updatedAt: now,
+              row.fromIat === -1
+                ? "saving a configuration token pair was interrupted, so the Keychain item may hold either pair. Save the pair again with: open-dot slack config"
+                : "a configuration token rotation was interrupted, so its new tokens may be lost. Generate a new configuration token pair and save it with: open-dot slack config",
+            updatedAt: Math.max(now, row.updatedAt + 1),
           },
-      ["rotating"],
     );
     row = configRow(db, now);
   }
@@ -348,21 +414,29 @@ export async function freshConfig(db: Db, setup: Setup, owner: { id: string; tea
   const pair = await readPair(setup);
   if (!pair)
     throw new Blocked(`save your app configuration tokens first, with: open-dot slack config`);
-  if (
-    !setConfig(db, { state: "rotating", fromIat: pair.iat ?? 0, problem: null, updatedAt: now }, [
-      "idle",
-    ])
-  )
-    throw new Blocked("another rotation started");
+  // Claimed only if nothing moved since the row was read, before the pair was.
+  let mine: ConfigRow = {
+    ...row,
+    state: "rotating",
+    fromIat: pair.iat ?? 0,
+    problem: null,
+    updatedAt: Math.max(now, row.updatedAt + 1),
+  };
+  const { state, fromIat, problem, updatedAt } = mine;
+  if (!setConfigFrom(db, row, { state, fromIat, problem, updatedAt }))
+    throw new Blocked("another rotation or save started");
   const answer = await configCall(setup, "tooling.tokens.rotate", {
     refresh_token: pair.refresh_token,
   });
-  const block = (problem: string) => {
-    setConfig(db, { state: "blocked", problem, updatedAt: setup.now() }, ["rotating"]);
-    return new Blocked(problem);
+  const block = (reason: string) => {
+    setConfigFrom(db, mine, { state: "blocked", problem: reason, updatedAt: setup.now() });
+    return new Blocked(reason);
   };
   if (answer.kind === "refused" && answer.error === "ratelimited") {
-    setConfig(db, { state: "idle", updatedAt: setup.now() }, ["rotating"]);
+    setConfigFrom(db, mine, {
+      state: "idle",
+      updatedAt: Math.max(setup.now(), mine.updatedAt + 1),
+    });
     throw new Blocked("Slack is rate limiting token rotation; trying again later");
   }
   if (answer.kind === "refused" && !maybeDone.has(answer.error))
@@ -377,6 +451,11 @@ export async function freshConfig(db: Db, setup: Setup, owner: { id: string; tea
   if (Option.isNone(rotated))
     throw block("Slack's rotation answer was unreadable. Generate and save a new pair.");
   const fresh = rotated.value;
+  // Renewed just before the save, so a takeover can start only a minute after, while the save is
+  // limited to 10 seconds. A process suspended for longer isn't fenced off.
+  const renewed: ConfigRow = { ...mine, updatedAt: Math.max(setup.now(), mine.updatedAt + 1) };
+  if (!setConfigFrom(db, mine, { updatedAt: renewed.updatedAt })) throw new Blocked(superseded);
+  mine = renewed;
   const savedPair = await setup
     .save(
       configItem,
@@ -395,11 +474,24 @@ export async function freshConfig(db: Db, setup: Setup, owner: { id: string; tea
       `the rotated configuration tokens couldn't be saved to the Keychain item ${configItem}. Generate a new configuration token pair and save it with: open-dot slack config`,
     );
   // The pair is saved, so a later recovery finds it. A pair of someone else's creates nothing.
-  if (fresh.user_id !== owner.id || fresh.team_id !== owner.team)
+  if (
+    fresh.user_id !== owner.id ||
+    fresh.team_id !== owner.team ||
+    !slackIDs.user.test(fresh.user_id) ||
+    !slackIDs.team.test(fresh.team_id)
+  )
     throw block(
-      `the configuration token belongs to ${fresh.user_id} in ${fresh.team_id}, not the owner ${owner.id} in ${owner.team} from open-dot-slack-user. Save the owner's own pair with: open-dot slack config`,
+      `the configuration token belongs to ${shownID(fresh.user_id, slackIDs.user)} in ${shownID(fresh.team_id, slackIDs.team)}, not the owner ${shownID(owner.id, slackIDs.user)} in ${shownID(owner.team, slackIDs.team)} from open-dot-slack-user. Save the owner's own pair with: open-dot slack config`,
     );
-  setConfig(db, { state: "idle", fromIat: fresh.iat, updatedAt: setup.now() }, ["rotating"]);
+  // A claim lost meanwhile means the outcome isn't this rotation's to settle: no token is used.
+  if (
+    !setConfigFrom(db, mine, {
+      state: "idle",
+      fromIat: fresh.iat,
+      updatedAt: Math.max(setup.now(), mine.updatedAt + 1),
+    })
+  )
+    throw new Blocked(superseded);
   return { token: fresh.token, team: fresh.team_id, user: fresh.user_id };
 }
 
@@ -432,15 +524,6 @@ const setSeen = (db: Db, seen: SlackApp, from: SlackApp["state"][], set: Partial
     .returning({ dot: slackApps.dot })
     .get() !== undefined;
 
-const errorsOf = (body: Record<string, unknown>) =>
-  Array.isArray(body.errors)
-    ? body.errors
-        .flatMap((error) =>
-          isRecord(error) && typeof error.message === "string" ? [error.message] : [],
-        )
-        .join("; ")
-    : "";
-
 /** Creates one requested app. The attempt is saved before the call, which is never repeated blindly. */
 async function create(db: Db, setup: Setup, app: SlackApp, owner: { id: string; team: string }) {
   const dot = findDot(db, app.dot);
@@ -454,15 +537,17 @@ async function create(db: Db, setup: Setup, app: SlackApp, owner: { id: string; 
     manifest: JSON.stringify(manifest(dot.name, dot.purpose)),
   });
   // Only the public app ID is kept. The client secret and signing secrets aren't needed.
-  if (answer.kind === "ok" && typeof answer.body.app_id === "string") {
+  // An app ID not of Slack's form is never saved: the app may exist, so it's left for the owner.
+  const appID = answer.kind === "ok" ? answer.body.app_id : undefined;
+  if (typeof appID === "string" && slackIDs.app.test(appID)) {
     setSeen(db, claimed, ["creating"], {
       state: "created",
-      appID: answer.body.app_id,
+      appID,
       teamID: config.team,
       ownerID: config.user,
       manifestVersion,
     });
-    console.log(`Slack: created the app ${answer.body.app_id} for ${app.dot}`);
+    console.log(`Slack: created the app ${appID} for ${app.dot}`);
     return;
   }
   if (answer.kind === "refused" && answer.error === "ratelimited") {
@@ -470,10 +555,9 @@ async function create(db: Db, setup: Setup, app: SlackApp, owner: { id: string; 
     return;
   }
   if (answer.kind === "refused" && !maybeDone.has(answer.error)) {
-    const details = errorsOf(answer.body);
     setSeen(db, claimed, ["creating"], {
       state: "failed",
-      problem: `Slack refused to create the app: ${answer.error}${details ? ` (${details})` : ""}`,
+      problem: `Slack refused to create the app: ${answer.error}`,
     });
     return;
   }
@@ -651,8 +735,7 @@ export async function updateApp(
     );
   }
   if (answer.kind === "refused" && !maybeDone.has(answer.error)) {
-    const details = errorsOf(answer.body);
-    const note = `Slack refused the manifest update: ${answer.error}${details ? ` (${details})` : ""}. Nothing changed in Slack.`;
+    const note = `Slack refused the manifest update: ${answer.error}. Nothing changed in Slack.`;
     return settle({ updateState: "failed", updateNote: note }, note);
   }
   const note = `The manifest update got no clear answer, so it may have landed. It's never sent again on its own: run open-dot slack update ${dot} to check the app's manifest with Slack.`;
@@ -677,23 +760,284 @@ export async function provision(db: Db, shared: Slack, setup: Setup = realSetup)
     .from(slackApps)
     .where(inArray(slackApps.state, ["requested", "attaching"]))
     .all();
-  if (pending.length === 0) return;
-  const id = await shared.owner();
-  const team = shared.team();
-  if (!id || !team) return;
-  // Rotations are serialized: one app at a time, in one loop.
-  for (const app of pending) {
+  const id = pending.length > 0 ? await shared.owner() : undefined;
+  const team = id ? shared.team() : undefined;
+  if (id && team) {
+    // Rotations are serialized: one app at a time, in one loop.
+    for (const app of pending) {
+      try {
+        if (app.state === "requested") await create(db, setup, app, { id, team });
+        else await attach(db, setup, app, { id, team });
+      } catch (error) {
+        // Only open-dot's own words are saved, where the notch shows them; anything else is
+        // logged in fixed words and left to the daemon's log line from the setup loop.
+        const problem =
+          error instanceof Blocked
+            ? error.message
+            : "app setup failed unexpectedly; see the daemon's log";
+        if (problem !== app.problem) console.error(`Slack app for ${app.dot}: ${problem}`);
+        setSeen(db, app, [app.state], { problem });
+        if (error instanceof Blocked) return;
+        throw error;
+      }
+    }
+  }
+  await setIcons(db, setup);
+}
+
+/** Slack's apps.icon.set is Tier 1, so open-dot makes at most one such call a minute. */
+const iconSpacing = 60_000;
+/** A daemon's own call ends within 20 seconds, so an older "setting" was left by a stopped one. */
+const iconStale = 60_000;
+/** The latest time `Date` can show, so even a huge Retry-After is kept, and still printable. */
+const latestTime = 8.64e15;
+/** What an icon call with no clear answer, or one left by a stopped daemon, is saved as. */
+export const unknownOutcome = "unknown_outcome";
+
+export type IconStatus = "no-avatar" | "set" | "pending" | "setting" | "waiting" | "refused";
+
+/**
+ * Where the app's icon stands against the dot's current avatar. A rate limit holds every revision,
+ * so "waiting" shows whatever the avatar is now.
+ */
+export function iconStatus(app: SlackApp, revision = avatarRevision(app.dot)): IconStatus {
+  if (!revision) return "no-avatar";
+  if (app.iconRevision === revision) return "set";
+  if (app.iconState === "setting") return "setting";
+  if (app.iconState === "waiting") return "waiting";
+  if (app.iconAttempt === revision && app.iconState === "refused") return "refused";
+  return "pending";
+}
+
+/** Until when Slack's rate limit holds every icon call, across every app, or 0. */
+const iconLimit = (apps: readonly SlackApp[]) =>
+  Math.max(0, ...apps.map((app) => (app.iconState === "waiting" ? (app.iconRetryAt ?? 0) : 0)));
+
+/**
+ * Moves an icon attempt on, only from the very state and stamp `seen` was read with, for the
+ * same app. Each move stamps `icon_at` past the last, so a late answer changes nothing newer.
+ */
+const setIcon = (db: Db, seen: SlackApp, now: number, set: Partial<SlackApp>) => {
+  const stamp = Math.max(now, (seen.iconAt ?? 0) + 1);
+  const saved = db
+    .update(slackApps)
+    .set({ ...set, iconAt: stamp, updatedAt: Date.now() })
+    .where(
+      and(
+        eq(slackApps.dot, seen.dot),
+        inArray(slackApps.state, ["created", "active"]),
+        seen.appID === null ? isNull(slackApps.appID) : eq(slackApps.appID, seen.appID),
+        seen.iconState === null
+          ? isNull(slackApps.iconState)
+          : eq(slackApps.iconState, seen.iconState),
+        seen.iconAt === null ? isNull(slackApps.iconAt) : eq(slackApps.iconAt, seen.iconAt),
+      ),
+    )
+    .returning({ dot: slackApps.dot })
+    .get();
+  return saved ? stamp : undefined;
+};
+
+/**
+ * Sets one app's icon from its dot's avatar with apps.icon.set, when the avatar's revision isn't
+ * the one last set. A call whose outcome is unknown, or one a stopped daemon left, is never sent
+ * again on its own: like a refusal, it waits for a new avatar or the owner's retry. Slack's rate
+ * limit holds every app until its Retry-After. One call a pass, at most one a minute.
+ */
+export async function setIcons(db: Db, setup: Setup) {
+  const now = setup.now();
+  const apps = db
+    .select()
+    .from(slackApps)
+    .where(inArray(slackApps.state, ["created", "active"]))
+    .all();
+  if (apps.length === 0) return;
+  for (const app of apps)
+    if (app.iconState === "setting" && now - (app.iconAt ?? 0) >= iconStale)
+      setIcon(db, app, now, { iconState: "refused", iconError: unknownOutcome });
+  const last = Math.max(0, ...apps.map((app) => app.iconAt ?? 0));
+  if (now - last < iconSpacing || now < iconLimit(apps)) return;
+  for (const app of apps) {
+    if (!app.appID || !app.ownerID || !app.teamID) continue;
+    const revision = avatarRevision(app.dot);
+    const status = iconStatus(app, revision);
+    if (!revision || status === "set" || status === "refused" || status === "setting") continue;
+    const avatar = readAvatar(app.dot);
+    // Read only while the revision stayed the same, so the bytes are that revision's.
+    if ("status" in avatar || avatarRevision(app.dot) !== revision) continue;
+    let config: Awaited<ReturnType<typeof freshConfig>>;
     try {
-      if (app.state === "requested") await create(db, setup, app, { id, team });
-      else await attach(db, setup, app, { id, team });
+      config = await freshConfig(db, setup, { id: app.ownerID, team: app.teamID });
     } catch (error) {
-      const problem = error instanceof Error ? error.message : String(error);
-      if (problem !== app.problem) console.error(`Slack app for ${app.dot}: ${problem}`);
-      setSeen(db, app, [app.state], { problem });
+      // The configuration token's own state says why; slack status shows it.
       if (error instanceof Blocked) return;
       throw error;
     }
+    const stamp = setIcon(db, app, setup.now(), {
+      iconState: "setting",
+      iconAttempt: revision,
+      iconError: null,
+      iconRetryAt: null,
+    });
+    if (stamp === undefined) return;
+    const claimed: SlackApp = { ...app, iconState: "setting", iconAt: stamp };
+    const answer = await configCall(
+      setup,
+      "apps.icon.set",
+      { token: config.token, app_id: app.appID },
+      {
+        name: avatar.mime === "image/png" ? "avatar.png" : "avatar.jpg",
+        mime: avatar.mime,
+        bytes: avatar.bytes,
+      },
+    );
+    const at = setup.now();
+    if (answer.kind === "ok")
+      setIcon(db, claimed, at, { iconState: null, iconRevision: revision, iconError: null });
+    else if (answer.kind === "refused" && answer.error === "ratelimited")
+      // Slack refused this call, so it's sent again once Retry-After has passed, however long.
+      setIcon(db, claimed, at, {
+        iconState: "waiting",
+        iconError: answer.error,
+        iconRetryAt: Math.min(
+          latestTime,
+          Math.ceil(at + Math.max((answer.retryAfter ?? 60) * 1000, iconSpacing)),
+        ),
+      });
+    else {
+      const error =
+        answer.kind === "refused" && !maybeDone.has(answer.error) ? answer.error : unknownOutcome;
+      setIcon(db, claimed, at, { iconState: "refused", iconError: error });
+      console.error(`Slack app for ${app.dot}: Slack didn't set its icon (${error})`);
+    }
+    return;
   }
+}
+
+/**
+ * The owner's retry of the app's icon: it's set again from the current avatar on a later pass,
+ * after a refusal or an unknown outcome too. Gives why not, when it can't be: no app yet, a call
+ * in flight, or Slack's rate limit still holding icon calls.
+ */
+export function retryIcon(db: Db, dot: string, now = Date.now()) {
+  const apps = db.select().from(slackApps).all();
+  const app = apps.find((row) => row.dot === dot);
+  if (!app?.appID || !["created", "active"].includes(app.state))
+    return `${dot} has no created Slack app yet.`;
+  if (!avatarRevision(dot))
+    return `${dot} has no avatar. Set one with: open-dot avatar ${dot} <file>`;
+  if (app.iconState === "setting") return "The daemon is setting the icon now.";
+  if (now < iconLimit(apps))
+    return "Slack is rate limiting icon changes. The daemon tries again on its own once it allows.";
+  const cleared = db
+    .update(slackApps)
+    .set({
+      iconRevision: null,
+      iconState: null,
+      iconAttempt: null,
+      iconError: null,
+      iconRetryAt: null,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(slackApps.dot, dot),
+        eq(slackApps.appID, app.appID),
+        app.iconState === null
+          ? isNull(slackApps.iconState)
+          : eq(slackApps.iconState, app.iconState),
+        app.iconAt === null ? isNull(slackApps.iconAt) : eq(slackApps.iconAt, app.iconAt),
+      ),
+    )
+    .returning({ dot: slackApps.dot })
+    .get();
+  return cleared ? undefined : "The icon changed meanwhile. Try again.";
+}
+
+/** Clears what's known about an app's icon, when the app it was set on is no longer the one. */
+const noIcon = {
+  iconRevision: null,
+  iconState: null,
+  iconAttempt: null,
+  iconError: null,
+  iconRetryAt: null,
+} as const;
+
+const tokenLimit = 1024;
+/** A token of the given kind, by its prefix: printable ASCII without spaces, bounded. */
+const looksLike = (token: string, prefix: string) =>
+  token.length > prefix.length &&
+  token.length <= tokenLimit &&
+  token.startsWith(prefix) &&
+  /^[\x21-\x7e]+$/.test(token);
+
+/**
+ * Saves the owner's configuration token pair in its Keychain item, which ends a blocked rotation.
+ * The CLI and the notch share it. A save and a rotation both write that item, so a save claims
+ * the same "rotating" state a rotation does, only from the row as it read it: idle, blocked, or a
+ * claim over a minute old that a stopped process left. It's refused while a rotation runs, which
+ * renews its claim just before saving its own pair, so, among open-dot's own processes within
+ * the Keychain calls' time limits, neither overwrites the other. A save whose
+ * outcome is unclear blocks rotation until the owner saves again, since the item may hold either
+ * pair. The pair carries its claim's time, and the claim a `from_iat` of -1, so a save a stopped
+ * process left counts as finished only when the item holds that very pair; otherwise it blocks.
+ * Gives why not, never a token.
+ */
+export async function saveConfigPair(db: Db, setup: Setup, token: string, refresh: string) {
+  if (!looksLike(token, "xoxe.") || !looksLike(refresh, "xoxe-"))
+    return "Those don't look like a configuration access token and refresh token. Nothing was saved.";
+  const now = setup.now();
+  const before = configRow(db, now);
+  const mine: ConfigRow = {
+    ...before,
+    state: "rotating",
+    fromIat: -1,
+    problem: null,
+    updatedAt: Math.max(now, before.updatedAt + 1),
+  };
+  const active = before.state === "rotating" && now - before.updatedAt <= claimStale;
+  const { state, fromIat, problem, updatedAt } = mine;
+  if (active || !setConfigFrom(db, before, { state, fromIat, problem, updatedAt }))
+    return "A configuration token rotation is in progress, so nothing was saved. Try again in a minute.";
+  const saved = await setup
+    .save(configItem, JSON.stringify({ token, refresh_token: refresh, saved: mine.updatedAt }))
+    .catch(() => false);
+  const after = Math.max(setup.now(), mine.updatedAt + 1);
+  if (!saved) {
+    setConfigFrom(db, mine, {
+      state: "blocked",
+      problem: `saving a configuration token pair to the Keychain item ${configItem} wasn't confirmed, so it may hold either pair. Save the pair again with: open-dot slack config`,
+      updatedAt: after,
+    });
+    return `Couldn't confirm the configuration tokens were saved in the Keychain item ${configItem}, so it may hold either pair. Save the pair again.`;
+  }
+  if (!setConfigFrom(db, mine, { state: "idle", fromIat: 0, problem: null, updatedAt: after }))
+    return "The configuration tokens changed while they were being saved, so this save may not be the one in the Keychain. Save the pair again.";
+  return undefined;
+}
+
+/**
+ * Saves a created app's bot token (`xoxb-…`) or app-level token (`xapp-…`) in its Keychain item,
+ * where the daemon reads and checks it. Gives why not, never the token.
+ */
+export async function saveAppToken(
+  db: Db,
+  setup: Setup,
+  dot: string,
+  kind: "bot" | "app",
+  token: string,
+) {
+  const app = db.select().from(slackApps).where(eq(slackApps.dot, dot)).get();
+  if (!app?.appID || !["created", "active"].includes(app.state))
+    return `${dot} has no created Slack app to save a token for.`;
+  const [prefix, item] = kind === "bot" ? ["xoxb-", botItem(dot)] : ["xapp-", appItem(dot)];
+  if (!looksLike(token, prefix))
+    return `That doesn't look like ${kind === "bot" ? "a bot token (xoxb-…)" : "an app-level token (xapp-…)"}. Nothing was saved.`;
+  // False may mean it was written but couldn't be read back, so nothing is claimed either way.
+  const saved = await setup.save(item, token).catch(() => false);
+  return saved
+    ? undefined
+    : `Couldn't confirm the token was saved in the Keychain item ${item}. It may or may not be there: check the item, or save the token again.`;
 }
 
 /** Asks the daemon to create the dot's app. Safe to repeat; an app's progress is never reset. */
@@ -709,13 +1053,14 @@ export function requestApp(db: Db, dot: string, retry = false) {
     attemptID: null,
     appID: null,
     problem: null,
+    ...noIcon,
   });
   return db.select().from(slackApps).where(eq(slackApps.dot, dot)).get();
 }
 
 /** Asks the daemon to check and adopt an app the owner found, such as one whose creation was lost. */
 export function attachApp(db: Db, dot: string, appID: string) {
-  if (!/^A[A-Z0-9]{6,}$/.test(appID)) return false;
+  if (!slackIDs.app.test(appID)) return false;
   const now = Date.now();
   // Each attach gets its own attempt ID, so an answer about an earlier one is never applied to it.
   const attemptID = crypto.randomUUID();
@@ -728,6 +1073,7 @@ export function attachApp(db: Db, dot: string, appID: string) {
     appID,
     attemptID,
     problem: null,
+    ...noIcon,
   });
 }
 
@@ -767,6 +1113,30 @@ export function configSaved(db: Db) {
 const save = (item: string) => `security add-generic-password -U -a "$USER" -s ${item} -w`;
 
 const appURL = (id: string) => `https://api.slack.com/apps/${id}`;
+
+/** Where the app's icon stands, and the manual upload when Slack refused it. */
+function iconLine(app: SlackApp, appID: string, blocked: string | null) {
+  const revision = avatarRevision(app.dot);
+  const path = avatarPath(app.dot);
+  switch (iconStatus(app, revision)) {
+    case "no-avatar":
+      return `${app.dot} has no avatar yet. Set one with: open-dot avatar ${app.dot} <file>, and the daemon sets it as the app's icon with Slack's apps.icon.set. The icon is under Display Information at ${appURL(appID)}/general.`;
+    case "set":
+      return `set from ${path} with Slack's apps.icon.set.`;
+    case "setting":
+      return "the daemon is setting it from the avatar now.";
+    case "pending":
+      return `the daemon sets it from ${path} with Slack's apps.icon.set and your app configuration token, within a minute or two.${blocked ? ` Configuration token: ${blocked}` : ""}`;
+    case "waiting":
+      return `Slack is rate limiting apps.icon.set, so the daemon tries again after ${new Date(app.iconRetryAt ?? 0).toISOString()}.`;
+    case "refused":
+      break;
+  }
+  const manual = `Open ${appURL(appID)}/general, scroll to Display Information, upload ${path} under App icon & Preview (square, 512 to 2000 pixels), then click Save Changes. A new avatar, or Retry icon in the notch's Slack view, tries apps.icon.set again.`;
+  return app.iconError === unknownOutcome
+    ? `apps.icon.set got no clear answer (${unknownOutcome}), so it may or may not have set the icon, and it's never sent again on its own. Check the icon in Slack. If it isn't the avatar, set it yourself: ${manual}`
+    : `Slack refused apps.icon.set (${app.iconError ?? "slack_error"}), so set it yourself. ${manual}`;
+}
 
 /** The app's state and the owner's next step, without any secret. */
 export function describe(db: Db, app: SlackApp) {
@@ -819,14 +1189,9 @@ export function describe(db: Db, app: SlackApp) {
         `  Its manifest is older than this open-dot, so the agent view can't get suggested prompts. Update it with: open-dot slack update ${app.dot}`,
       );
     if (app.updateNote) lines.push(`  Manifest update: ${app.updateNote}`);
-    const avatar = avatarRevision(app.dot) ? avatarPath(app.dot) : undefined;
     lines.push(
-      `  Profile picture: Slack has no API or manifest field for an app's icon, so set it yourself. Open ${appURL(app.appID)}/general, scroll to Display Information, upload ${avatar ?? "an image"} under App icon & Preview (square, 512 to 2000 pixels), then click Save Changes.`,
+      `  App icon: ${iconLine(app, app.appID, config?.state === "blocked" ? config.problem : null)}`,
     );
-    if (!avatar)
-      lines.push(
-        `  ${app.dot} has no avatar yet. Set one with: open-dot avatar ${app.dot} <file>, then upload ${avatarPath(app.dot)}.`,
-      );
   }
   return lines.join("\n");
 }

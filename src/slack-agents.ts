@@ -31,6 +31,7 @@ import {
   replyID,
   type Slack,
   slackClient,
+  slackCode,
   unescape,
 } from "./slack";
 
@@ -465,7 +466,7 @@ export function slackAgents(
           setProblem(
             app,
             opened?.kind === "refused"
-              ? `Slack refused the app-level token in ${appItem(app.dot)}: ${opened.error}`
+              ? `Slack refused the app-level token in ${appItem(app.dot)}: ${slackCode(opened.error)}`
               : `waiting for this app's app-level token in the Keychain item ${appItem(app.dot)}`,
           );
           continue;

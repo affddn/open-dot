@@ -57,8 +57,8 @@ final class HealthTests: XCTestCase {
       return HealthReport(schemaVersion: 1, checkedAt: 1, checks: [HealthCheck(id: "daemon", status: "healthy", summary: "Running.")])
     }
     let menu = dotMenu(store, dot: "jolyne")
-    let item = try XCTUnwrap(menu.items.last)
-    XCTAssertEqual(item.identifier?.rawValue, "dot-menu-health")
+    XCTAssertEqual(menu.items.map { $0.identifier?.rawValue }[3], "dot-menu-health")
+    let item = try XCTUnwrap(menu.items.first { $0.identifier?.rawValue == "dot-menu-health" })
     XCTAssertTrue(NSApplication.shared.sendAction(try XCTUnwrap(item.action), to: item.target, from: item))
     await eventually { store.selected == "jolyne" && store.pane == .health && store.health?.checks.count == 1 }
     await Task.yield()

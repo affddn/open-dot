@@ -56,6 +56,20 @@ import {
 import { quoted, quoteText, replyPrompt } from "./replies";
 import { answerSummary, needsYou, requestView } from "./requests";
 import { listRuns } from "./runs";
+import { isRecord, slackIDs } from "./slack";
+import {
+  attachApp,
+  Blocked,
+  iconStatus,
+  manifestVersion,
+  realSetup,
+  requestApp,
+  retryIcon,
+  saveAppToken,
+  saveConfigPair,
+  type Setup,
+  updateApp,
+} from "./slack-setup";
 import { approveBinding, endBinding, openSupervisions, supervisionView } from "./supervise";
 import {
   createTrigger,
@@ -80,6 +94,8 @@ import {
   outbox,
   requests,
   responsibilities,
+  slackApps,
+  slackConfig,
   type Worker,
   type WorkerRequest,
   workers,
@@ -415,6 +431,182 @@ const instructionsRoute = async (db: Db, request: Request, path: string[]) => {
   if (!isInstructionsText(content))
     return error(400, "Instructions must be well-formed text without NUL characters.");
   return instructionsAnswer(saveInstructions(dot.name, content, revision));
+};
+
+/** Every Slack setup body is a few tokens or names, so anything larger is refused unread. */
+const slackBodyLimit = 8 * 1024;
+
+/**
+ * A Slack setup body: a JSON object with exactly the keys allowed, or a Response saying why not.
+ * An empty body is `{}`. Nothing in a body is ever logged or echoed, since it may hold a token.
+ */
+const slackBody = async (
+  request: Request,
+  allowed: readonly string[],
+): Promise<Record<string, unknown> | Response> => {
+  const body = await messageBody(request, slackBodyLimit).catch(() => null);
+  if (body instanceof Response) return error(413, "The body is too large.");
+  if (body === undefined) return {};
+  if (!isRecord(body) || Array.isArray(body)) return error(400, "Send a JSON object.");
+  if (Object.keys(body).some((key) => !allowed.includes(key)))
+    return error(400, `Send only ${allowed.join(", ") || "an empty body"}.`);
+  return body;
+};
+
+/**
+ * A dot's Slack app as `open-dot slack status` sees it, for the notch: its state, problem, the
+ * manifest and icon, and the configuration token's state. Never a token: none is kept here.
+ */
+const slackView = (db: Db, dot: string) => {
+  const app = db.select().from(slackApps).where(eq(slackApps.dot, dot)).get();
+  const config = db.select().from(slackConfig).where(eq(slackConfig.id, 1)).get();
+  const ready = app?.appID && (app.state === "created" || app.state === "active");
+  return {
+    config: { state: config?.state ?? "idle", problem: config?.problem ?? null },
+    app: app
+      ? {
+          state: app.state,
+          // Only IDs of Slack's form are shown, whatever an older version saved.
+          appID: app.appID && slackIDs.app.test(app.appID) ? app.appID : null,
+          botUser: app.botUser && slackIDs.user.test(app.botUser) ? app.botUser : null,
+          problem: app.problem,
+          manifestOutdated: Boolean(
+            ready && (app.manifestVersion ?? 1) < manifestVersion && app.updateState === null,
+          ),
+          updateState: app.updateState,
+          updateNote: app.updateNote,
+          icon: ready
+            ? {
+                status: iconStatus(app),
+                error: app.iconError,
+                retryAt: app.iconState === "waiting" ? app.iconRetryAt : null,
+              }
+            : null,
+        }
+      : null,
+  };
+};
+
+/**
+ * `POST /slack/config` with `{token, refreshToken}`: the owner's configuration token pair, saved
+ * by the daemon with the same `saveSecret` the CLI uses, so the daemon reads the item without a
+ * Keychain prompt. The answer never repeats a token.
+ */
+const slackConfigRoute = async (db: Db, request: Request, path: string[], setup: Setup) => {
+  if (path.length !== 1 || path[0] !== "config" || request.method !== "POST")
+    return error(404, "Not found");
+  if (new URL(request.url).search) return error(400, "This route takes no query.");
+  const body = await slackBody(request, ["token", "refreshToken"]);
+  if (body instanceof Response) return body;
+  const { token, refreshToken } = body;
+  if (typeof token !== "string" || typeof refreshToken !== "string")
+    return error(400, "Send {token, refreshToken}.");
+  const problem = await saveConfigPair(db, setup, token.trim(), refreshToken.trim());
+  if (problem)
+    return error(
+      problem.startsWith("Couldn't confirm")
+        ? 500
+        : problem.includes("in progress") || problem.includes("changed while")
+          ? 409
+          : 400,
+      problem,
+    );
+  return Response.json({ saved: true });
+};
+
+/**
+ * A dot's Slack app from the notch, sharing the CLI's code: `GET /dots/<name>/slack` reads its
+ * state, and POST `…/slack/connect` (`{retry?}`), `…/attach` (`{appID}`), `…/tokens`
+ * (`{kind: "bot" | "app", token}`), `…/update` (`{approve?}`) and `…/icon` act on it. Creating,
+ * attaching and the icon are done by the daemon's setup loop; the manifest update is sent only
+ * once the owner approved exactly the changes it shows. No answer repeats a token.
+ */
+const slackRoute = async (db: Db, request: Request, path: string[], setup: Setup) => {
+  const [, rawName = "", , action, ...extra] = path;
+  const name = (() => {
+    try {
+      return decodeURIComponent(rawName);
+    } catch {
+      return undefined;
+    }
+  })();
+  const dot = name === undefined ? undefined : findDot(db, name);
+  if (!dot) return error(404, "There's no such dot.");
+  if (extra.length) return error(404, "Not found");
+  if (new URL(request.url).search) return error(400, "This route takes no query.");
+  if (action === undefined)
+    return request.method === "GET"
+      ? Response.json(slackView(db, dot.name))
+      : error(404, "Not found");
+  if (request.method !== "POST") return error(404, "Not found");
+  const view = () => Response.json(slackView(db, dot.name));
+  switch (action) {
+    case "connect": {
+      const body = await slackBody(request, ["retry"]);
+      if (body instanceof Response) return body;
+      if (body.retry !== undefined && typeof body.retry !== "boolean")
+        return error(400, "retry must be true or false.");
+      requestApp(db, dot.name, body.retry === true);
+      return view();
+    }
+    case "attach": {
+      const body = await slackBody(request, ["appID"]);
+      if (body instanceof Response) return body;
+      if (typeof body.appID !== "string" || !attachApp(db, dot.name, body.appID.trim()))
+        return error(400, "Send {appID}, an app ID such as A0123ABCDEF.");
+      return view();
+    }
+    case "tokens": {
+      const body = await slackBody(request, ["kind", "token"]);
+      if (body instanceof Response) return body;
+      const { kind, token } = body;
+      if ((kind !== "bot" && kind !== "app") || typeof token !== "string")
+        return error(400, 'Send {kind: "bot" or "app", token}.');
+      const problem = await saveAppToken(db, setup, dot.name, kind, token.trim());
+      if (problem) return error(problem.startsWith("Couldn't confirm") ? 500 : 400, problem);
+      return view();
+    }
+    case "update": {
+      const body = await slackBody(request, ["approve"]);
+      if (body instanceof Response) return body;
+      const { approve } = body;
+      if (
+        approve !== undefined &&
+        (!Array.isArray(approve) ||
+          approve.length > 20 ||
+          !approve.every((change) => typeof change === "string" && change.length <= 4000))
+      )
+        return error(400, "approve must be the list of changes the notch showed.");
+      const approved = (changes: readonly string[]) =>
+        approve !== undefined && Bun.deepEquals([...changes], approve);
+      const asked: { changes?: readonly string[] } = {};
+      let said: string;
+      try {
+        said = await updateApp(db, setup, dot.name, (changes) => {
+          asked.changes = changes;
+          return approved(changes);
+        });
+      } catch (cause) {
+        if (cause instanceof Blocked) return error(409, cause.message);
+        throw cause;
+      }
+      // Changes the owner hasn't approved, as they are now, go back for approval; nothing was sent.
+      if (asked.changes && !approved(asked.changes))
+        return Response.json({
+          said: "Approve these changes to send them.",
+          confirm: asked.changes,
+        });
+      return Response.json({ said });
+    }
+    case "icon": {
+      const body = await slackBody(request, []);
+      if (body instanceof Response) return body;
+      const problem = retryIcon(db, dot.name, setup.now());
+      return problem ? error(409, problem) : view();
+    }
+    default:
+      return error(404, "Not found");
+  }
 };
 
 /** True once the dot's binding no longer matches the one a request began with. */
@@ -1666,6 +1858,7 @@ export const api = (
   run: Run = spawnRun,
   now: () => number = Date.now,
   health?: () => Promise<HealthReport>,
+  setup: Setup = realSetup,
 ) => {
   interface Cached {
     sessionID: string;
@@ -1801,6 +1994,23 @@ export const api = (
     const path = new URL(request.url).pathname.split("/").filter(Boolean);
     if (path[0] === "health" && path.length === 1) return healthRoute(request, health);
     if (path[0] === "feed") return Promise.resolve(feedRoute(db, request, path.slice(1)));
+    // A failure is logged in fixed words only: a Slack body may hold a token.
+    if (path[0] === "slack")
+      return slackConfigRoute(db, request, path.slice(1), setup).catch(() => {
+        console.error("Slack setup: saving the configuration tokens failed.");
+        return error(
+          500,
+          "Couldn't confirm the configuration tokens were saved. Check open-dot slack status, and save them again if needed.",
+        );
+      });
+    if (path[0] === "dots" && path[2] === "slack")
+      return slackRoute(db, request, path, setup).catch(() => {
+        console.error("Slack setup: a request from the notch failed.");
+        return error(
+          500,
+          "Couldn't confirm the change to the dot's Slack app. Check its state before trying again.",
+        );
+      });
     if (path[0] === "workers") return workerRoute(db, request, path.slice(1), layer, run);
     if (path[0] === "requests") return requestRoute(db, request, path.slice(1), run);
     if (path[0] === "dots" && path[2] === "requests")

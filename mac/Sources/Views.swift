@@ -104,6 +104,9 @@ struct ExpandedView: View {
               .id("library-\(name)")
           } else if store.showingHealth {
             HealthView(store: store)
+          } else if store.showingSlack {
+            SlackView(store: store, name: name)
+              .id("slack-\(name)")
           } else {
             Conversation(store: store, name: name)
               .id(name)
@@ -146,50 +149,52 @@ struct ExpandedView: View {
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("feed-tab")
-        ForEach(store.dots, id: \.name) { dot in
-          let unsaved = store.instructions[dot.name]?.dirty == true
-          Button { store.openDot(dot.name, .chat) } label: {
-            HStack(spacing: 5) {
-              if dot.busy { BusyDot() }
-              if let image = store.avatars.images[dot.name] { AvatarView(image: image, size: 16) }
-              Text(dot.name).font(.callout.weight(.medium))
-              if dot.needsYouCount > 0 {
-                Text("\(dot.needsYouCount)")
-                  .font(.caption2.weight(.semibold).monospacedDigit())
-                  .padding(.horizontal, 5)
-                  .background(Capsule().fill(.orange.opacity(0.7)))
-                  .help("Workers waiting on you")
-                  .accessibilityLabel("\(dot.needsYouCount) waiting on you")
-                  .accessibilityIdentifier("dot-needs-you-\(dot.name)")
-              }
-              if unsaved {
-                Image(systemName: "pencil.circle.fill")
-                  .font(.system(size: 9))
-                  .foregroundStyle(.secondary)
-                  .help("Unsaved instructions")
-                  .accessibilityLabel("unsaved instructions")
-                  .accessibilityIdentifier("dot-unsaved-\(dot.name)")
-              }
-              if store.unread(dot.name) { UnreadDot() }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-            .background(Capsule().fill(.white.opacity(!store.showingFeed && dot.name == store.selected ? 0.18 : 0)))
-            .contentShape(Capsule())
-          }
-          .buttonStyle(.plain)
-          // A secondary click or Control-click opens its Memory, Instructions, Library and Health menu.
-          .background(MenuAnchor(id: "dot-menu-\(dot.name)", store: store) { _ in dotMenu(store, dot: dot.name) })
-          .help(dot.purpose ?? "")
-          .accessibilityIdentifier("dot-tab-\(dot.name)")
-          .accessibilityAction(named: "Memory") { store.openDot(dot.name, .memory) }
-          .accessibilityAction(named: unsaved ? "Instructions, unsaved changes" : "Instructions") { store.openDot(dot.name, .instructions) }
-          .accessibilityAction(named: "Library") { store.openDot(dot.name, .library) }
-          .accessibilityAction(named: "Health") { store.openDot(dot.name, .health) }
-        }
+        ForEach(store.dots, id: \.name) { dot in dotTab(dot) }
       }
     }
     .scrollIndicators(.hidden)
+  }
+
+  /// A dot's tab. A click shows its chat; a secondary click or Control-click opens its Memory,
+  /// Instructions, Library, Health and Slack menu, which VoiceOver reaches as actions.
+  private func dotTab(_ dot: Dot) -> some View {
+    let unsaved = store.instructions[dot.name]?.dirty == true
+    return Button { store.openDot(dot.name, .chat) } label: { dotTabLabel(dot, unsaved: unsaved) }
+      .buttonStyle(.plain)
+      .background(MenuAnchor(id: "dot-menu-\(dot.name)", store: store) { _ in dotMenu(store, dot: dot.name) })
+      .help(dot.purpose ?? "")
+      .accessibilityIdentifier("dot-tab-\(dot.name)")
+      .modifier(DotTabActions(store: store, name: dot.name, unsaved: unsaved))
+  }
+
+  private func dotTabLabel(_ dot: Dot, unsaved: Bool) -> some View {
+    HStack(spacing: 5) {
+      if dot.busy { BusyDot() }
+      if let image = store.avatars.images[dot.name] { AvatarView(image: image, size: 16) }
+      Text(dot.name).font(.callout.weight(.medium))
+      if dot.needsYouCount > 0 {
+        Text("\(dot.needsYouCount)")
+          .font(.caption2.weight(.semibold).monospacedDigit())
+          .padding(.horizontal, 5)
+          .background(Capsule().fill(.orange.opacity(0.7)))
+          .help("Workers waiting on you")
+          .accessibilityLabel("\(dot.needsYouCount) waiting on you")
+          .accessibilityIdentifier("dot-needs-you-\(dot.name)")
+      }
+      if unsaved {
+        Image(systemName: "pencil.circle.fill")
+          .font(.system(size: 9))
+          .foregroundStyle(.secondary)
+          .help("Unsaved instructions")
+          .accessibilityLabel("unsaved instructions")
+          .accessibilityIdentifier("dot-unsaved-\(dot.name)")
+      }
+      if store.unread(dot.name) { UnreadDot() }
+    }
+    .padding(.horizontal, 10)
+    .padding(.vertical, 4)
+    .background(Capsule().fill(.white.opacity(!store.showingFeed && dot.name == store.selected ? 0.18 : 0)))
+    .contentShape(Capsule())
   }
 
   /// Above Memory, Instructions or Library: the dot, the view, and the way back to its chat, which Escape
@@ -218,6 +223,7 @@ struct ExpandedView: View {
     case .memory: "Memory"
     case .library: "Library"
     case .health: "Health"
+    case .slack: "Slack"
     default: "Instructions"
     }
   }
@@ -1825,6 +1831,22 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
 /// A dot tab's menu. Memory, Instructions, Library and Health each select the dot first, and
 /// Instructions is marked while the dot has unsaved instructions. Health isn't the dot's own: it's
 /// the daemon's whole report, reached from here so the notch needs no new navigation.
+/// A dot tab's menu items as VoiceOver actions.
+private struct DotTabActions: ViewModifier {
+  let store: Store
+  let name: String
+  let unsaved: Bool
+
+  func body(content: Content) -> some View {
+    content
+      .accessibilityAction(named: "Memory") { store.openDot(name, .memory) }
+      .accessibilityAction(named: unsaved ? "Instructions, unsaved changes" : "Instructions") { store.openDot(name, .instructions) }
+      .accessibilityAction(named: "Library") { store.openDot(name, .library) }
+      .accessibilityAction(named: "Health") { store.openDot(name, .health) }
+      .accessibilityAction(named: "Slack") { store.openDot(name, .slack) }
+  }
+}
+
 @MainActor func dotMenu(_ store: Store, dot: String) -> NSMenu {
   let menu = NSMenu()
   menu.autoenablesItems = false
@@ -1840,6 +1862,7 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
   menu.addItem(instructions)
   menu.addItem(action("Library", symbol: "books.vertical", id: "dot-menu-library") { store.openDot(dot, .library) })
   menu.addItem(action("Health", symbol: "stethoscope", id: "dot-menu-health") { store.openDot(dot, .health) })
+  menu.addItem(action("Slack", symbol: "number", id: "dot-menu-slack") { store.openDot(dot, .slack) })
   return menu
 }
 

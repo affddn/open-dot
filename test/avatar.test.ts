@@ -13,7 +13,7 @@ import { join, resolve } from "node:path";
 import { deflateSync } from "node:zlib";
 import { Effect, Layer } from "effect";
 import { api } from "../src/api";
-import { avatarLimit, avatarPath, checkAvatar, setAvatar } from "../src/avatar";
+import { avatarLimit, avatarPath, avatarRevision, checkAvatar, setAvatar } from "../src/avatar";
 import { type Db, openDatabase } from "../src/db";
 import { OpenCode, OpenCodeError } from "../src/opencode";
 import { dots, slackApps } from "../src/schema";
@@ -410,7 +410,18 @@ test("open-dot avatar copies a checked image and keeps the old one on a refusal"
   const saved = cli("avatar", "jojo", join(home, "good.png"));
   expect(saved.exit).toBe(0);
   expect(saved.out).toContain("1254×1254");
+  expect(saved.out).not.toContain("Warning");
   expect(readFileSync(avatarPath("jojo")).equals(good)).toBe(true);
+
+  // A valid avatar outside Slack's 512 to 2000 pixels is saved, with a warning about its app icon.
+  const small = png(300, 300, 16);
+  writeFileSync(join(home, "small.png"), small);
+  const warned = cli("avatar", "jojo", join(home, "small.png"));
+  expect(warned.exit).toBe(0);
+  expect(warned.out).toContain("Warning: Slack app icons must be 512 to 2000 pixels a side");
+  expect(readFileSync(avatarPath("jojo")).equals(small)).toBe(true);
+  writeFileSync(join(home, "good.png"), good);
+  expect(cli("avatar", "jojo", join(home, "good.png")).exit).toBe(0);
 
   const refused = cli("avatar", "jojo", join(home, "wide.png"));
   expect(refused.exit).toBe(1);
@@ -421,7 +432,7 @@ test("open-dot avatar copies a checked image and keeps the old one on a refusal"
   expect(cli("avatar", "nobody", join(home, "good.png")).exit).toBe(1);
 });
 
-test("slack status names the avatar file for the manual icon upload", () => {
+test("slack status says the daemon sets the icon, and names the avatar file only once Slack refuses", () => {
   db.insert(slackApps)
     .values({ dot: "jojo", state: "created", appID: "A0123", createdAt: 0, updatedAt: 0 })
     .run();
@@ -430,11 +441,26 @@ test("slack status names the avatar file for the manual icon upload", () => {
     if (!row) throw new Error("no app");
     return row;
   };
-  expect(slackStatus(db, app())).toContain(
-    `open-dot avatar jojo <file>, then upload ${avatarPath("jojo")}`,
+  const status = () => slackStatus(db, app());
+  expect(status()).toContain(
+    "open-dot avatar jojo <file>, and the daemon sets it as the app's icon",
   );
+  expect(status()).not.toContain("no API");
   writeFileSync(avatarPath("jojo"), png(512, 512));
-  const status = slackStatus(db, app());
-  expect(status).toContain(`upload ${avatarPath("jojo")} under App icon & Preview`);
-  expect(status).not.toContain("has no avatar yet");
+  expect(status()).toContain(
+    `the daemon sets it from ${avatarPath("jojo")} with Slack's apps.icon.set`,
+  );
+  expect(status()).not.toContain("has no avatar yet");
+  expect(status()).not.toContain("App icon & Preview");
+
+  // Slack refused the token: the manual upload comes back, naming Slack's error.
+  db.update(slackApps)
+    .set({
+      iconState: "refused",
+      iconAttempt: avatarRevision("jojo"),
+      iconError: "not_allowed_token_type",
+    })
+    .run();
+  expect(status()).toContain("Slack refused apps.icon.set (not_allowed_token_type)");
+  expect(status()).toContain(`upload ${avatarPath("jojo")} under App icon & Preview`);
 });

@@ -282,11 +282,18 @@ struct MessageWindow: Equatable {
   }
   var feedStatus: String?
   var showingFeed = false
-  /// The selected dot's Memory, Instructions, Library or Health tab is open instead of its chat. At most one is.
+  /// The selected dot's Memory, Instructions, Library, Health or Slack tab is open instead of its chat. At most one is.
   var showingMemory = false
   var showingInstructions = false
   var showingLibrary = false
   var showingHealth = false
+  var showingSlack = false
+  /// Each dot's Slack app as the daemon last showed it, why the newest read failed, what the last
+  /// action said, and the dots with an action in flight.
+  var slackStates: [String: SlackSetup] = [:]
+  var slackErrors: [String: String] = [:]
+  var slackNotices: [String: String] = [:]
+  var slackBusy: Set<String> = []
   /// The daemon's latest health report, and why the newest read failed, if it did.
   var health: HealthReport?
   var healthError: String?
@@ -355,6 +362,12 @@ struct MessageWindow: Equatable {
   /// The health read. Tests replace it.
   @ObservationIgnored var healthReport: @MainActor () async throws -> HealthReport = { throw APIError.unreachable }
   @ObservationIgnored private var healthReads = 0
+  /// The Slack app's read, its actions, and the owner's approval of a manifest update. Tests replace them.
+  @ObservationIgnored var slackRead: @MainActor (String) async throws -> SlackSetup = { _ in throw APIError.unreachable }
+  @ObservationIgnored var slackSend: @MainActor (String, SlackAction) async throws -> SlackOutcome = { _, _ in throw APIError.unreachable }
+  @ObservationIgnored var approveSlackUpdate: @MainActor (String, [String]) -> Bool = { _, _ in false }
+  @ObservationIgnored var confirmSlackRetry: @MainActor (String) -> Bool = { _ in false }
+  @ObservationIgnored private var slackReads: [String: Int] = [:]
   private var seen: [String: Double] = [:]
   private var newest: [String: Double] = [:]
   private var feedSeen: Double?
@@ -372,6 +385,10 @@ struct MessageWindow: Equatable {
     artifactBytes = { try await api.artifactContent($0, $1) }
     chooseExport = { [unowned self] name in savePanel(name, self) }
     healthReport = { try await api.health() }
+    slackRead = { try await api.slack($0) }
+    slackSend = { try await api.slackAction($0, $1) }
+    approveSlackUpdate = { [unowned self] name, changes in approveUpdate(name, changes, self) }
+    confirmSlackRetry = { [unowned self] name in confirmNoApp(name, self) }
   }
 
   var showsIndicator: Bool { dotsBusy || dotsUnread || feedUnread }
@@ -398,6 +415,7 @@ struct MessageWindow: Equatable {
       while true {
         if let name = selected, visible(name) { await refreshMessages(name) }
         if let name = selected, expanded, !showingFeed, showingMemory { await refreshMemory(name) }
+        if let name = selected, expanded, !showingFeed, showingSlack { await refreshSlack(name) }
         try? await Task.sleep(for: .seconds(1))
       }
     }
@@ -439,6 +457,7 @@ struct MessageWindow: Equatable {
     if let name = selected, showingInstructions { loadInstructions(name, discarding: false) }
     if let name = selected, showingLibrary { Task { await refreshLibrary(name) } }
     if selected != nil, showingHealth { Task { await refreshHealth() } }
+    if let name = selected, showingSlack { Task { await refreshSlack(name) } }
   }
 
   func select(_ name: String) {
@@ -449,12 +468,18 @@ struct MessageWindow: Equatable {
     if showingMemory { Task { await refreshMemory(name) } }
     if showingInstructions { loadInstructions(name, discarding: false) }
     if showingLibrary { Task { await refreshLibrary(name) } }
+    if showingSlack { Task { await refreshSlack(name) } }
   }
 
-  enum Pane: Hashable { case chat, memory, instructions, library, health }
+  enum Pane: Hashable { case chat, memory, instructions, library, health, slack }
 
   var pane: Pane {
-    showingInstructions ? .instructions : showingMemory ? .memory : showingLibrary ? .library : showingHealth ? .health : .chat
+    if showingInstructions { return .instructions }
+    if showingMemory { return .memory }
+    if showingLibrary { return .library }
+    if showingHealth { return .health }
+    if showingSlack { return .slack }
+    return .chat
   }
 
   /// Switches the selected dot between its chat, its Memory tab and its Instructions tab. An
@@ -464,6 +489,7 @@ struct MessageWindow: Equatable {
     showingInstructions = pane == .instructions
     showingLibrary = pane == .library
     showingHealth = pane == .health
+    showingSlack = pane == .slack
     guard let name = selected else { return }
     switch pane {
     case .chat: seen[name] = newest[name]
@@ -471,6 +497,7 @@ struct MessageWindow: Equatable {
     case .instructions: loadInstructions(name, discarding: false)
     case .library: Task { await refreshLibrary(name) }
     case .health: Task { await refreshHealth() }
+    case .slack: Task { await refreshSlack(name) }
     }
   }
 
@@ -759,6 +786,7 @@ struct MessageWindow: Equatable {
     showingInstructions = false
     showingLibrary = false
     showingHealth = false
+    showingSlack = false
     select(first)
   }
 
@@ -1390,6 +1418,65 @@ struct MessageWindow: Equatable {
       guard read == healthReads else { return }
       healthError = "Couldn't run the health check. \(Self.describe(error))"
     }
+  }
+
+  /// Reads the dot's Slack app. Only the newest read's answer is shown, and a failure keeps the
+  /// last state with the error above it.
+  func refreshSlack(_ name: String) async {
+    slackReads[name, default: 0] += 1
+    let read = slackReads[name] ?? 0
+    do {
+      let setup = try await slackRead(name)
+      guard read == slackReads[name] else { return }
+      slackStates[name] = setup
+      slackErrors[name] = nil
+    } catch {
+      guard read == slackReads[name] else { return }
+      slackErrors[name] = "Couldn't read the Slack app. \(Self.describeRead(error))"
+    }
+  }
+
+  /// Sends one Slack action for the dot, one at a time per dot, never retried on its own. A
+  /// manifest update first comes back with its changes, and is sent only once the owner approves
+  /// exactly those. A token is in the action only while it's sent.
+  func runSlack(_ name: String, _ action: SlackAction) {
+    guard slackBusy.insert(name).inserted else { return }
+    slackNotices[name] = nil
+    Task {
+      defer { slackBusy.remove(name) }
+      do {
+        var outcome = try await slackSend(name, action)
+        if case .confirm(let changes) = outcome {
+          guard approveSlackUpdate(name, changes) else {
+            slackNotices[name] = "Nothing was changed."
+            return
+          }
+          outcome = try await slackSend(name, .update(approve: changes))
+        }
+        switch outcome {
+        case .view(let setup): slackStates[name] = setup
+        case .saved: slackNotices[name] = "Saved in the Keychain. The daemon rotates the pair before each use."
+        case .said(let said): slackNotices[name] = said
+        case .confirm: slackNotices[name] = "The changes changed again, so nothing was sent. Try again."
+        }
+        if case .token = action { slackNotices[name] = "Saved in the Keychain. The daemon checks it within a minute." }
+      } catch {
+        if case .lost = error as? APIError {
+          slackNotices[name] = "No response from the open-dot daemon, so it may have been done. Nothing is sent again on its own."
+        } else {
+          // The daemon may have done some of it, such as a Keychain write it couldn't read back.
+          slackNotices[name] = "Not confirmed. \(Self.describe(error))"
+        }
+      }
+      await refreshSlack(name)
+    }
+  }
+
+  /// Creates the dot's app again after a create with no clear answer, only once the owner says no
+  /// such app exists, as `open-dot slack connect --retry` needs.
+  func retryCreate(_ name: String) {
+    guard confirmSlackRetry(name) else { return }
+    runSlack(name, .connect(retry: true))
   }
 
   /// Reads the newest Library page again, keeping older pages already loaded. It only reads, and
