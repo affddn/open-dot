@@ -1273,6 +1273,19 @@ enum APIError: Error {
       return .view(try decode(SlackSetup.self, await send("POST", "\(path)/icon")))
     case .dmCheck:
       return .view(try decode(SlackSetup.self, await send("POST", "\(path)/dm-check")))
+    case .loginStart:
+      return .ticket(try decode(SlackLoginTicket.self, await send("POST", "/slack/login", timeout: 30)))
+    case .loginFinish(let attempt, let challenge):
+      let body = try JSONSerialization.data(withJSONObject: ["challenge": challenge])
+      _ = try await send("POST", "/slack/login/\(escape(attempt))", body: body, timeout: 30)
+      return .said("Logged in to Slack.")
+    case .install:
+      return .view(try decode(SlackSetup.self, await send("POST", "\(path)/install")))
+    case .link(let bot, let app, let replacing):
+      var object = ["bot": bot, "app": app]
+      if let replacing { object["replaceAppID"] = replacing }
+      let body = try JSONSerialization.data(withJSONObject: object)
+      return .view(try decode(SlackSetup.self, await send("POST", "\(path)/link", body: body, timeout: 30)))
     }
   }
 

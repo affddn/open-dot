@@ -301,12 +301,19 @@ struct MessageWindow: Equatable {
   var slackHolding: String?
   var slackApproval: Set<String> = []
   var slackSaved: [String: Set<String>] = [:]
+  /// A login's slash command waiting for its challenge code, in memory only, used once.
+  var slackTicket: SlackLoginTicket?
   @ObservationIgnored var heldAccess: HeldAccess?
   @ObservationIgnored var pickupGeneration = 0
   /// The clipboard, the clock pickups time out by, and the browser. Tests replace them.
   @ObservationIgnored var clipboard: any Clipboard = SystemClipboard()
   @ObservationIgnored var uptime: @MainActor () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
   @ObservationIgnored var openSlackPage: @MainActor (URL) -> Void = { _ = NSWorkspace.shared.open($0) }
+  /// Copies a login's slash command for the owner to paste in Slack. Tests replace it.
+  @ObservationIgnored var copyText: @MainActor (String) -> Void = { text in
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+  }
   /// The daemon's latest health report, and why the newest read failed, if it did.
   var health: HealthReport?
   var healthError: String?
@@ -384,6 +391,7 @@ struct MessageWindow: Equatable {
   @ObservationIgnored var slackSend: @MainActor (String, SlackAction) async throws -> SlackOutcome = { _, _ in throw APIError.unreachable }
   @ObservationIgnored var approveSlackUpdate: @MainActor (String, [String]) -> Bool = { _, _ in false }
   @ObservationIgnored var confirmSlackRetry: @MainActor (String) -> Bool = { _ in false }
+  @ObservationIgnored var confirmSlackReplace: @MainActor (String, String) -> Bool = { _, _ in false }
   @ObservationIgnored private var slackReads: [String: Int] = [:]
   private var seen: [String: Double] = [:]
   private var newest: [String: Double] = [:]
@@ -406,6 +414,7 @@ struct MessageWindow: Equatable {
     slackSend = { try await api.slackAction($0, $1) }
     approveSlackUpdate = { [unowned self] name, changes in approveUpdate(name, changes, self) }
     confirmSlackRetry = { [unowned self] name in confirmNoApp(name, self) }
+    confirmSlackReplace = { [unowned self] name, appID in confirmReplace(name, appID, self) }
   }
 
   var showsIndicator: Bool { dotsBusy || dotsUnread || feedUnread }
@@ -1502,10 +1511,19 @@ struct MessageWindow: Equatable {
         case .saved: slackNotices[name] = "Saved in the Keychain. The daemon rotates the pair before each use."
         case .said(let said): slackNotices[name] = said
         case .confirm: slackNotices[name] = "The changes changed again, so nothing was sent. Try again."
+        case .ticket(let ticket):
+          slackTicket = ticket
+          slackNotices[name] = "Run the command in any Slack channel or DM, approve it, then enter the code Slack shows."
         }
-        if case .token(let kind, _) = action {
+        switch action {
+        case .token(let kind, _):
           slackNotices[name] = "Saved in the Keychain. The daemon checks it within a minute."
           if let appID = slackStates[name]?.app?.appID { slackSaved[appID, default: []].insert(kind) }
+        case .link:
+          slackNotices[name] = "Saved both tokens in the Keychain. The daemon checks them within a minute."
+        case .loginFinish:
+          slackNotices[name] = "Logged in to Slack. The token is in the Keychain only."
+        default: break
         }
       } catch {
         if case .lost = error as? APIError {

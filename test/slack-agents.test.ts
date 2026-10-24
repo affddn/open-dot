@@ -46,6 +46,7 @@ const appID = "AJOTARO";
 const botUser = "UJOTARO";
 const botID = "BJOTARO";
 const ts = (n: number) => `2000.${String(n).padStart(6, "0")}`;
+const installedApp = `xapp-1-${appID}-1-installed`;
 
 type Message = Record<string, unknown> & { ts: string };
 type Mode = "ok" | "lost" | "dropped" | "refused" | "internal";
@@ -68,6 +69,7 @@ function fakeSlack() {
     ]),
     appTokens: new Map([
       ["xapp-jotaro", appID],
+      [installedApp, appID],
       ["xapp-other", "AOTHER"],
     ]),
     threads: new Map<string, Message[]>(),
@@ -344,6 +346,13 @@ function fakeSlack() {
             signing_secret: "shh-sign",
           },
           oauth_authorize_url: "https://slack.com/oauth/v2/authorize?client_id=1.2",
+        });
+      // Issue 50: the Slack CLI-style install of the app, with the app's own two tokens.
+      case "apps.developerInstall":
+        return json({
+          ok: true,
+          app_id: appID,
+          api_access_tokens: { bot: "xoxb-jotaro", app_level: installedApp },
         });
       case "apps.manifest.export": {
         state.onExport();
@@ -2534,3 +2543,54 @@ test("a text event part that ends past Slack's limit is never appended, and the 
       expect(calls("chat.postMessage")).toEqual([]);
     });
   }));
+
+test("issue50: tokens an install saved for an inactive account stay unconnected, and only hello connects them once it's back", async () => {
+  const logged: unknown[] = [];
+  const errors = spyOn(console, "error").mockImplementation((...args) => logged.push(...args));
+  const logs = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    // A Slack login for the owner, then the daemon creates and installs the app with it.
+    fake.state.keychain.set(
+      "open-dot-slack-cli-T1",
+      JSON.stringify({
+        token: "xoxe.xoxp-1-cli",
+        refresh_token: "xoxe-1-cli",
+        team_id: team,
+        user_id: owner,
+        exp: time / 1000 + 43_200,
+        state: "ready",
+      }),
+    );
+    requestApp(db, "jotaro");
+    await provision(db, shared, setup());
+    expect(fake.state.keychain.get("open-dot-slack-jotaro-bot")).toBe("xoxb-jotaro");
+    expect(fake.state.keychain.get("open-dot-slack-jotaro-app")).toBe(installedApp);
+    expect(app()).toMatchObject({ state: "created", appID, botID: null });
+
+    // Slack says the bot's account is inactive: no connection, and nothing active.
+    fake.state.botCheck = "account_inactive";
+    for (let pass = 0; pass < 3; pass++) {
+      time += 60_000;
+      await tick();
+    }
+    expect(fake.sockets).toEqual([]);
+    expect(fake.state.calls.filter((call) => call.endsWith("apps.connections.open"))).toEqual([]);
+    expect(app()).toMatchObject({ state: "created", botID: null, botUser: null });
+    expect(logged.map(String).join("\n")).toContain("account_inactive");
+
+    // Once it's back, the token is read again and a connection opens, but only hello activates it.
+    fake.state.botCheck = undefined;
+    time += 60_000;
+    await tick();
+    expect(fake.sockets).toHaveLength(1);
+    expect(app()?.state).toBe("created");
+    socket()?.on.message(JSON.stringify({ type: "hello", connection_info: { app_id: appID } }));
+    expect(app()).toMatchObject({ state: "active", botID, botUser, problem: null });
+    const shown = `${everything()}\n${logged.map(String).join("\n")}`;
+    expect(shown).not.toContain("xoxb-jotaro");
+    expect(shown).not.toContain(installedApp);
+  } finally {
+    errors.mockRestore();
+    logs.mockRestore();
+  }
+});

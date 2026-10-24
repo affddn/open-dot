@@ -34,11 +34,36 @@ struct SlackSetup: Decodable, Equatable {
     var retryAt: Double? = nil
   }
 
+  /// The daemon's install with the Slack login: "queued", "sending", "saved", "approval" or
+  /// "failed", with Slack's error code or open-dot's own (`unknown_outcome`, `bad_answer`,
+  /// `save_failed`).
+  struct Install: Decodable, Equatable {
+    let phase: String
+    var code: String? = nil
+  }
+
+  /// The owner's Slack login, once per workspace, as the daemon last saw it. Never a token.
+  struct Login: Decodable, Equatable {
+    struct Pending: Decodable, Equatable {
+      let attempt: String
+      let expiresAt: Double
+    }
+
+    /// "unknown", "none", "ready" or "relogin".
+    let state: String
+    var team: String? = nil
+    var user: String? = nil
+    var problem: String? = nil
+    var pending: Pending? = nil
+  }
+
   struct App: Decodable, Equatable {
     let state: String
     var appID: String? = nil
     var botUser: String? = nil
     var problem: String? = nil
+    /// Nil from an older daemon, and for an app the daemon wasn't asked to install.
+    var install: Install? = nil
     let manifestOutdated: Bool
     var updateState: String? = nil
     var updateNote: String? = nil
@@ -50,6 +75,17 @@ struct SlackSetup: Decodable, Equatable {
   var app: App? = nil
   var ownerFeed: OwnerFeed? = nil
   var dmCheck: DMCheck? = nil
+  /// Nil from a daemon older than the login.
+  var login: Login? = nil
+  /// Slack's prefilled link for a new app from the dot's manifest.
+  var manifestLink: String? = nil
+}
+
+/// A login's slash command, waiting in the notch's memory for the owner's challenge code.
+struct SlackLoginTicket: Decodable, Equatable {
+  let attempt: String
+  let command: String
+  let expiresAt: Double
 }
 
 /// What the owner asks of a dot's Slack app from the notch. Each is sent once, never retried.
@@ -63,6 +99,15 @@ enum SlackAction: Equatable {
   case icon
   /// Starts, or restarts, a DM check. It sends nothing to Slack.
   case dmCheck
+  /// Asks the daemon for a login's slash command, then exchanges it once with Slack's code.
+  case loginStart
+  case loginFinish(attempt: String, challenge: String)
+  /// The owner's Retry install of the created app with the Slack login.
+  case install
+  /// Binds the app whose two tokens these are, such as one made from the prefilled link. It takes
+  /// the place of the dot's current app only with `replacing`, the ID of the app the owner
+  /// confirmed replacing; the daemon refuses it once another app is bound.
+  case link(bot: String, app: String, replacing: String?)
 }
 
 /// What the daemon answered an action.
@@ -72,6 +117,8 @@ enum SlackOutcome: Equatable {
   case said(String)
   /// The manifest update's changes, waiting for the owner's approval. Nothing was sent.
   case confirm([String])
+  /// A login waiting for its challenge code.
+  case ticket(SlackLoginTicket)
 }
 
 /// The app's pages on api.slack.com, built only from an app ID of Slack's form.
@@ -109,6 +156,70 @@ func slackCanUpdate(_ app: SlackSetup.App) -> Bool {
   app.manifestOutdated || app.updateState != nil || app.updateNote != nil
 }
 
+/// Whether the view offers the Slack login: a daemon that has it, and no usable login.
+func slackNeedsLogin(_ setup: SlackSetup) -> Bool {
+  guard let login = setup.login else { return false }
+  return login.state != "ready"
+}
+
+/// Where the Slack login stands, in the owner's words.
+func slackLoginLine(_ login: SlackSetup.Login) -> String {
+  switch login.state {
+  case "ready": return "Logged in to Slack\(login.team.map { " in \($0)" } ?? ""). Install creates and installs each dot's app with it."
+  case "relogin": return "Log in to Slack again: \(login.problem ?? "the saved login can't be used.")"
+  case "none": return "Not logged in to Slack. Log in once for this workspace, and Install does the rest."
+  default: return "Log in to Slack once for this workspace, and Install creates and installs each dot's app. If you logged in before, the daemon finds it when it next needs it."
+  }
+}
+
+/// What the daemon's install with the Slack login says now, or nil when it wasn't asked.
+func slackInstallLine(_ install: SlackSetup.Install?) -> String? {
+  guard let install else { return nil }
+  switch install.phase {
+  case "queued", "sending": return "The daemon is installing the app with your Slack login."
+  case "saved": return "Installed with your Slack login, and both tokens are in the Keychain. Saved isn't connected: this says Connected once the daemon has checked them."
+  case "approval":
+    return install.code == "app_approval_request_eligible"
+      ? "Waiting for admin approval. open-dot hasn't asked for it: request approval on the app's install page, then Retry install once an admin approves."
+      : install.code == "app_approval_request_pending"
+        ? "Waiting for admin approval: the request is with your workspace's admins. Retry install once one approves."
+        : "An admin denied this app. Ask your admins, then Retry install."
+  default:
+    return "Installing didn't finish (\(install.code ?? "slack_error")). Retry install, or install the same app yourself below."
+  }
+}
+
+/// Whether Retry install is offered: a created app with nothing in flight, and a usable login.
+func slackCanRetryInstall(_ setup: SlackSetup) -> Bool {
+  guard let app = setup.app, app.state == "created", setup.login?.state == "ready" else { return false }
+  return app.install?.phase != "queued" && app.install?.phase != "sending"
+}
+
+/// The prefilled link, only while it's one of Slack's app pages.
+func slackManifestURL(_ setup: SlackSetup) -> URL? {
+  guard let text = setup.manifestLink, let url = URL(string: text), isSlackAppPage(url) else { return nil }
+  return url
+}
+
+/// The app an app-level token names, as `xapp-<n>-<app ID>-…`.
+func slackLinkAppID(_ token: String) -> String? {
+  guard let match = token.firstMatch(of: /^xapp-[0-9]{1,4}-(A[A-Z0-9]{6,31})-/) else { return nil }
+  return String(match.1)
+}
+
+/// What the prefilled link warns before it's used: it always makes another app.
+func slackLinkWarning(_ app: SlackSetup.App?, dot: String) -> String {
+  let base = "The prefilled link makes a new app in Slack each time you use it."
+  guard let app else { return base }
+  if let id = app.appID, app.state == "created" || app.state == "active" {
+    return "\(base) \(dot) already has the app \(id): another would be a duplicate, and binding it replaces \(id) only once you confirm. \(id) stays in Slack until you delete it."
+  }
+  if app.state == "unknown" {
+    return "\(base) Creating \(dot)'s app got no clear answer, so one may already exist at api.slack.com/apps; look there first."
+  }
+  return base
+}
+
 /// The app's ID and state in a line, or that there's none.
 func slackTitle(_ app: SlackSetup.App?) -> String {
   guard let app else { return "No app" }
@@ -118,17 +229,18 @@ func slackTitle(_ app: SlackSetup.App?) -> String {
 /// The app's state and the owner's next step, in the words `open-dot slack status` uses.
 func slackSummary(_ setup: SlackSetup, dot: String) -> String {
   guard let app = setup.app else {
-    return "\(dot) has no Slack app of its own. Install asks the daemon to create one from a manifest with your configuration token, then guides you through Slack."
+    return "\(dot) has no Slack app of its own. Install asks the daemon to create one named \(dot) and install it with your Slack login. Without a login, use the prefilled link below."
   }
   switch app.state {
   case "requested":
-    return "Requested. The daemon creates the app with your configuration token within about 10 seconds."
+    return "Requested. The daemon creates the app with your Slack login, or your configuration token, within about 10 seconds."
   case "creating": return "The daemon is creating the app now."
   case "unknown":
     return "Creating the app got no clear answer, so it may exist. Look for an app named \(dot) at api.slack.com/apps and attach its ID, or create it again with Retry."
   case "attaching": return "The daemon is checking that app with Slack."
   case "failed": return "Slack refused to create the app. Try again with Install."
   case "created":
+    if let line = slackInstallLine(app.install) { return "Created. \(line)" }
     return "Created. Install it in Slack (Install, then Allow), then save its bot token and an app-level token with the connections:write scope, by pickup or in the fields. Saved isn't connected: the daemon checks them within a minute and connects."
   case "active":
     return "Connected\(app.botUser.map { " as <@\($0)>" } ?? ""). Invite it to a channel with /invite @\(dot), then mention it there, or DM it."
@@ -185,16 +297,27 @@ func slackDMCheckLine(_ check: SlackSetup.DMCheck?, dot: String) -> String {
   return "DM check: pending since \(shortTime(check.since)). Send \(dot) a DM in Slack yourself; this changes only once Slack confirmed its reply. A queued reply doesn't count, and restarting the daemon forgets the check."
 }
 
-/// A token the guided install picks up from the clipboard, one step at a time.
+/// A token the guided install picks up from the clipboard, one step at a time. `linkBot` and
+/// `linkApp` are the two tokens of an app the owner made from the prefilled link, whose ID the
+/// app-level token names.
 enum SlackPickupStep: String, Equatable {
-  case access, refresh, bot, app
+  case access, refresh, bot, app, linkBot, linkApp
 
   var name: String {
     switch self {
     case .access: "configuration access token"
     case .refresh: "configuration refresh token"
-    case .bot: "bot token"
-    case .app: "app-level token"
+    case .bot, .linkBot: "bot token"
+    case .app, .linkApp: "app-level token"
+    }
+  }
+
+  /// The step whose token is held in memory until this one's arrives.
+  var after: SlackPickupStep? {
+    switch self {
+    case .refresh: .access
+    case .linkApp: .linkBot
+    default: nil
     }
   }
 }
@@ -206,10 +329,11 @@ func slackTokenMatches(_ step: SlackPickupStep, _ text: String, appID: String?) 
   switch step {
   case .access: pattern = #"\Axoxe\.xoxp-[0-9]{1,4}-[A-Za-z0-9]{20,1000}\z"#
   case .refresh: pattern = #"\Axoxe-[0-9]{1,4}-[A-Za-z0-9]{20,1000}\z"#
-  case .bot: pattern = #"\Axoxb-[0-9]{1,20}-[0-9]{1,20}-[A-Za-z0-9]{20,64}\z"#
+  case .bot, .linkBot: pattern = #"\Axoxb-[0-9]{1,20}-[0-9]{1,20}-[A-Za-z0-9]{20,64}\z"#
   case .app:
     guard let appID, slackLinks(appID) != nil else { return false }
     pattern = #"\Axapp-[0-9]{1,4}-"# + appID + #"-[0-9]{1,20}-[A-Za-z0-9]{20,128}\z"#
+  case .linkApp: pattern = #"\Axapp-[0-9]{1,4}-A[A-Z0-9]{6,31}-[0-9]{1,20}-[A-Za-z0-9]{20,128}\z"#
   }
   return text.utf8.count <= 1024 && text.range(of: pattern, options: .regularExpression) != nil
 }
@@ -243,9 +367,11 @@ struct SlackPickup: Equatable {
   var mismatched = false
 }
 
-/// An access token picked up and held in memory only until its refresh token is.
+/// An access token picked up and held in memory only until its refresh token is, or a link's
+/// bot token until its app-level token is.
 struct HeldAccess {
   let dot: String
+  var step: SlackPickupStep = .access
   let token: String
   var deadline: TimeInterval
 }
@@ -269,16 +395,16 @@ extension Store {
         slackLinks(app.appID) != nil
       else { return }
       appID = app.appID
-    case .refresh:
-      guard let held = heldAccess, held.dot == name, uptime() < held.deadline else {
+    case .refresh, .linkApp:
+      guard let held = heldAccess, held.dot == name, held.step == step.after, uptime() < held.deadline else {
         endPickup(nil)
-        slackNotices[name] = "Pick up the access token first."
+        slackNotices[name] = "Pick up the \(step == .refresh ? "access" : "bot") token first."
         return
       }
-    case .access: break
+    case .access, .linkBot: break
     }
     let deadline = uptime() + Self.pickupSeconds
-    if step != .refresh { dropHeldAccess() }
+    if step.after == nil { dropHeldAccess() }
     slackPickup = SlackPickup(dot: name, step: step, appID: appID, seen: clipboard.revision, deadline: deadline)
     slackNotices[name] = nil
     pickupGeneration += 1
@@ -317,7 +443,9 @@ extension Store {
     if let held = heldAccess {
       if !slackShown(held.dot) { return endPickup(left) }
       if now >= held.deadline {
-        return endPickup("The refresh token wasn't picked up within 2 minutes, so the access token was dropped. Nothing was saved.")
+        return endPickup(held.step == .linkBot
+          ? "The app-level token wasn't picked up within 2 minutes, so the bot token was dropped. Nothing was saved."
+          : "The refresh token wasn't picked up within 2 minutes, so the access token was dropped. Nothing was saved.")
       }
     }
     guard let pickup = slackPickup else { return }
@@ -345,14 +473,53 @@ extension Store {
       heldAccess = HeldAccess(dot: pickup.dot, token: copied, deadline: now + Self.pickupSeconds)
       slackHolding = pickup.dot
       slackNotices[pickup.dot] = "Access token picked up and held in the notch's memory only. Pick up the refresh token within 2 minutes; nothing is saved until both are."
-    case .refresh:
-      guard let held = heldAccess, held.dot == pickup.dot else { return endPickup(nil) }
+    case .linkBot:
+      heldAccess = HeldAccess(dot: pickup.dot, step: .linkBot, token: copied, deadline: now + Self.pickupSeconds)
+      slackHolding = pickup.dot
+      slackNotices[pickup.dot] = "Bot token picked up and held in the notch's memory only. Pick up the app-level token within 2 minutes; nothing is saved until both are."
+    case .refresh, .linkApp:
+      guard let held = heldAccess, held.dot == pickup.dot, held.step == pickup.step.after else { return endPickup(nil) }
       endPickup(nil)
-      runSlack(pickup.dot, .config(token: held.token, refreshToken: copied))
+      if pickup.step == .refresh {
+        runSlack(pickup.dot, .config(token: held.token, refreshToken: copied))
+      } else {
+        link(pickup.dot, bot: held.token, app: copied)
+      }
     case .bot, .app:
       endPickup(nil)
       runSlack(pickup.dot, .token(kind: pickup.step.rawValue, token: copied))
     }
+  }
+
+  /// Binds the app these tokens belong to. One that isn't the dot's created or active app takes
+  /// its place only once the owner confirms, and the request names the very app the owner saw
+  /// and confirmed replacing, so the daemon refuses it if another is bound by then.
+  func link(_ name: String, bot: String, app: String) {
+    let current = slackStates[name]?.app
+    var replacing: String?
+    if let current, let id = current.appID, current.state == "created" || current.state == "active",
+      slackLinkAppID(app) != id
+    {
+      guard confirmSlackReplace(name, id) else {
+        slackNotices[name] = "Nothing was saved. \(name) keeps the app \(id)."
+        return
+      }
+      replacing = id
+    }
+    runSlack(name, .link(bot: bot, app: app, replacing: replacing))
+  }
+
+  /// Asks the daemon for a login's slash command. The ticket stays only in the notch's memory.
+  func startLogin(_ name: String) {
+    slackTicket = nil
+    runSlack(name, .loginStart)
+  }
+
+  /// Sends the challenge code once. The login is used up whatever the answer, so it's forgotten.
+  func finishLogin(_ name: String, challenge: String) {
+    guard let ticket = slackTicket else { return }
+    slackTicket = nil
+    runSlack(name, .loginFinish(attempt: ticket.attempt, challenge: challenge))
   }
 
   /// The owner's own mark that Slack asked an admin to approve the app. Nothing detects approval.
@@ -385,6 +552,9 @@ struct SlackView: View {
   @State private var botToken = ""
   @State private var appToken = ""
   @State private var appID = ""
+  @State private var challenge = ""
+  @State private var linkBot = ""
+  @State private var linkApp = ""
 
   var body: some View {
     let setup = store.slackStates[name]
@@ -399,11 +569,20 @@ struct SlackView: View {
             .accessibilityIdentifier("slack-notice")
         }
         if let setup {
-          // The first dot in a workspace needs the configuration pair before Install can work.
-          if slackNeedsConfig(setup) { configSection(setup) }
+          // The first dot in a workspace needs the Slack login before Install can do it all.
+          if slackNeedsLogin(setup), let login = setup.login { loginSection(login) }
           state(setup)
           if let app = setup.app, app.state == "active" { conversation(setup, app) }
-          if !slackNeedsConfig(setup) { configSection(setup) }
+          if setup.app?.state != "active" { linkSection(setup) }
+          if let login = setup.login, !slackNeedsLogin(setup) { loginSection(login) }
+          // Configuration tokens are the advanced path: the manifest update and the icon use them.
+          // A daemon older than the login has only them.
+          if setup.login == nil {
+            configSection(setup)
+          } else {
+            DisclosureGroup("Advanced: configuration tokens") { configSection(setup) }
+              .font(.caption2).accessibilityIdentifier("slack-advanced")
+          }
           Text("Pickup is off until you press Pick up. It then watches the clipboard for 2 minutes for that one token, takes only a copy made after you pressed it that is exactly that token, clears that copy, and stops when you leave this view. A clipboard manager or Universal Clipboard may keep its own copy. You can type or paste into the secure fields instead.")
             .font(.caption2).foregroundStyle(.secondary).accessibilityIdentifier("slack-pickup-disclosure")
         } else {
@@ -446,8 +625,12 @@ struct SlackView: View {
         EmptyView()
       }
       if slackCanAttach(app?.state) { attach }
+      if slackCanRetryInstall(setup) {
+        Button(app?.install == nil ? "Install with Slack login" : "Retry install") { store.runSlack(name, .install) }
+          .accessibilityIdentifier("slack-retry-install")
+      }
       if let app, app.state == "created" || app.state == "active", let links = slackLinks(app.appID) {
-        installSteps(app, links)
+        if app.state == "active" || app.install?.phase != "saved" { installSteps(app, links) }
         if slackCanUpdate(app) {
           Button("Update manifest…") { store.runSlack(name, .update(approve: nil)) }
             .accessibilityIdentifier("slack-update")
@@ -571,14 +754,88 @@ struct SlackView: View {
     }
   }
 
+  /// The owner's Slack login, once per workspace: a slash command to run in Slack, then the code
+  /// Slack shows. The command and code stay in the notch's memory until sent once.
+  private func loginSection(_ login: SlackSetup.Login) -> some View {
+    let ticket = store.slackTicket.flatMap { $0.expiresAt > Date().timeIntervalSince1970 * 1000 ? $0 : nil }
+    return VStack(alignment: .leading, spacing: 6) {
+      Text("Slack login").font(.caption.weight(.medium)).accessibilityIdentifier("slack-login-heading")
+      step(slackLoginLine(login)).accessibilityIdentifier("slack-login-line")
+      if let ticket {
+        step("1. Run this in any Slack channel or DM, then approve it:")
+        Text(verbatim: ticket.command).font(.caption2.monospaced()).textSelection(.enabled)
+          .accessibilityIdentifier("slack-login-command")
+        Button("Copy command") { store.copyText(ticket.command) }.accessibilityIdentifier("slack-login-copy")
+        step("2. Enter the code Slack shows. It's sent once; a wrong one needs a new login.")
+        HStack {
+          SecureField("Challenge code", text: $challenge).textFieldStyle(.roundedBorder)
+          Button("Finish login") {
+            let code = challenge.trimmingCharacters(in: .whitespacesAndNewlines)
+            challenge = ""
+            store.finishLogin(name, challenge: code)
+          }
+          .disabled(challenge.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+          .accessibilityIdentifier("slack-login-finish")
+        }
+      } else {
+        Button(login.state == "ready" ? "Log in again" : "Log in to Slack") { store.startLogin(name) }
+          .accessibilityIdentifier("slack-login-start")
+      }
+    }
+    .buttonStyle(.plain)
+    .font(.caption2.weight(.semibold))
+    .padding(8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.05)))
+  }
+
+  /// The fallback when Install can't: Slack's prefilled link for a new app, then its two tokens,
+  /// which the daemon checks with Slack before binding that app.
+  private func linkSection(_ setup: SlackSetup) -> some View {
+    let holding = store.slackHolding == name && store.heldAccess?.step == .linkBot
+    return VStack(alignment: .leading, spacing: 6) {
+      Text("Or create it yourself").font(.caption.weight(.medium)).accessibilityIdentifier("slack-link-heading")
+      step(slackLinkWarning(setup.app, dot: name)).foregroundStyle(.orange).accessibilityIdentifier("slack-link-warning")
+      step("Open the prefilled link, pick the workspace and Create. Install it to the workspace, then copy the Bot User OAuth Token from OAuth & Permissions, and under Basic Information generate an app-level token with connections:write.")
+      HStack {
+        if let url = slackManifestURL(setup) {
+          Button("Open prefilled link") { store.openSlack(url) }.accessibilityIdentifier("slack-link-open")
+        }
+        pickupButton(.linkBot)
+        pickupButton(.linkApp).disabled(!holding)
+      }
+      if holding {
+        Text("Bot token held in memory only, until the app-level token is picked up.")
+          .font(.caption2).foregroundStyle(.orange).accessibilityIdentifier("slack-link-holding")
+      }
+      pickupStatus([.linkBot, .linkApp])
+      SecureField("Bot token (xoxb-…)", text: $linkBot).textFieldStyle(.roundedBorder)
+      SecureField("App-level token (xapp-…)", text: $linkApp).textFieldStyle(.roundedBorder)
+      Button("Connect this app") {
+        let bot = linkBot.trimmingCharacters(in: .whitespacesAndNewlines)
+        let app = linkApp.trimmingCharacters(in: .whitespacesAndNewlines)
+        linkBot = ""
+        linkApp = ""
+        store.link(name, bot: bot, app: app)
+      }
+      .disabled(linkBot.isEmpty || linkApp.isEmpty)
+      .accessibilityIdentifier("slack-link-save")
+    }
+    .buttonStyle(.plain)
+    .font(.caption2.weight(.semibold))
+    .padding(8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.05)))
+  }
+
   /// The configuration token pair: the first dot in a workspace needs it, later dots reuse it.
   private func configSection(_ setup: SlackSetup) -> some View {
     let first = slackNeedsConfig(setup)
-    let holding = store.slackHolding == name
-    let heading = first ? "First dot in this workspace: configuration tokens" : "Configuration tokens, saved for this workspace"
+    let holding = store.slackHolding == name && store.heldAccess?.step == .access
+    let heading = first ? "Configuration tokens, not saved yet" : "Configuration tokens, saved for this workspace"
     let guide = first
-      ? "Once per workspace, before Install can create an app: open Your App Configuration Tokens, Generate Token for the workspace, then pick up the access token and then the refresh token. Later dots skip this: the daemon rotates the saved pair before each use."
-      : "open-dot saved a pair before and rotates it before each use, so this dot skips this step. Replace the pair only if it's blocked."
+      ? "Optional with the Slack login. Manifest updates and setting the app's icon use them, and Install falls back to them without a login: open Your App Configuration Tokens, Generate Token for the workspace, then pick up the access token and then the refresh token. The daemon rotates the saved pair before each use."
+      : "open-dot saved a pair before and rotates it before each use. Replace the pair only if it's blocked."
     return VStack(alignment: .leading, spacing: 6) {
       Text(verbatim: heading).font(.caption.weight(.medium)).accessibilityIdentifier("slack-config-heading")
       Text(verbatim: guide).font(.caption2).foregroundStyle(.secondary)
@@ -636,6 +893,17 @@ struct SlackView: View {
   alert.informativeText = "This adds to its manifest, keeping everything else in it:\n\n"
     + changes.joined(separator: "\n")
   alert.addButton(withTitle: "Update")
+  alert.addButton(withTitle: "Cancel")
+  return runAlert(alert, store) == .alertFirstButtonReturn
+}
+
+/// Asks the owner before another app takes the place of the dot's current one. The current app
+/// stays in Slack; only open-dot forgets it.
+@MainActor func confirmReplace(_ name: String, _ appID: String, _ store: Store) -> Bool {
+  let alert = NSAlert()
+  alert.messageText = "Replace \(name)'s Slack app?"
+  alert.informativeText = "\(name) is bound to the app \(appID). These tokens belong to another app, which would take its place, and open-dot would forget \(appID)'s bot. \(appID) stays in Slack until you delete it there."
+  alert.addButton(withTitle: "Replace it")
   alert.addButton(withTitle: "Cancel")
   return runAlert(alert, store) == .alertFirstButtonReturn
 }

@@ -5,7 +5,7 @@ import type { Db } from "./db";
 import { findDot } from "./dots";
 import { type Fetch, output } from "./feed";
 import { type SlackApp, type SuggestedPrompt, slackApps, slackConfig, slackEvents } from "./schema";
-import { isRecord, type Slack, slackCode, slackIDs } from "./slack";
+import { isRecord, type Slack, slackClient, slackCode, slackIDs } from "./slack";
 
 /** The Keychain item holding the owner's app configuration token pair, as JSON. */
 export const configItem = "open-dot-slack-config";
@@ -271,25 +271,43 @@ interface Upload {
  * One call to Slack's configuration API. Its answers can carry secrets, so none is logged. With
  * a file, the call is multipart and the token goes in the Authorization header instead.
  */
-async function configCall(
+function configCall(
   setup: Setup,
   method: string,
   params: Record<string, string>,
   file?: Upload,
 ): Promise<Answer> {
-  const base = process.env.OPEN_DOT_SLACK_URL ?? "https://slack.com/api";
-  let request: RequestInit;
-  if (file) {
-    const { token, ...fields } = params;
-    const form = new FormData();
-    for (const [key, value] of Object.entries(fields)) form.append(key, value);
-    form.append("file", new Blob([new Uint8Array(file.bytes)], { type: file.mime }), file.name);
-    request = { headers: { authorization: `Bearer ${token ?? ""}` }, body: form };
-  } else
-    request = {
+  if (!file)
+    return slackPost(setup, method, {
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams(params).toString(),
-    };
+    });
+  const { token, ...fields } = params;
+  const form = new FormData();
+  for (const [key, value] of Object.entries(fields)) form.append(key, value);
+  form.append("file", new Blob([new Uint8Array(file.bytes)], { type: file.mime }), file.name);
+  return slackPost(setup, method, {
+    headers: { authorization: `Bearer ${token ?? ""}` },
+    body: form,
+  });
+}
+
+/**
+ * One JSON call with the owner's Slack CLI token in the Authorization header, the way the Slack
+ * CLI calls apps.manifest.create and apps.developerInstall. Its answers can carry tokens, so
+ * none is logged.
+ */
+const cliCall = (setup: Setup, method: string, token: string, body: Record<string, unknown>) =>
+  slackPost(setup, method, {
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify(body),
+  });
+
+async function slackPost(setup: Setup, method: string, request: RequestInit): Promise<Answer> {
+  const base = process.env.OPEN_DOT_SLACK_URL ?? "https://slack.com/api";
   try {
     const response = await setup.fetch(`${base}/${method}`, {
       method: "POST",
@@ -375,6 +393,12 @@ const readPair = async (setup: Setup) => {
 const superseded =
   "the configuration tokens changed while they were being rotated, so this rotation's tokens weren't used. Trying again later.";
 
+const noPair = "save your app configuration tokens first, with: open-dot slack config";
+
+/** What a dot's app waits for when there's neither a Slack login nor a configuration pair. */
+const loginFirst =
+  "log in to Slack once in the notch's Slack view (Connectors → Slack → Log in to Slack), or create the app yourself from the prefilled link there. A configuration token pair saved with open-dot slack config works too.";
+
 /**
  * A fresh app configuration token for the owner, rotated just now so Slack says whose it is.
  * The intent is saved before the rotation and the new pair goes straight to the Keychain. A
@@ -412,8 +436,7 @@ export async function freshConfig(db: Db, setup: Setup, owner: { id: string; tea
   }
   if (row.state !== "idle") throw new Blocked(row.problem ?? "a token rotation is in progress");
   const pair = await readPair(setup);
-  if (!pair)
-    throw new Blocked(`save your app configuration tokens first, with: open-dot slack config`);
+  if (!pair) throw new Blocked(noPair);
   // Claimed only if nothing moved since the row was read, before the pair was.
   let mine: ConfigRow = {
     ...row,
@@ -495,6 +518,658 @@ export async function freshConfig(db: Db, setup: Setup, owner: { id: string; tea
   return { token: fresh.token, team: fresh.team_id, user: fresh.user_id };
 }
 
+/** The owner and workspace of `open-dot-slack-user`, whom every dot's app answers. */
+export interface Owner {
+  readonly id: string;
+  readonly team: string;
+}
+
+/** A workspace's ID. An org-wide (E…) login or install isn't supported. */
+const workspaceID = /^T[A-Z0-9]{1,31}$/;
+
+/** The Keychain item holding the owner's Slack CLI-style login for one workspace, as JSON. */
+export const cliItem = (team: string) => `open-dot-slack-cli-${team}`;
+
+/** The Slack CLI's latest release (v4.11.0). A ticket asks with major.minor, an exchange with all. */
+const cliTicketVersion = "v4.11";
+const cliVersion = "v4.11.0";
+/** How long a login's slash command waits for its challenge code, in open-dot's memory only. */
+export const ticketLife = 10 * 60_000;
+/** A CLI token is used until this close to its expiry, then refreshed first, as the CLI does. */
+const refreshMargin = 5 * 60_000;
+
+/** An expiry in seconds that `Date` can show: finite, positive, and at most 8.64e12. */
+const saneExp = (exp: number) => Number.isFinite(exp) && exp > 0 && exp <= 8.64e12;
+
+const CliRecord = Schema.Struct({
+  token: Schema.String,
+  refresh_token: Schema.String,
+  team_id: Schema.String,
+  user_id: Schema.String,
+  exp: Schema.Number,
+  // "rotating" is saved before tooling.tokens.rotate, so one whose outcome was lost is never retried.
+  state: Schema.Literals(["ready", "rotating"]),
+});
+
+const Exchanged = Schema.Struct({
+  token: Schema.String,
+  refresh_token: Schema.String,
+  team_id: Schema.String,
+  user_id: Schema.String,
+  exp: Schema.Number,
+  is_ready: Schema.optionalKey(Schema.Boolean),
+  is_enterprise_install: Schema.optionalKey(Schema.Boolean),
+});
+
+/** What the notch shows of the Slack login: never a token, a refresh token or a ticket. */
+export interface LoginView {
+  // "unknown": not read since the daemon started. "relogin": it can't be used; log in again.
+  readonly state: "unknown" | "none" | "ready" | "relogin";
+  readonly team: string | null;
+  readonly user: string | null;
+  readonly problem: string | null;
+  /** A login waiting for its challenge code. */
+  readonly pending: { readonly attempt: string; readonly expiresAt: number } | null;
+}
+
+/** One answer of a route's work: why not, with the status to send. */
+export interface Refusal {
+  readonly status: number;
+  readonly problem: string;
+}
+
+/**
+ * Runs one Keychain-writing step at a time in this process: a login's save, a CLI token's
+ * refresh and the saves of a dot's tokens. Only the daemon runs them.
+ */
+const gates = new WeakMap<Setup, { last: Promise<unknown> }>();
+function serial<T>(setup: Setup, run: () => Promise<T>) {
+  const gate = gates.get(setup) ?? { last: Promise.resolve() };
+  gates.set(setup, gate);
+  const next = gate.last.then(run, run);
+  gate.last = next.catch(() => {});
+  return next;
+}
+
+/**
+ * The owner's Slack CLI-style login, in the daemon's memory: the login waiting for its challenge
+ * code, and what the Keychain item last showed. The ticket lives only here, is used once and
+ * expires; the challenge code is never kept. Tokens live only in the Keychain item `cliItem`,
+ * never in `~/.slack`, the database, a log or an answer.
+ */
+function makeLogin(setup: Setup) {
+  let known: Omit<LoginView, "pending"> = {
+    state: "unknown",
+    team: null,
+    user: null,
+    problem: null,
+  };
+  let pending: { attempt: string; ticket: string; expiresAt: number } | undefined;
+  const set = (state: LoginView["state"], owner: Owner, problem: string | null = null) => {
+    known = { state, team: owner.team, user: owner.id, problem };
+  };
+  const relogin = (owner: Owner, problem: string) => {
+    set("relogin", owner, problem);
+    return new Blocked(problem);
+  };
+  const live = () => (pending && setup.now() < pending.expiresAt ? pending : undefined);
+
+  /** The saved login of the owner's workspace, or undefined with none. Throws when it can't be used. */
+  const read = async (owner: Owner) => {
+    if (!workspaceID.test(owner.team)) {
+      set("none", owner);
+      return undefined;
+    }
+    const item = cliItem(owner.team);
+    const saved = await setup.read(item);
+    if (!saved) {
+      set("none", owner);
+      return undefined;
+    }
+    let record: typeof CliRecord.Type;
+    try {
+      record = Schema.decodeUnknownSync(CliRecord)(JSON.parse(saved));
+    } catch {
+      throw relogin(owner, `the Keychain item ${item} doesn't hold a Slack login. Log in again.`);
+    }
+    // An expired token is fine, since its refresh token renews it; a malformed one is never used.
+    if (
+      !looksLike(record.token, "xoxe.") ||
+      !looksLike(record.refresh_token, "xoxe-") ||
+      !saneExp(record.exp)
+    )
+      throw relogin(
+        owner,
+        `the Keychain item ${item} doesn't hold a usable Slack login. Log in again.`,
+      );
+    if (record.team_id !== owner.team || record.user_id !== owner.id)
+      throw relogin(owner, `the Slack login in ${item} isn't yours. Log in again as yourself.`);
+    if (record.state === "rotating")
+      throw relogin(
+        owner,
+        "refreshing the Slack login was interrupted, so its tokens may be used up. Log in again.",
+      );
+    return record;
+  };
+
+  return {
+    view: (): LoginView => {
+      const waiting = live();
+      return {
+        ...known,
+        pending: waiting ? { attempt: waiting.attempt, expiresAt: waiting.expiresAt } : null,
+      };
+    },
+
+    /** Reads what the Keychain holds for the owner, without refreshing anything. */
+    check: (owner: Owner) =>
+      serial(setup, async () => {
+        if ((await read(owner)) !== undefined) set("ready", owner);
+      }),
+
+    /**
+     * Starts a login: Slack's ticket for the `/slackauthticket` command, kept in memory for
+     * `ticketLife`. A new start forgets any earlier one. Without no_rotation, as the CLI asks.
+     */
+    start: async (): Promise<Refusal | { attempt: string; command: string; expiresAt: number }> => {
+      const answer = await configCall(setup, "apps.hosted.generateAuthTicket", {
+        slack_cli_version: cliTicketVersion,
+      });
+      const ticket = answer.kind === "ok" ? answer.body.ticket : undefined;
+      if (typeof ticket !== "string" || !/^[A-Za-z0-9+/=_-]{8,512}$/.test(ticket))
+        return {
+          status: 502,
+          problem:
+            answer.kind === "refused"
+              ? `Slack wouldn't start a login (${answer.error}). Try again.`
+              : "Slack didn't start a login. Try again.",
+        };
+      pending = { attempt: crypto.randomUUID(), ticket, expiresAt: setup.now() + ticketLife };
+      return {
+        attempt: pending.attempt,
+        command: `/slackauthticket ${ticket}`,
+        expiresAt: pending.expiresAt,
+      };
+    },
+
+    /**
+     * Exchanges the waiting login's ticket and the owner's challenge code, once: the login is
+     * used up before the call, whatever its outcome. Only a complete, ready answer for the owner's
+     * own workspace and user is saved, straight to the Keychain.
+     */
+    finish: async (attempt: string, challenge: string, owner: Owner) => {
+      const mine = live();
+      if (!mine || mine.attempt !== attempt)
+        return {
+          status: 409,
+          problem: "That login isn't the one waiting, or it expired. Start the login again.",
+        } satisfies Refusal;
+      pending = undefined;
+      return serial(setup, async (): Promise<Refusal | undefined> => {
+        const answer = await configCall(setup, "apps.hosted.exchangeAuthTicket", {
+          ticket: mine.ticket,
+          challenge,
+          slack_cli_version: cliVersion,
+        });
+        if (answer.kind !== "ok")
+          return {
+            status: 502,
+            problem:
+              answer.kind === "refused"
+                ? `Slack refused the login (${answer.error}). Nothing was saved. Start it again.`
+                : "The login got no clear answer from Slack, so nothing was saved. Start it again.",
+          };
+        const decoded = Schema.decodeUnknownOption(Exchanged)(answer.body);
+        const got = Option.isSome(decoded) ? decoded.value : undefined;
+        if (
+          !got ||
+          got.is_ready !== true ||
+          !looksLike(got.token, "xoxe.") ||
+          !looksLike(got.refresh_token, "xoxe-") ||
+          !slackIDs.user.test(got.user_id) ||
+          !saneExp(got.exp) ||
+          !(got.exp * 1000 > setup.now())
+        )
+          return {
+            status: 502,
+            problem: "Slack's login answer wasn't complete, so nothing was saved. Start it again.",
+          };
+        if (got.is_enterprise_install === true || !workspaceID.test(got.team_id))
+          return {
+            status: 409,
+            problem:
+              "That login is for a whole Enterprise organization. Log in to your workspace instead. Nothing was saved.",
+          };
+        if (got.user_id !== owner.id || got.team_id !== owner.team)
+          return {
+            status: 409,
+            problem: `That login is ${shownID(got.user_id, slackIDs.user)} in ${shownID(got.team_id, slackIDs.team)}, not you (${shownID(owner.id, slackIDs.user)} in ${shownID(owner.team, slackIDs.team)}, from open-dot-slack-user). Nothing was saved. Log in as yourself.`,
+          };
+        const item = cliItem(got.team_id);
+        const saved = await setup
+          .save(
+            item,
+            JSON.stringify({
+              token: got.token,
+              refresh_token: got.refresh_token,
+              team_id: got.team_id,
+              user_id: got.user_id,
+              exp: got.exp,
+              state: "ready",
+            }),
+          )
+          .catch(() => false);
+        if (!saved) {
+          const problem = `Couldn't confirm the login was saved in the Keychain item ${item}. Log in again.`;
+          set("relogin", owner, problem);
+          return { status: 500, problem };
+        }
+        set("ready", owner);
+        return undefined;
+      });
+    },
+
+    /**
+     * The owner's CLI token, or undefined without a login. Near its expiry it's refreshed first
+     * with tooling.tokens.rotate: "rotating" is saved before the call, so a refresh whose answer
+     * or save is lost leaves it, and the next use asks the owner to log in again instead of
+     * sending a refresh token Slack may have used up. The answer must name the same owner.
+     */
+    token: (owner: Owner) =>
+      serial(setup, async () => {
+        const record = await read(owner);
+        if (!record) return undefined;
+        if (record.exp * 1000 - setup.now() > refreshMargin) {
+          set("ready", owner);
+          return record.token;
+        }
+        const item = cliItem(owner.team);
+        const marked = await setup
+          .save(item, JSON.stringify({ ...record, state: "rotating" }))
+          .catch(() => false);
+        if (!marked)
+          throw new Blocked(
+            `couldn't confirm the Slack login's refresh was marked in ${item}, so it wasn't refreshed. Trying again later.`,
+          );
+        const answer = await configCall(setup, "tooling.tokens.rotate", {
+          refresh_token: record.refresh_token,
+        });
+        if (answer.kind === "refused" && answer.error === "ratelimited") {
+          // Slack refused, so the refresh token is still good: it goes back as it was.
+          if (!(await setup.save(item, JSON.stringify(record)).catch(() => false)))
+            throw relogin(owner, `couldn't put the Slack login back in ${item}. Log in again.`);
+          throw new Blocked(
+            "Slack is rate limiting the Slack login's refresh. Trying again later.",
+          );
+        }
+        if (answer.kind !== "ok")
+          throw relogin(
+            owner,
+            answer.kind === "refused" && !maybeDone.has(answer.error)
+              ? `Slack refused to refresh the Slack login (${answer.error}). Log in again.`
+              : "refreshing the Slack login got no clear answer, so its tokens may be used up. Log in again.",
+          );
+        const decoded = Schema.decodeUnknownOption(Rotated)(answer.body);
+        const fresh = Option.isSome(decoded) ? decoded.value : undefined;
+        if (
+          !fresh ||
+          !saneExp(fresh.exp) ||
+          !(fresh.exp * 1000 > setup.now()) ||
+          fresh.team_id !== owner.team ||
+          fresh.user_id !== owner.id ||
+          !looksLike(fresh.token, "xoxe.") ||
+          !looksLike(fresh.refresh_token, "xoxe-")
+        )
+          throw relogin(
+            owner,
+            "Slack's refresh of the Slack login didn't name you, was already expired or was unreadable, so it wasn't used. Log in again.",
+          );
+        const saved = await setup
+          .save(
+            item,
+            JSON.stringify({
+              token: fresh.token,
+              refresh_token: fresh.refresh_token,
+              team_id: fresh.team_id,
+              user_id: fresh.user_id,
+              exp: fresh.exp,
+              state: "ready",
+            }),
+          )
+          .catch(() => false);
+        if (!saved)
+          throw relogin(
+            owner,
+            `the refreshed Slack login couldn't be saved in ${item}. Log in again.`,
+          );
+        set("ready", owner);
+        return fresh.token;
+      }),
+  };
+}
+
+const logins = new WeakMap<Setup, ReturnType<typeof makeLogin>>();
+
+/** The one login of this process for `setup`, shared by the daemon's API and its setup loop. */
+export function cliLogin(setup: Setup) {
+  const found = logins.get(setup) ?? makeLogin(setup);
+  logins.set(setup, found);
+  return found;
+}
+
+/** The owner from `open-dot-slack-user`, by Slack's auth.test, or undefined while there's none. */
+export async function ownerOf(setup: Setup): Promise<Owner | undefined> {
+  const client = slackClient(
+    setup.fetch,
+    { bot: async () => undefined, user: () => setup.read("open-dot-slack-user") },
+    setup.now,
+  );
+  const answer = await client.call("user", "auth.test");
+  const { user_id: id, team_id: team } = answer?.kind === "ok" ? answer.body : {};
+  return typeof id === "string" &&
+    slackIDs.user.test(id) &&
+    typeof team === "string" &&
+    slackIDs.team.test(team)
+    ? { id, team }
+    : undefined;
+}
+
+/**
+ * The daemon's install of a dot's app with apps.developerInstall, kept in `attempt_id` so no
+ * migration is needed: `install:<phase>:<code>:<uuid>`. "queued" waits for the daemon, "sending"
+ * is saved just before the call, "saved" means both tokens reached the Keychain, "approval" an
+ * admin must approve it, and "failed" anything else. Only "queued" is ever sent, once.
+ */
+const installPhases = ["queued", "sending", "saved", "approval", "failed"] as const;
+type InstallPhase = (typeof installPhases)[number];
+
+const installMark = (phase: InstallPhase, code = "") =>
+  `install:${phase}:${code}:${crypto.randomUUID()}`;
+
+export function installOf(app: Pick<SlackApp, "attemptID">) {
+  const found = /^install:(queued|sending|saved|approval|failed):([a-z_]*):/.exec(
+    app.attemptID ?? "",
+  );
+  const phase = installPhases.find((one) => one === found?.[1]);
+  return phase ? { phase, code: found?.[2] || null } : null;
+}
+
+const appRow = (db: Db, dot: string) =>
+  db.select().from(slackApps).where(eq(slackApps.dot, dot)).get();
+
+/** The app an app-level token names: `xapp-<n>-<app ID>-…`. */
+const appOfLevel = (token: string) => /^xapp-\d{1,4}-(A[A-Z0-9]{6,31})-/.exec(token)?.[1];
+
+/**
+ * Slack's documented prefilled link: a new app from the dot's manifest, which the owner creates,
+ * installs and takes tokens from in Slack. Every time it's used, it makes another app.
+ */
+export const manifestLink = (dot: string, purpose: string | null) =>
+  `https://api.slack.com/apps?new_app=1&manifest_json=${encodeURIComponent(JSON.stringify(manifest(dot, purpose)))}`;
+
+const approvals = new Map([
+  [
+    "app_approval_request_eligible",
+    "Waiting for admin approval: your workspace needs an admin to approve this app, and open-dot hasn't asked for it. Request approval on the app's install page, then Retry install once an admin approves.",
+  ],
+  [
+    "app_approval_request_pending",
+    "Waiting for admin approval: a request to approve this app is waiting for your workspace's admins. Retry install once one approves.",
+  ],
+  [
+    "app_approval_request_denied",
+    "An admin denied this app. Ask your admins, then Retry install, or use a workspace that allows it.",
+  ],
+]);
+
+const manualInstall = (appID: string) =>
+  `Retry install, or install the same app yourself at ${appURL(appID)}/install-on-team and save its bot token and an app-level token. The prefilled link makes a second app instead, and this one stays in Slack until you delete it.`;
+
+/** What an apps.developerInstall answer means: the bot and app-level tokens, or how it failed. */
+function installed(
+  answer: Answer,
+  appID: string,
+): { bot: string; level: string } | { phase: InstallPhase; code: string; problem: string } {
+  if (answer.kind === "refused") {
+    const approval = approvals.get(answer.error);
+    if (approval) return { phase: "approval", code: answer.error, problem: approval };
+    if (!maybeDone.has(answer.error))
+      return {
+        phase: "failed",
+        code: answer.error,
+        problem: `Slack refused to install the app (${answer.error}). ${manualInstall(appID)}`,
+      };
+  }
+  if (answer.kind !== "ok")
+    return {
+      phase: "failed",
+      code: unknownOutcome,
+      problem: `installing the app got no clear answer, so Slack may have issued tokens open-dot didn't keep. ${manualInstall(appID)}`,
+    };
+  const issued = isRecord(answer.body.api_access_tokens) ? answer.body.api_access_tokens : {};
+  const { bot, app_level: level } = issued;
+  if (
+    answer.body.app_id === appID &&
+    typeof bot === "string" &&
+    typeof level === "string" &&
+    looksLike(bot, "xoxb-") &&
+    looksLike(level, "xapp-") &&
+    appOfLevel(level) === appID
+  )
+    return { bot, level };
+  return {
+    phase: "failed",
+    code: "bad_answer",
+    problem: `Slack's install answer had no usable tokens for this app, so none was saved. ${manualInstall(appID)}`,
+  };
+}
+
+/**
+ * Installs a created app with the owner's Slack login, the way `slack run` does: apps.developerInstall
+ * with the app ID and bot scopes, and no team ID for a workspace. "sending" is saved first, and the
+ * call is made once; a refusal or lost answer waits for the owner's Retry install. Its bot and
+ * app-level tokens go only to their Keychain items, and only while the app is still this attempt's;
+ * a user token is ignored. The tokens' own checks, `auth.test`, `bots.info` and Socket Mode's
+ * `hello`, still decide when the app is active.
+ */
+async function installApp(db: Db, setup: Setup, app: SlackApp) {
+  if (!app.appID || !app.ownerID || !app.teamID) return;
+  const appID = app.appID;
+  const token = await cliLogin(setup).token({ id: app.ownerID, team: app.teamID });
+  if (!token) {
+    const problem = `log in to Slack in the notch's Slack view to install it, or ${manualInstall(appID).replace(/^Retry install, or /, "")}`;
+    if (app.problem !== problem) setSeen(db, app, ["created"], { problem });
+    return;
+  }
+  const attemptID = installMark("sending");
+  if (!setSeen(db, app, ["created"], { attemptID, problem: null })) return;
+  const claimed: SlackApp = { ...app, attemptID };
+  const settle = (phase: InstallPhase, code: string, problem: string | null) => {
+    setSeen(db, claimed, ["created"], { attemptID: installMark(phase, code), problem });
+  };
+  const answer = await cliCall(setup, "apps.developerInstall", token, {
+    app_id: appID,
+    bot_scopes: botScopes,
+  });
+  const outcome = installed(answer, appID);
+  if ("phase" in outcome) {
+    settle(outcome.phase, outcome.code, outcome.problem);
+    return;
+  }
+  const { bot, level } = outcome;
+  await serial(setup, async () => {
+    const now = appRow(db, app.dot);
+    if (now?.state !== "created" || now.appID !== appID || now.attemptID !== attemptID) return;
+    const saved =
+      (await setup.save(botItem(app.dot), bot).catch(() => false)) &&
+      (await setup.save(appItem(app.dot), level).catch(() => false));
+    if (saved) {
+      settle("saved", "", null);
+      console.log(`Slack: installed the app ${appID} for ${app.dot}`);
+    } else
+      settle(
+        "failed",
+        "save_failed",
+        `couldn't confirm the tokens Slack issued were saved in ${botItem(app.dot)} and ${appItem(app.dot)}. ${manualInstall(appID)}`,
+      );
+  });
+}
+
+/**
+ * The owner's Retry install: the daemon installs the same created app again with the Slack
+ * login, once. Gives why not.
+ */
+export function retryInstall(db: Db, dot: string) {
+  const app = appRow(db, dot);
+  if (app?.state !== "created" || !app.appID || !app.ownerID || !app.teamID)
+    return `${dot} has no created app waiting to be installed.`;
+  if (installOf(app)?.phase === "sending") return "The daemon is installing the app now.";
+  return setSeen(db, app, ["created"], { attemptID: installMark("queued"), problem: null })
+    ? undefined
+    : "The app changed meanwhile. Try again.";
+}
+
+/**
+ * Binds the dot to the app whose bot token and app-level token the owner gives, such as one made
+ * from the prefilled link, with no Slack login or configuration token. Slack, not the owner's word,
+ * says whose it is: the bot token's auth.test must show a bot in the owner's workspace, and its
+ * bots.info the app the app-level token names. A different app than the dot's created or active
+ * one replaces it only with `replacing`, the ID of that very app the owner confirmed replacing, so
+ * a confirmation of an app since replaced never carries over; replacing forgets the old bot and
+ * icon, and both Keychain items are written for the new app. Gives why not, never a token.
+ */
+export async function linkApp(
+  db: Db,
+  setup: Setup,
+  dot: string,
+  bot: string,
+  level: string,
+  replacing: string | undefined,
+): Promise<Refusal | undefined> {
+  const appID = appOfLevel(level);
+  if (!looksLike(bot, "xoxb-") || !looksLike(level, "xapp-") || !appID)
+    return {
+      status: 400,
+      problem:
+        "Send the app's bot token (xoxb-…) and its app-level token (xapp-…). Nothing was saved.",
+    };
+  const before = appRow(db, dot);
+  const busy =
+    before &&
+    (["creating", "attaching"].includes(before.state) || installOf(before)?.phase === "sending");
+  if (busy)
+    return { status: 409, problem: "The daemon is setting up this dot's app now. Try again soon." };
+  const other = db
+    .select({ dot: slackApps.dot })
+    .from(slackApps)
+    .where(eq(slackApps.appID, appID))
+    .all()
+    .find((row) => row.dot !== dot);
+  if (other)
+    return { status: 409, problem: `The app ${appID} is ${other.dot}'s. Nothing was saved.` };
+  const boundApp =
+    before?.appID && ["created", "active"].includes(before.state) ? before.appID : undefined;
+  const same = boundApp === appID;
+  // Checked before any call or write: the confirmation must name the app bound now.
+  if (replacing !== undefined && replacing !== boundApp)
+    return {
+      status: 409,
+      problem: `You confirmed replacing ${shownID(replacing, slackIDs.app)}, but ${dot}'s app is ${boundApp ?? "none"} now. Check it and confirm again. Nothing was saved.`,
+    };
+  if (boundApp && !same && replacing !== boundApp)
+    return {
+      status: 409,
+      problem: `${dot} already has the app ${boundApp}. Replacing it with ${appID} needs your confirmation. Nothing was saved.`,
+    };
+  const owner = await ownerOf(setup);
+  if (!owner)
+    return {
+      status: 409,
+      problem:
+        "open-dot needs your own Slack user token (open-dot-slack-user) to check whose app this is. Nothing was saved.",
+    };
+  const client = slackClient(
+    setup.fetch,
+    { bot: async () => bot, user: async () => undefined },
+    setup.now,
+    { item: botItem(dot) },
+  );
+  const unchecked = {
+    status: 502,
+    problem: "Slack didn't confirm whose bot token that is. Nothing was saved.",
+  };
+  const botUser = await client.bot().catch(() => undefined);
+  const botID = client.botID();
+  if (!botUser || !botID) return unchecked;
+  if (client.botTeam() !== owner.team || (same && before?.teamID !== owner.team))
+    return {
+      status: 409,
+      problem: "That bot is in another workspace than yours. Nothing was saved.",
+    };
+  const info = await client.call("bot", "bots.info", { bot: botID });
+  if (info?.kind !== "ok") return unchecked;
+  const found = isRecord(info.body.bot) ? info.body.bot : {};
+  if (found.app_id !== appID || found.user_id !== botUser)
+    return {
+      status: 409,
+      problem: "That bot token and app-level token belong to different apps. Nothing was saved.",
+    };
+  return serial(setup, async (): Promise<Refusal | undefined> => {
+    const now = appRow(db, dot);
+    const unchanged =
+      now?.state === before?.state &&
+      now?.appID === before?.appID &&
+      now?.attemptID === before?.attemptID;
+    if (!unchanged)
+      return { status: 409, problem: "The dot's app changed meanwhile. Nothing was saved." };
+    // Again with no await before the binding: no schema rule keeps an app to one dot.
+    const taken = db
+      .select({ dot: slackApps.dot })
+      .from(slackApps)
+      .where(eq(slackApps.appID, appID))
+      .all()
+      .find((row) => row.dot !== dot);
+    if (taken)
+      return { status: 409, problem: `The app ${appID} is ${taken.dot}'s. Nothing was saved.` };
+    if (!same) {
+      const bound = {
+        state: "created" as const,
+        appID,
+        teamID: owner.team,
+        ownerID: owner.id,
+        botID: null,
+        botUser: null,
+        attemptID: crypto.randomUUID(),
+        problem: null,
+        // The prefilled link carries this version's manifest.
+        manifestVersion,
+        updateState: null,
+        updateAt: null,
+        updateNote: null,
+        ...noIcon,
+      };
+      const moved = before
+        ? setSeen(db, before, [before.state], bound)
+        : db
+            .insert(slackApps)
+            .values({ dot, ...bound, createdAt: Date.now(), updatedAt: Date.now() })
+            .onConflictDoNothing()
+            .returning({ dot: slackApps.dot })
+            .get() !== undefined;
+      if (!moved)
+        return { status: 409, problem: "The dot's app changed meanwhile. Nothing was saved." };
+    }
+    const saved =
+      (await setup.save(botItem(dot), bot).catch(() => false)) &&
+      (await setup.save(appItem(dot), level).catch(() => false));
+    if (saved) return undefined;
+    const problem = `Couldn't confirm the tokens were saved in ${botItem(dot)} and ${appItem(dot)}. They may or may not be there: save them again.`;
+    const current = appRow(db, dot);
+    if (current) setSeen(db, current, ["created", "active"], { problem });
+    return { status: 500, problem };
+  });
+}
+
 const setApp = (db: Db, dot: string, from: SlackApp["state"][], set: Partial<SlackApp>) =>
   db
     .update(slackApps)
@@ -524,30 +1199,66 @@ const setSeen = (db: Db, seen: SlackApp, from: SlackApp["state"][], set: Partial
     .returning({ dot: slackApps.dot })
     .get() !== undefined;
 
+/**
+ * The token that creates and checks apps: the owner's Slack login when there is one, else the
+ * configuration pair, rotated as before. A login that needs logging in again blocks; it never
+ * falls back, so a lost refresh is never hidden.
+ */
+async function toolFor(db: Db, setup: Setup, owner: Owner) {
+  const cli = await cliLogin(setup).token(owner);
+  if (cli) return { kind: "cli" as const, token: cli, team: owner.team, user: owner.id };
+  try {
+    return { kind: "config" as const, ...(await freshConfig(db, setup, owner)) };
+  } catch (error) {
+    throw error instanceof Blocked && error.message === noPair ? new Blocked(loginFirst) : error;
+  }
+}
+
+type Tool = Awaited<ReturnType<typeof toolFor>>;
+
+/** apps.manifest.create or export, as JSON with a CLI token or as a form with a configuration one. */
+const toolCall = (setup: Setup, tool: Tool, method: string, params: Record<string, unknown>) =>
+  tool.kind === "cli"
+    ? cliCall(setup, method, tool.token, params)
+    : configCall(setup, method, {
+        token: tool.token,
+        ...Object.fromEntries(
+          Object.entries(params).map(([key, value]) => [
+            key,
+            typeof value === "string" ? value : JSON.stringify(value),
+          ]),
+        ),
+      });
+
 /** Creates one requested app. The attempt is saved before the call, which is never repeated blindly. */
-async function create(db: Db, setup: Setup, app: SlackApp, owner: { id: string; team: string }) {
+async function create(db: Db, setup: Setup, app: SlackApp, owner: Owner) {
   const dot = findDot(db, app.dot);
   if (!dot) return;
-  const config = await freshConfig(db, setup, owner);
+  const tool = await toolFor(db, setup, owner);
   const attemptID = crypto.randomUUID();
   if (!setSeen(db, app, ["requested"], { state: "creating", attemptID, problem: null })) return;
   const claimed: SlackApp = { ...app, state: "creating", attemptID };
-  const answer = await configCall(setup, "apps.manifest.create", {
-    token: config.token,
-    manifest: JSON.stringify(manifest(dot.name, dot.purpose)),
+  // The dot's own name, with no "(local)" suffix: that's the Slack CLI's, added on its side.
+  const answer = await toolCall(setup, tool, "apps.manifest.create", {
+    manifest: manifest(dot.name, dot.purpose),
   });
   // Only the public app ID is kept. The client secret and signing secrets aren't needed.
   // An app ID not of Slack's form is never saved: the app may exist, so it's left for the owner.
   const appID = answer.kind === "ok" ? answer.body.app_id : undefined;
   if (typeof appID === "string" && slackIDs.app.test(appID)) {
-    setSeen(db, claimed, ["creating"], {
+    // With a Slack login the daemon installs it next; with a configuration token, the owner does.
+    const install = tool.kind === "cli" ? installMark("queued") : undefined;
+    const saved = setSeen(db, claimed, ["creating"], {
       state: "created",
       appID,
-      teamID: config.team,
-      ownerID: config.user,
+      teamID: tool.team,
+      ownerID: tool.user,
       manifestVersion,
+      ...(install ? { attemptID: install } : {}),
     });
     console.log(`Slack: created the app ${appID} for ${app.dot}`);
+    const now = install && saved ? appRow(db, app.dot) : undefined;
+    if (now && now.attemptID === install) await installApp(db, setup, now);
     return;
   }
   if (answer.kind === "refused" && answer.error === "ratelimited") {
@@ -577,13 +1288,10 @@ const Exported = Schema.Struct({
 });
 
 /** Checks the app the owner named against Slack's configuration API before adopting it. */
-async function attach(db: Db, setup: Setup, app: SlackApp, owner: { id: string; team: string }) {
+async function attach(db: Db, setup: Setup, app: SlackApp, owner: Owner) {
   if (!app.appID) return;
-  const config = await freshConfig(db, setup, owner);
-  const answer = await configCall(setup, "apps.manifest.export", {
-    token: config.token,
-    app_id: app.appID,
-  });
+  const tool = await toolFor(db, setup, owner);
+  const answer = await toolCall(setup, tool, "apps.manifest.export", { app_id: app.appID });
   // Export only reads, so anything but a clear answer is asked again later.
   if (
     answer.kind === "lost" ||
@@ -598,11 +1306,13 @@ async function attach(db: Db, setup: Setup, app: SlackApp, owner: { id: string; 
     exported.value.manifest.features.bot_user.display_name === app.dot &&
     exported.value.manifest.settings.socket_mode_enabled === true;
   if (fits) {
+    // With a Slack login, the same app is installed next, never a new one created.
     setSeen(db, app, ["attaching"], {
       state: "created",
-      teamID: config.team,
-      ownerID: config.user,
+      teamID: tool.team,
+      ownerID: tool.user,
       problem: null,
+      ...(tool.kind === "cli" ? { attemptID: installMark("queued") } : {}),
     });
     return;
   }
@@ -611,7 +1321,7 @@ async function attach(db: Db, setup: Setup, app: SlackApp, owner: { id: string; 
     appID: null,
     problem:
       answer.kind === "refused"
-        ? `Slack wouldn't show the app ${app.appID} to your configuration token: ${answer.error}`
+        ? `Slack wouldn't show the app ${app.appID} to your ${tool.kind === "cli" ? "Slack login" : "configuration token"}: ${answer.error}`
         : `the app ${app.appID} isn't ${app.dot}'s: its bot isn't named ${app.dot} or it doesn't use Socket Mode`,
   });
 }
@@ -755,19 +1465,45 @@ export async function provision(db: Db, shared: Slack, setup: Setup = realSetup)
     })
     .where(and(eq(slackApps.state, "creating"), lt(slackApps.updatedAt, setup.now() - 60_000)))
     .run();
-  const pending = db
+  // An install a stopped daemon left may have had tokens issued that nobody saved: never resent.
+  for (const app of db
     .select()
     .from(slackApps)
-    .where(inArray(slackApps.state, ["requested", "attaching"]))
-    .all();
-  const id = pending.length > 0 ? await shared.owner() : undefined;
+    .where(
+      and(
+        eq(slackApps.state, "created"),
+        like(slackApps.attemptID, "install:sending:%"),
+        lt(slackApps.updatedAt, setup.now() - 60_000),
+      ),
+    )
+    .all())
+    if (app.appID)
+      setSeen(db, app, ["created"], {
+        attemptID: installMark("failed", unknownOutcome),
+        problem: `the daemon stopped while installing the app, so Slack may have issued tokens open-dot didn't keep. ${manualInstall(app.appID)}`,
+      });
+  const rows = db.select().from(slackApps).all();
+  const pending = rows.filter(
+    (app) =>
+      app.state === "requested" ||
+      app.state === "attaching" ||
+      (app.state === "created" && installOf(app)?.phase === "queued"),
+  );
+  const login = cliLogin(setup);
+  // Once a daemon start, while some app isn't connected, the login's state is read for the notch.
+  const unsure =
+    login.view().state === "unknown" &&
+    rows.some((app) => ["unknown", "failed", "created"].includes(app.state));
+  const id = pending.length > 0 || unsure ? await shared.owner() : undefined;
   const team = id ? shared.team() : undefined;
   if (id && team) {
+    if (unsure && pending.length === 0) await login.check({ id, team }).catch(() => {});
     // Rotations are serialized: one app at a time, in one loop.
     for (const app of pending) {
       try {
         if (app.state === "requested") await create(db, setup, app, { id, team });
-        else await attach(db, setup, app, { id, team });
+        else if (app.state === "attaching") await attach(db, setup, app, { id, team });
+        else await installApp(db, setup, app);
       } catch (error) {
         // Only open-dot's own words are saved, where the notch shows them; anything else is
         // logged in fixed words and left to the daemon's log line from the setup loop.
@@ -1030,15 +1766,34 @@ export async function saveAppToken(
   const app = db.select().from(slackApps).where(eq(slackApps.dot, dot)).get();
   if (!app?.appID || !["created", "active"].includes(app.state))
     return `${dot} has no created Slack app to save a token for.`;
+  if (installOf(app)?.phase === "sending") return installing;
   const [prefix, item] = kind === "bot" ? ["xoxb-", botItem(dot)] : ["xapp-", appItem(dot)];
   if (!looksLike(token, prefix))
     return `That doesn't look like ${kind === "bot" ? "a bot token (xoxb-…)" : "an app-level token (xapp-…)"}. Nothing was saved.`;
-  // False may mean it was written but couldn't be read back, so nothing is claimed either way.
-  const saved = await setup.save(item, token).catch(() => false);
+  // Written only while the app is still the one read above, so a token meant for an app that
+  // was replaced while this waited its turn never overwrites the new app's.
+  const saved = await serial(setup, async () => {
+    const now = appRow(db, dot);
+    if (
+      now?.appID !== app.appID ||
+      now.attemptID !== app.attemptID ||
+      !["created", "active"].includes(now.state)
+    )
+      return changedMeanwhile;
+    if (installOf(now)?.phase === "sending") return installing;
+    // False may mean it was written but couldn't be read back, so nothing is claimed either way.
+    return setup.save(item, token).catch(() => false);
+  });
+  if (typeof saved === "string") return saved;
   return saved
     ? undefined
     : `Couldn't confirm the token was saved in the Keychain item ${item}. It may or may not be there: check the item, or save the token again.`;
 }
+
+const changedMeanwhile =
+  "The dot's app changed meanwhile, so nothing was saved. Check it and try again.";
+const installing =
+  "The daemon is installing the app now, so nothing was saved. Try again once it's done.";
 
 /** Asks the daemon to create the dot's app. Safe to repeat; an app's progress is never reset. */
 export function requestApp(db: Db, dot: string, retry = false) {
@@ -1194,7 +1949,7 @@ export function describe(db: Db, app: SlackApp) {
   switch (app.state) {
     case "requested":
       lines.push(
-        "  The daemon creates the app with your app configuration token. Generate a token pair at https://api.slack.com/apps (Your App Configuration Tokens), then save it with: open-dot slack config",
+        "  The daemon creates the app with your Slack login from the notch's Slack view, and installs it. Without one it uses a configuration token pair saved with open-dot slack config; without either, create the app from the prefilled link in the notch's Slack view.",
       );
       break;
     case "creating":
@@ -1212,8 +1967,20 @@ export function describe(db: Db, app: SlackApp) {
     case "failed":
       lines.push(`  Try again with: open-dot slack connect ${app.dot}`);
       break;
-    case "created":
+    case "created": {
       if (!app.appID) break;
+      const install = installOf(app);
+      if (install?.phase === "queued" || install?.phase === "sending") {
+        lines.push("  The daemon is installing it with your Slack login.");
+        break;
+      }
+      if (install?.phase === "saved") {
+        lines.push(
+          "  Installed with your Slack login, and its tokens are in the Keychain. The daemon checks them and connects within a minute.",
+        );
+        break;
+      }
+      if (install) lines.push("  Retry install in the notch's Slack view, or:");
       lines.push(
         `  1. Install it: open ${appURL(app.appID)}/install-on-team, click Install, then Allow.`,
         `  2. Under App-Level Tokens at ${appURL(app.appID)}/general, generate a token with the connections:write scope.`,
@@ -1223,6 +1990,7 @@ export function describe(db: Db, app: SlackApp) {
         "  The daemon reads them within a minute, checks they belong to this app, and connects.",
       );
       break;
+    }
     case "active":
       lines.push(
         `  Connected as <@${app.botUser ?? "?"}>. Invite it to a channel with /invite @${app.dot}, then mention it there, or DM it.`,

@@ -383,6 +383,60 @@ final class SlackPickupTests: XCTestCase {
     XCTAssertEqual(opened.count, 2)
   }
 
+  @MainActor func testALinksBotTokenWaitsForItsAppLevelTokenAndAnotherAppReplacesOnlyOnConfirmation() async throws {
+    let (store, clipboard, sent) = try armedStore()
+    store.endPickup(nil)
+    let other = ["xapp", "1", "AOTHER01", "3333333333333", String(repeating: "b", count: 64)].joined(separator: "-")
+    var asked: [String] = []
+    store.confirmSlackReplace = { name, appID in
+      asked.append(appID)
+      if let during = sent.duringConfirm { store.slackStates[name] = during }
+      return sent.confirm
+    }
+    let pickBoth = {
+      store.armPickup("jojo", .linkBot)
+      clipboard.copy(self.bot)
+      store.checkPickup()
+      XCTAssertEqual(store.heldAccess?.step, .linkBot)
+      store.armPickup("jojo", .linkApp)
+      clipboard.copy(other)
+      store.checkPickup()
+    }
+    store.armPickup("jojo", .linkApp)
+    XCTAssertNil(store.slackPickup, "The app-level step waits for the bot token")
+    XCTAssertEqual(store.slackNotices["jojo"], "Pick up the bot token first.")
+    // An access token held for the configuration pair isn't a link's bot token.
+    store.armPickup("jojo", .access)
+    clipboard.copy(access)
+    store.checkPickup()
+    store.armPickup("jojo", .linkApp)
+    XCTAssertNil(store.slackPickup)
+
+    // jojo has AJOJO01, so another app is sent only once the owner confirms.
+    pickBoth()
+    XCTAssertEqual(asked, ["AJOJO01"])
+    XCTAssertNil(store.heldAccess)
+    XCTAssertEqual(sent.actions, [], "Declined: nothing was sent")
+    // The request names the app the owner confirmed, even if a refresh bound another while the
+    // confirmation was open; the daemon then refuses it.
+    sent.confirm = true
+    sent.duringConfirm = created("AMIDDLE01")
+    pickBoth()
+    await eventually { !store.slackBusy.contains("jojo") }
+    XCTAssertEqual(asked, ["AJOJO01", "AJOJO01"])
+    XCTAssertEqual(sent.actions, [.link(bot: bot, app: other, replacing: "AJOJO01")])
+    sent.duringConfirm = nil
+
+    // Without an app, nothing is asked.
+    sent.view = SlackSetup(config: .init(state: "idle"))
+    store.slackStates["jojo"] = sent.view
+    pickBoth()
+    await eventually { !store.slackBusy.contains("jojo") }
+    XCTAssertEqual(asked.count, 2)
+    XCTAssertEqual(sent.actions.last, .link(bot: bot, app: other, replacing: nil))
+    for notice in store.slackNotices.values { XCTAssertFalse(notice.contains("xox") || notice.contains("xapp")) }
+  }
+
   @MainActor func testTheDMCheckSaysPendingUntilAConfirmedReplyAndTheFeedStaysApart() async throws {
     let old = try API.decode(SlackSetup.self, Data(#"{"config":{"state":"idle"},"app":null}"#.utf8), log: { _ in })
     XCTAssertNil(old.dmCheck)
@@ -415,6 +469,105 @@ final class SlackPickupTests: XCTestCase {
     XCTAssertEqual(store.slackStates["jojo"]?.dmCheck?.state, "pending")
   }
 
+  // Issue 50: the Slack login, Retry install and the prefilled link's fallback.
+
+  func testDecodesTheLoginTheInstallAndThePrefilledLink() throws {
+    let json = #"""
+      {"config":{"state":"idle","problem":null,"saved":false},"ownerFeed":{"items":0,"latestAt":null},"dmCheck":null,
+       "login":{"state":"ready","team":"T1","user":"UOWNER","problem":null,"pending":null},
+       "manifestLink":"https://api.slack.com/apps?new_app=1&manifest_json=%7B%7D",
+       "app":{"state":"created","appID":"AJOJO01","botUser":null,"problem":"Waiting for admin approval","install":{"phase":"approval","code":"app_approval_request_eligible"},"manifestOutdated":false}}
+      """#
+    let setup = try API.decode(SlackSetup.self, Data(json.utf8), log: { _ in })
+    XCTAssertEqual(setup.login, SlackSetup.Login(state: "ready", team: "T1", user: "UOWNER"))
+    XCTAssertEqual(setup.app?.install, SlackSetup.Install(phase: "approval", code: "app_approval_request_eligible"))
+    XCTAssertFalse(slackNeedsLogin(setup))
+    XCTAssertTrue(slackCanRetryInstall(setup))
+    let waiting = try XCTUnwrap(slackInstallLine(setup.app?.install))
+    XCTAssertTrue(waiting.contains("Waiting for admin approval"))
+    XCTAssertTrue(waiting.contains("hasn't asked"), "It never says approval was requested")
+    XCTAssertTrue(slackSummary(setup, dot: "jojo").hasPrefix("Created. Waiting for admin approval"))
+    XCTAssertEqual(slackManifestURL(setup)?.host, "api.slack.com")
+
+    // Nothing to retry while one is in flight, without a login, or once connected.
+    var busy = setup
+    busy.app?.install = .init(phase: "sending")
+    XCTAssertFalse(slackCanRetryInstall(busy))
+    var out = setup
+    out.login = .init(state: "relogin", problem: "refreshing the Slack login was interrupted")
+    XCTAssertTrue(slackNeedsLogin(out))
+    XCTAssertFalse(slackCanRetryInstall(out))
+    XCTAssertTrue(slackLoginLine(try XCTUnwrap(out.login)).contains("interrupted"))
+    XCTAssertTrue(slackInstallLine(.init(phase: "saved"))?.contains("Saved isn't connected") == true)
+    XCTAssertNil(slackInstallLine(nil))
+
+    // An older daemon has no login, so the view offers none and keeps the configuration tokens.
+    let old = try API.decode(SlackSetup.self, Data(#"{"config":{"state":"idle"},"app":null}"#.utf8), log: { _ in })
+    XCTAssertNil(old.login)
+    XCTAssertFalse(slackNeedsLogin(old))
+    XCTAssertNil(slackManifestURL(old))
+    // Only Slack's own app pages open.
+    var evil = setup
+    evil.manifestLink = "https://evil.com/apps?new_app=1"
+    XCTAssertNil(slackManifestURL(evil))
+  }
+
+  func testTheLinksTokensNameTheirAppAndTheLinkWarnsOfADuplicate() {
+    let bot = ["xoxb", "1111111111", "2222222222222", String(repeating: "a", count: 24)].joined(separator: "-")
+    let other = ["xapp", "1", "AOTHER01", "3333333333333", String(repeating: "b", count: 64)].joined(separator: "-")
+    XCTAssertTrue(slackTokenMatches(.linkBot, bot, appID: nil))
+    XCTAssertTrue(slackTokenMatches(.linkApp, other, appID: nil), "Any app's, since the link made a new one")
+    XCTAssertFalse(slackTokenMatches(.linkApp, bot, appID: nil))
+    XCTAssertFalse(slackTokenMatches(.linkApp, "\(other)\n", appID: nil))
+    XCTAssertEqual(slackLinkAppID(other), "AOTHER01")
+    XCTAssertNil(slackLinkAppID("xapp-1-nope"))
+    let duplicate = slackLinkWarning(.init(state: "created", appID: "AJOJO01", manifestOutdated: false), dot: "jojo")
+    XCTAssertTrue(duplicate.contains("duplicate"))
+    XCTAssertTrue(duplicate.contains("AJOJO01 stays in Slack"))
+    XCTAssertTrue(slackLinkWarning(.init(state: "unknown", manifestOutdated: false), dot: "jojo").contains("may already exist"))
+  }
+
+  @MainActor func testALoginsCommandIsHeldInMemoryAndItsCodeIsSentOnce() async throws {
+    let store = try isolatedStore()
+    let ticket = SlackLoginTicket(attempt: "a1", command: "/slackauthticket TICKET", expiresAt: 9e15)
+    var sent: [SlackAction] = []
+    let daemon = Sent()
+    store.slackRead = { _ in SlackSetup(config: .init(state: "idle"), login: .init(state: "none")) }
+    store.slackSend = { _, action in
+      sent.append(action)
+      if let failure = daemon.failure { throw failure }
+      if case .loginStart = action { return .ticket(ticket) }
+      return .said("Logged in to Slack.")
+    }
+    store.startLogin("jojo")
+    await eventually { !store.slackBusy.contains("jojo") && store.slackTicket != nil }
+    XCTAssertEqual(store.slackTicket, ticket)
+    var copied: [String] = []
+    store.copyText = { copied.append($0) }
+    store.copyText(ticket.command)
+    XCTAssertEqual(copied, ["/slackauthticket TICKET"])
+
+    // A lost answer still uses the login up: it's never sent again.
+    daemon.failure = APIError.lost
+    store.finishLogin("jojo", challenge: "CODE1")
+    XCTAssertNil(store.slackTicket)
+    await eventually { !store.slackBusy.contains("jojo") }
+    store.finishLogin("jojo", challenge: "CODE1")
+    XCTAssertEqual(sent, [.loginStart, .loginFinish(attempt: "a1", challenge: "CODE1")])
+
+    daemon.failure = nil
+    store.startLogin("jojo")
+    await eventually { !store.slackBusy.contains("jojo") && store.slackTicket != nil }
+    store.finishLogin("jojo", challenge: "CODE2")
+    await eventually { !store.slackBusy.contains("jojo") && store.slackNotices["jojo"]?.hasPrefix("Logged in") == true }
+    XCTAssertEqual(sent.last, .loginFinish(attempt: "a1", challenge: "CODE2"))
+    XCTAssertFalse(store.slackNotices.values.contains { $0.contains("CODE") || $0.contains("TICKET") })
+
+    store.runSlack("jojo", .install)
+    await eventually { !store.slackBusy.contains("jojo") }
+    XCTAssertEqual(sent.last, .install)
+  }
+
   /// A store showing jojo's Slack view of a created app, with a fake clipboard and a fake daemon
   /// that records each action. A bot pickup is armed.
   @MainActor private func armedStore() throws -> (Store, FakeClipboard, Sent) {
@@ -441,6 +594,9 @@ final class SlackPickupTests: XCTestCase {
 @MainActor private final class Sent {
   var actions: [SlackAction] = []
   var failure: Error?
+  /// The owner's answer to a replacement, and a view a refresh shows while it's being asked.
+  var confirm = false
+  var duringConfirm: SlackSetup?
   var view = created("AJOJO01")
   var now: TimeInterval = 1_000
 }

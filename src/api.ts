@@ -69,13 +69,19 @@ import { isRecord, slackIDs } from "./slack";
 import {
   attachApp,
   Blocked,
+  cliLogin,
   type DMCheck,
   dmCheckStatus,
   iconStatus,
+  installOf,
+  linkApp,
+  manifestLink,
   manifestVersion,
+  ownerOf,
   realSetup,
   requestApp,
   retryIcon,
+  retryInstall,
   saveAppToken,
   saveConfigPair,
   type Setup,
@@ -472,8 +478,8 @@ const slackBody = async (
  * `ownerFeed` is what the owner's own Slack feed saved, apart from the dot's bot, and `dmCheck`
  * an owner-started DM check. Both only read open-dot's database: no Keychain, no Slack.
  */
-const slackView = (db: Db, dot: string, checks: ReadonlyMap<string, DMCheck>) => {
-  const app = db.select().from(slackApps).where(eq(slackApps.dot, dot)).get();
+const slackView = (db: Db, dot: Dot, checks: ReadonlyMap<string, DMCheck>, setup: Setup) => {
+  const app = db.select().from(slackApps).where(eq(slackApps.dot, dot.name)).get();
   const config = db.select().from(slackConfig).where(eq(slackConfig.id, 1)).get();
   const ready = app?.appID && (app.state === "created" || app.state === "active");
   const ownerFeed = db
@@ -491,7 +497,11 @@ const slackView = (db: Db, dot: string, checks: ReadonlyMap<string, DMCheck>) =>
       saved: (config?.fromIat ?? -1) >= 0,
     },
     ownerFeed: { items: ownerFeed?.items ?? 0, latestAt: ownerFeed?.latestAt ?? null },
-    dmCheck: dmCheckStatus(db, dot, checks.get(dot)),
+    dmCheck: dmCheckStatus(db, dot.name, checks.get(dot.name)),
+    // The Slack login as the daemon last saw it, from its memory: never a token or a ticket.
+    login: cliLogin(setup).view(),
+    // Slack's prefilled link for a new app from the dot's manifest, the fallback to the login.
+    manifestLink: manifestLink(dot.name, dot.purpose),
     app: app
       ? {
           state: app.state,
@@ -499,6 +509,7 @@ const slackView = (db: Db, dot: string, checks: ReadonlyMap<string, DMCheck>) =>
           appID: app.appID && slackIDs.app.test(app.appID) ? app.appID : null,
           botUser: app.botUser && slackIDs.user.test(app.botUser) ? app.botUser : null,
           problem: app.problem,
+          install: installOf(app),
           manifestOutdated: Boolean(
             ready && (app.manifestVersion ?? 1) < manifestVersion && app.updateState === null,
           ),
@@ -522,6 +533,7 @@ const slackView = (db: Db, dot: string, checks: ReadonlyMap<string, DMCheck>) =>
  * Keychain prompt. The answer never repeats a token.
  */
 const slackConfigRoute = async (db: Db, request: Request, path: string[], setup: Setup) => {
+  if (path[0] === "login") return slackLoginRoute(request, path.slice(1), setup);
   if (path.length !== 1 || path[0] !== "config" || request.method !== "POST")
     return error(404, "Not found");
   if (new URL(request.url).search) return error(400, "This route takes no query.");
@@ -544,10 +556,45 @@ const slackConfigRoute = async (db: Db, request: Request, path: string[], setup:
 };
 
 /**
+ * The owner's Slack login, once per workspace, the way `slack login` does it but with no Slack
+ * CLI or `~/.slack`: `POST /slack/login` (`{}`) asks Slack for a ticket and answers the
+ * `/slackauthticket` command to run in Slack, and `POST /slack/login/<attempt>` (`{challenge}`)
+ * exchanges it, once, for a CLI token pair that only the Keychain keeps. `GET /slack/login`
+ * shows the login from the daemon's memory. Both need the owner's `open-dot-slack-user`, whose
+ * user and workspace the login must be. No answer, error or log repeats a token or the challenge.
+ */
+const slackLoginRoute = async (request: Request, path: string[], setup: Setup) => {
+  if (new URL(request.url).search) return error(400, "This route takes no query.");
+  const login = cliLogin(setup);
+  if (path.length === 0 && request.method === "GET") return Response.json({ login: login.view() });
+  if (path.length > 1 || request.method !== "POST") return error(404, "Not found");
+  const body = await slackBody(request, path.length === 0 ? [] : ["challenge"]);
+  if (body instanceof Response) return body;
+  const challenge = typeof body.challenge === "string" ? body.challenge.trim() : "";
+  if (path.length === 1 && !/^[\x21-\x7e]{1,128}$/.test(challenge))
+    return error(400, "Send {challenge}, the code Slack showed you.");
+  const owner = await ownerOf(setup);
+  if (!owner)
+    return error(
+      409,
+      "open-dot needs your own Slack user token (open-dot-slack-user) first: the login must be yours.",
+    );
+  if (path.length === 0) {
+    const started = await login.start();
+    return "problem" in started ? error(started.status, started.problem) : Response.json(started);
+  }
+  const refused = await login.finish(path[0] ?? "", challenge, owner);
+  return refused ? error(refused.status, refused.problem) : Response.json({ login: login.view() });
+};
+
+/**
  * A dot's Slack app from the notch, sharing the CLI's code: `GET /dots/<name>/slack` reads its
  * state, and POST `…/slack/connect` (`{retry?}`), `…/attach` (`{appID}`), `…/tokens`
- * (`{kind: "bot" | "app", token}`), `…/update` (`{approve?}`) and `…/icon` act on it. Creating,
- * attaching and the icon are done by the daemon's setup loop; the manifest update is sent only
+ * (`{kind: "bot" | "app", token}`), `…/install` (`{}`, the owner's Retry install with the Slack
+ * login), `…/link` (`{bot, app, replaceAppID?}`, an app the owner made, checked with Slack,
+ * replacing only the app the owner confirmed),
+ * `…/update` (`{approve?}`) and `…/icon` act on it. Creating, installing, attaching and the icon
+ * are done by the daemon's setup loop; the manifest update is sent only
  * once the owner approved exactly the changes it shows. No answer repeats a token. `…/dm-check`
  * starts, or restarts, a DM check of an active app; it sends nothing and starts no turn.
  */
@@ -572,10 +619,10 @@ const slackRoute = async (
   if (new URL(request.url).search) return error(400, "This route takes no query.");
   if (action === undefined)
     return request.method === "GET"
-      ? Response.json(slackView(db, dot.name, checks))
+      ? Response.json(slackView(db, dot, checks, setup))
       : error(404, "Not found");
   if (request.method !== "POST") return error(404, "Not found");
-  const view = () => Response.json(slackView(db, dot.name, checks));
+  const view = () => Response.json(slackView(db, dot, checks, setup));
   switch (action) {
     case "connect": {
       const body = await slackBody(request, ["retry"]);
@@ -599,7 +646,15 @@ const slackRoute = async (
       if ((kind !== "bot" && kind !== "app") || typeof token !== "string")
         return error(400, 'Send {kind: "bot" or "app", token}.');
       const problem = await saveAppToken(db, setup, dot.name, kind, token.trim());
-      if (problem) return error(problem.startsWith("Couldn't confirm") ? 500 : 400, problem);
+      if (problem)
+        return error(
+          problem.startsWith("Couldn't confirm")
+            ? 500
+            : problem.includes("nothing was saved")
+              ? 409
+              : 400,
+          problem,
+        );
       return view();
     }
     case "update": {
@@ -633,6 +688,29 @@ const slackRoute = async (
           confirm: asked.changes,
         });
       return Response.json({ said });
+    }
+    case "install": {
+      const body = await slackBody(request, []);
+      if (body instanceof Response) return body;
+      const problem = retryInstall(db, dot.name);
+      return problem ? error(409, problem) : view();
+    }
+    case "link": {
+      const body = await slackBody(request, ["bot", "app", "replaceAppID"]);
+      if (body instanceof Response) return body;
+      const { bot, app, replaceAppID } = body;
+      if (
+        typeof bot !== "string" ||
+        typeof app !== "string" ||
+        (replaceAppID !== undefined &&
+          (typeof replaceAppID !== "string" || !slackIDs.app.test(replaceAppID)))
+      )
+        return error(
+          400,
+          "Send {bot, app, replaceAppID?}, with the app ID you confirmed replacing.",
+        );
+      const refused = await linkApp(db, setup, dot.name, bot.trim(), app.trim(), replaceAppID);
+      return refused ? error(refused.status, refused.problem) : view();
     }
     case "icon": {
       const body = await slackBody(request, []);
@@ -2127,10 +2205,12 @@ export const api = (
     // A failure is logged in fixed words only: a Slack body may hold a token.
     if (path[0] === "slack")
       return slackConfigRoute(db, request, path.slice(1), setup).catch(() => {
-        console.error("Slack setup: saving the configuration tokens failed.");
+        console.error("Slack setup: a login or configuration token request failed.");
         return error(
           500,
-          "Couldn't confirm the configuration tokens were saved. Check open-dot slack status, and save them again if needed.",
+          path[1] === "login"
+            ? "Couldn't confirm the Slack login. Check the Slack view, and log in again if needed."
+            : "Couldn't confirm the configuration tokens were saved. Check open-dot slack status, and save them again if needed.",
         );
       });
     if (path[0] === "dots" && path[2] === "slack")
