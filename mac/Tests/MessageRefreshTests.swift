@@ -118,6 +118,50 @@ final class MessageRefreshTests: XCTestCase {
     XCTAssertNil(store.messageErrors[dot])
   }
 
+  @MainActor func testTheFirstKnownBindingClosesNoteSourcesOpenedBeforeIt() async throws {
+    let store = Store()
+    let recorded = NoteSource(sessionID: "ses_old", messageID: "msg_saved", edited: false)
+    let notes = [1, 2].map { MemoryNote(id: $0, version: 1, updatedAt: 0, updatedBy: "dot", text: "Decided", source: recorded) }
+    var memory = MemoryState()
+    XCTAssertTrue(memory.apply(memory.startRead(), Memory(notes: notes, responsibilities: [], reminders: [])))
+    store.memories[dot] = memory
+    let found = { (note: Int) in
+      NoteSourceRead(note: note, state: "found", edited: false, message: .init(id: "msg_saved", sessionID: "ses_old", role: "assistant", text: "Saved it.", truncated: false, tools: [], time: 0))
+    }
+    // Read under the old binding, before any conversation page said which binding is current.
+    let loaded = try XCTUnwrap(store.memories[dot]?.startSource(1, version: 1, recorded))
+    XCTAssertEqual(store.memories[dot]?.finishSource(1, loaded, .success(found(1))), true)
+    let pending = try XCTUnwrap(store.memories[dot]?.startSource(2, version: 1, recorded))
+
+    // A failed first page knows no binding, so nothing changes.
+    store.latestPage = { _ in throw APIError.lost }
+    await store.refreshMessages(dot)
+    XCTAssertNil(store.memories[dot]?.boundSession)
+    XCTAssertEqual(store.memories[dot]?.sources.count, 2)
+
+    // A delayed first page then shows the dot bound to another conversation.
+    let gate = Gate()
+    store.latestPage = { _ in
+      await gate.wait()
+      return page(messages("msg_0"))
+    }
+    let first = Task { await store.refreshMessages(dot) }
+    XCTAssertEqual(store.memories[dot]?.sources.count, 2, "Unchanged while the page is delayed")
+    gate.release()
+    await first.value
+    XCTAssertEqual(store.memories[dot]?.boundSession, "ses_one")
+    XCTAssertEqual(store.memories[dot]?.sources.isEmpty, true, "The loaded and the pending source are closed")
+    XCTAssertEqual(store.memories[dot]?.finishSource(2, pending, .success(found(2))), false, "The old answer can't land")
+
+    // Later pages of the same binding keep a source reopened under it.
+    let reopened = try XCTUnwrap(store.memories[dot]?.startSource(2, version: 1, recorded))
+    store.latestPage = { _ in page(messages("msg_0")) }
+    await store.refreshMessages(dot)
+    XCTAssertNotNil(store.memories[dot]?.sources[2])
+    XCTAssertEqual(store.memories[dot]?.finishSource(2, pending, .success(found(2))), false)
+    XCTAssertEqual(store.memories[dot]?.finishSource(2, reopened, .success(found(2))), true)
+  }
+
   func testLiveRedactedPagesDecode() throws {
     for name in ["issue-44-jotaro-latest", "issue-44-jolyne-latest"] {
       var lines: [String] = []

@@ -24,12 +24,17 @@ import {
   editNote,
   editReminder,
   editResponsibility,
+  noteSource,
   type Outcome,
   parseNote,
   parseNoteEdit,
   parseReminderEdit,
   parseResponsibilityEdit,
+  parseSearch,
   readMemory,
+  searchDefaultLimit,
+  searchNotes,
+  searchResultLimit,
 } from "./memory";
 import { type Attachment, OpenCode, type Entry, OpenCodeError } from "./opencode";
 import {
@@ -49,6 +54,7 @@ import {
   type FeedItem,
   type FeedSnapshot,
   hiddenMessages,
+  notes,
   type QuoteSnapshot,
   outbox,
   requests,
@@ -1019,6 +1025,97 @@ const supervisionRoute = (
   return error(404, "There's no such binding for this dot.");
 };
 
+/** `GET …/memory/search?q=<words>[&limit=<1–50>]`: the dot's notes that contain every word. */
+const search = (db: Db, dot: string, request: Request) => {
+  const query = new URL(request.url).searchParams;
+  const usage = error(400, `Send ?q=<words>, and optionally &limit=<1 to ${searchResultLimit}>.`);
+  if (
+    query.getAll("q").length !== 1 ||
+    query.getAll("limit").length > 1 ||
+    [...query.keys()].some((key) => key !== "q" && key !== "limit")
+  )
+    return usage;
+  const rawLimit = query.get("limit");
+  const limit = rawLimit === null ? searchDefaultLimit : Number(rawLimit);
+  if (rawLimit !== null && (!positive.test(rawLimit) || limit > searchResultLimit)) return usage;
+  const words = parseSearch(query.get("q"));
+  if ("invalid" in words) return error(400, words.invalid);
+  return Response.json({ query: words.join(" "), ...searchNotes(db, dot, words, limit) });
+};
+
+/** How much of a source message's text is shown. */
+const sourceTextLimit = 4000;
+
+/**
+ * `GET …/memory/notes/<id>/source`: the message a note was saved from, read with OpenCode's public
+ * single-message API from the dot's exact ready session, checked before and after the read. A
+ * source in an earlier session of the dot isn't read. Its text is the conversation's data.
+ */
+const noteSourceRead = (db: Db, dot: Dot, rawID: string) =>
+  Effect.gen(function* () {
+    const missing = error(404, "There's no such note for this dot. It may have been deleted.");
+    if (!positive.test(rawID) || !Number.isSafeInteger(Number(rawID))) return missing;
+    const id = Number(rawID);
+    const saved = () =>
+      db
+        .select()
+        .from(notes)
+        .where(and(eq(notes.id, id), eq(notes.dot, dot.name)))
+        .get();
+    const row = saved();
+    if (!row) return missing;
+    const source = noteSource(row);
+    if (!source) return Response.json({ note: id, state: "unknown" });
+    if (dot.sessionState !== "ready")
+      return error(409, `${dot.name}'s conversation isn't ready, so its source can't be read.`);
+    if (source.sessionID !== dot.sessionID)
+      return Response.json({
+        note: id,
+        state: "unavailable",
+        edited: source.edited,
+        reason: `It was saved in an earlier conversation of ${dot.name}, which open-dot no longer reads.`,
+      });
+    const opencode = yield* OpenCode;
+    // Connecting to OpenCode can wait, so the binding is checked again before the read.
+    if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+    const target = yield* opencode
+      .message({ sessionID: dot.sessionID, messageID: source.messageID })
+      .pipe(
+        Effect.mapError(
+          () =>
+            new OpenCodeError({
+              message: "Couldn't read the source from OpenCode, so it's unavailable. Retry.",
+            }),
+        ),
+      );
+    if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+    const now = saved();
+    if (!now) return missing;
+    if (!target)
+      return Response.json({
+        note: id,
+        state: "gone",
+        edited: noteSource(now)?.edited ?? source.edited,
+        reason: "OpenCode no longer has that message in the conversation.",
+      });
+    // Never ends on half a surrogate pair.
+    const shown = target.text.slice(0, sourceTextLimit).replace(/[\uD800-\uDBFF]$/, "");
+    return Response.json({
+      note: id,
+      state: "found",
+      edited: noteSource(now)?.edited ?? source.edited,
+      message: {
+        id: target.id,
+        sessionID: dot.sessionID,
+        role: target.role,
+        text: shown,
+        truncated: shown.length < target.text.length,
+        tools: target.tools,
+        time: target.time,
+      },
+    });
+  });
+
 /**
  * The owner's view and edits of a dot's notes, responsibilities and reminders. Every item is
  * scoped to the named dot, and every change needs the version the owner saw. Nothing here starts
@@ -1043,6 +1140,10 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
           ...readMemory(db, dot.name),
           supervisions: openSupervisions(db, dot.name).map(supervisionView),
         })
+      : error(404, "Not found");
+  if (kind === "search")
+    return rawID === undefined && method === "GET"
+      ? search(db, dot.name, request)
       : error(404, "Not found");
   if (kind !== "notes" && kind !== "responsibilities" && kind !== "reminders")
     return error(404, "Not found");
@@ -1116,6 +1217,14 @@ const route = (
     if (request.method === "POST") return send(db, dot, request);
   }
   const [id, part, index, ...more] = extra;
+  if (rest === "memory")
+    return id === "notes" &&
+      part !== undefined &&
+      index === "source" &&
+      more.length === 0 &&
+      request.method === "GET"
+      ? noteSourceRead(db, dot, part)
+      : Effect.succeed(error(404, "Not found"));
   if (rest === "messages" && id !== undefined && extra.length === 1 && request.method === "GET")
     return conversationMessage(db, dot, id, request);
   if (
@@ -1494,7 +1603,8 @@ export const api = (
         console.error(`Instructions: ${cause instanceof Error ? cause.message : String(cause)}`);
         return error(500, "Couldn't read or save the dot's instructions. Nothing was changed.");
       });
-    if (path[0] === "dots" && path[2] === "memory")
+    // A note's source is the one memory read that needs OpenCode.
+    if (path[0] === "dots" && path[2] === "memory" && path[5] !== "source")
       return memoryRoute(db, request, path).catch((cause) => {
         console.error(`Memory: ${cause instanceof Error ? cause.message : String(cause)}`);
         return error(500, "Couldn't read or save the dot's memory.");

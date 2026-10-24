@@ -108,6 +108,37 @@ struct MemoryState {
   private(set) var adding = false
   private var writes = 0
   private var reads = 0
+  /// The note search box, the words last searched for, and what that search found.
+  var searchDraft = ""
+  private(set) var submitted: String?
+  private(set) var search: NoteSearch?
+  private(set) var searchError: String?
+  private(set) var searching = false
+  private var searches = 0
+  /// Each note's source the owner opened, by note ID.
+  private(set) var sources: [Int: OpenSource] = [:]
+  private var sourceReads = 0
+
+  struct SearchRun {
+    fileprivate let number: Int
+    fileprivate let writes: Int
+    let query: String
+  }
+
+  enum SourceShown: Equatable {
+    /// A read in flight, by its number.
+    case loading(Int)
+    case loaded(NoteSourceRead)
+    case failed(String)
+  }
+
+  /// A source the owner opened, for the note's version and recorded source at the time. A read
+  /// that shows either changed closes it, so an old edited flag or message is never left shown.
+  struct OpenSource: Equatable {
+    let version: Int
+    let source: NoteSource
+    var shown: SourceShown
+  }
 
   struct Read {
     fileprivate let number: Int
@@ -132,7 +163,100 @@ struct MemoryState {
     guard isCurrent(read), read.writes == writes, saving.isEmpty, !adding else { return false }
     self.memory = memory
     readError = nil
+    let shown = Set(memory.notes.map(\.id))
+    sources = sources.filter { shown.contains($0.key) }
+    for note in memory.notes { dropStaleSource(note) }
     return true
+  }
+
+  /// Closes a note's open or in-flight source once the note is at another version or has another
+  /// source, as after an edit here, a conflict or another client's edit, so it's read again if wanted.
+  private mutating func dropStaleSource(_ note: MemoryNote) {
+    guard let open = sources[note.id], open.version != note.version || open.source != note.source else { return }
+    sources[note.id] = nil
+  }
+
+  /// The dot's conversation as the notch last read it. Any change, including the first one known,
+  /// closes every open and in-flight source, since none was read under a binding this one confirms.
+  private(set) var boundSession: String?
+
+  mutating func bind(_ session: String?) {
+    if boundSession != session { sources = [:] }
+    boundSession = session
+  }
+
+  /// Starts searching the dot's notes for `query`. A blank query clears the search instead.
+  mutating func startSearch(_ query: String) -> SearchRun? {
+    let words = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !words.isEmpty else {
+      clearSearch()
+      return nil
+    }
+    searches += 1
+    submitted = words
+    searching = true
+    searchError = nil
+    return SearchRun(number: searches, writes: writes, query: words)
+  }
+
+  /// The last search again, as after a change to the notes. Nil when no search is shown.
+  mutating func rerunSearch() -> SearchRun? {
+    guard let submitted else { return nil }
+    return startSearch(submitted)
+  }
+
+  /// Shows a search's answer unless a newer search began, the search was cleared, or any change
+  /// began or ended since it did: whoever made that change searches again when it settles.
+  mutating func finishSearch(_ run: SearchRun, _ result: Result<NoteSearch, MemoryInvalid>) -> Bool {
+    guard run.number == searches, submitted == run.query, run.writes == writes, saving.isEmpty, !adding else { return false }
+    searching = false
+    switch result {
+    case .success(let found):
+      search = found
+      searchError = nil
+    case .failure(let failure):
+      search = nil
+      searchError = failure.message
+    }
+    return true
+  }
+
+  mutating func clearSearch() {
+    searches += 1
+    searchDraft = ""
+    submitted = nil
+    search = nil
+    searchError = nil
+    searching = false
+  }
+
+  /// Starts reading where a note, at `version`, was saved from. Nil while a read for that same
+  /// version and source is already running.
+  mutating func startSource(_ note: Int, version: Int, _ source: NoteSource) -> Int? {
+    if let open = sources[note], open.version == version, open.source == source, case .loading = open.shown { return nil }
+    sourceReads += 1
+    sources[note] = OpenSource(version: version, source: source, shown: .loading(sourceReads))
+    return sourceReads
+  }
+
+  /// Shows a source read only if it's still the one open for that note, and it answers for that
+  /// note and, when found, for the very message and session the note recorded.
+  mutating func finishSource(_ note: Int, _ number: Int, _ result: Result<NoteSourceRead, MemoryInvalid>) -> Bool {
+    guard var open = sources[note], open.shown == .loading(number) else { return false }
+    switch result {
+    case .failure(let failure):
+      open.shown = .failed(failure.message)
+    case .success(let read):
+      let matches = read.note == note && (read.state != "found"
+        || (read.message?.id == open.source.messageID && read.message?.sessionID == open.source.sessionID))
+      open.shown = matches ? .loaded(read) : .failed("The daemon answered for another message or conversation, so nothing is shown. Refresh.")
+    }
+    sources[note] = open
+    return true
+  }
+
+  mutating func closeSource(_ note: Int) {
+    sources[note] = nil
   }
 
   mutating func edit(_ item: MemoryItem) {
@@ -196,6 +320,7 @@ struct MemoryState {
   }
 
   private mutating func put(_ item: MemoryItem) {
+    if case .note(let note) = item { dropStaleSource(note) }
     guard var memory else { return }
     switch item {
     case .note(let note):
@@ -211,7 +336,12 @@ struct MemoryState {
   private mutating func remove(_ key: MemoryKey) {
     errors[key] = nil
     switch key.kind {
-    case .note: memory?.notes.removeAll { $0.id == key.id }
+    case .note:
+      memory?.notes.removeAll { $0.id == key.id }
+      sources[key.id] = nil
+      if let found = search {
+        search = NoteSearch(query: found.query, results: found.results.filter { $0.id != key.id }, more: found.more)
+      }
     case .responsibility: memory?.responsibilities.removeAll { $0.id == key.id }
     case .reminder: memory?.reminders.removeAll { $0.id == key.id }
     }
@@ -231,6 +361,23 @@ func ago(_ time: Double, now: Date = Date()) -> String {
 func memoryChange(_ updatedAt: Double, by actor: String, dot: String, now: Date = Date()) -> String {
   let who = actor == "owner" ? "you" : actor == "scheduler" ? "its schedule" : actor == "dot" ? dot : actor
   return "Updated \(ago(updatedAt, now: now)) by \(who)"
+}
+
+/// What the notch says about a note's source, apart from the message itself.
+func sourceSummary(_ read: NoteSourceRead, dot: String) -> String {
+  let edited = read.edited == true ? " The note was edited since, so this is only where it was first saved, not where its current text came from." : ""
+  switch read.state {
+  case "found":
+    let who = read.message?.role == "assistant" ? "\(dot)'s message" : "a message"
+    let when = read.message.map { Date(timeIntervalSince1970: $0.time / 1000).formatted(date: .abbreviated, time: .shortened) } ?? "at an unknown time"
+    return "Saved by \(who), \(when), in its current conversation: the message whose dot_note saved this note, not proof that the note is true.\(edited)"
+  case "unknown":
+    return "Source unknown: saved before sources were kept, by you, or from a message open-dot couldn't confirm."
+  case "gone":
+    return "Source gone: \(read.reason ?? "OpenCode no longer has that message.")\(edited)"
+  default:
+    return "Source unavailable: \(read.reason ?? "open-dot can't read it.")\(edited)"
+  }
 }
 
 /// When a supervision was asked for or created, and when the owner made it active if that was later.
@@ -261,6 +408,8 @@ struct MemoryView: View {
         }
         if let memory = state?.memory {
           section("Notes") {
+            searchBox
+            searchResults
             ForEach(memory.notes) { MemoryRow(store: store, dot: name, item: .note($0)) }
             addNote
           }
@@ -308,6 +457,49 @@ struct MemoryView: View {
     VStack(alignment: .leading, spacing: 6) {
       Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
       content()
+    }
+  }
+
+  /// Searches only this dot's saved notes, without starting a turn.
+  private var searchBox: some View {
+    let draft = Binding { store.memories[name]?.searchDraft ?? "" } set: { store.memories[name, default: MemoryState()].searchDraft = $0 }
+    let state = store.memories[name]
+    let blank = draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    return HStack {
+      TextField("Search notes", text: draft)
+        .textFieldStyle(.plain)
+        .onSubmit { store.searchNotes(name) }
+        .accessibilityIdentifier("memory-search-field")
+      if state?.searching == true {
+        Text("Searching…").font(.caption2).foregroundStyle(.secondary)
+      }
+      Button("Search") { store.searchNotes(name) }
+        .disabled(blank)
+        .opacity(blank ? 0.4 : 1)
+        .accessibilityIdentifier("memory-search")
+      if state?.submitted != nil {
+        Button("Clear") { store.memories[name]?.clearSearch() }
+          .accessibilityIdentifier("memory-search-clear")
+      }
+    }
+    .buttonStyle(.plain)
+    .font(.caption.weight(.semibold))
+    .padding(8)
+    .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.05)))
+  }
+
+  @ViewBuilder private var searchResults: some View {
+    let state = store.memories[name]
+    if let error = state?.searchError {
+      Text(verbatim: error).font(.caption2).foregroundStyle(.red)
+    }
+    if let found = state?.search {
+      Text(verbatim: found.results.isEmpty
+        ? "No saved notes match “\(found.query)”."
+        : "\(found.results.count)\(found.more ? "+" : "") saved notes match “\(found.query)”, most recently changed first.")
+        .font(.caption2).foregroundStyle(.secondary)
+        .accessibilityIdentifier("memory-search-summary")
+      ForEach(found.results) { NoteMatchRow(store: store, dot: name, match: $0) }
     }
   }
 
@@ -408,7 +600,7 @@ struct MemoryRow: View {
 
   private var meta: String {
     switch item {
-    case .note(let note): memoryChange(note.updatedAt, by: note.updatedBy, dot: dot)
+    case .note(let note): memoryChange(note.updatedAt, by: note.updatedBy, dot: dot) + (note.source == nil ? " · source unknown" : "")
     case .responsibility(let item): memoryChange(item.updatedAt, by: item.updatedBy, dot: dot)
     case .reminder(let reminder): memoryChange(reminder.updatedAt, by: reminder.updatedBy, dot: dot)
     }
@@ -499,6 +691,82 @@ struct MemoryRow: View {
     }
     guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
     store.removeMemory(dot, item)
+  }
+}
+
+/// A note a search found, with where it was saved from when that's known.
+struct NoteMatchRow: View {
+  let store: Store
+  let dot: String
+  let match: NoteMatch
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Text(verbatim: match.snippet).font(.callout).textSelection(.enabled)
+      HStack(spacing: 10) {
+        Text(verbatim: "#\(match.id) · \(memoryChange(match.updatedAt, by: match.updatedBy, dot: dot))\(match.source == nil ? " · source unknown" : match.source?.edited == true ? " · edited since saved" : "")")
+          .font(.caption2).foregroundStyle(.tertiary)
+        Spacer()
+        if let source = match.source { toggle(source) }
+      }
+      .buttonStyle(.plain)
+      .font(.caption2.weight(.semibold))
+      NoteSourcePanel(store: store, dot: dot, note: match.id)
+    }
+    .padding(8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.08)))
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("memory-search-result-\(match.id)")
+  }
+
+  @ViewBuilder private func toggle(_ source: NoteSource) -> some View {
+    switch store.memories[dot]?.sources[match.id]?.shown {
+    case .loading?:
+      Text("Reading…").foregroundStyle(.secondary)
+    case nil:
+      Button("Source") { store.readSource(dot, note: match.id, version: match.version, source: source) }
+        .accessibilityIdentifier("memory-source-\(match.id)")
+    default:
+      Button("Hide source") { store.memories[dot]?.closeSource(match.id) }
+        .accessibilityIdentifier("memory-source-hide-\(match.id)")
+    }
+  }
+}
+
+/// A note's source as the daemon read it. The message's text is the conversation's data, shown as
+/// plain text, never as instructions, Markdown or links.
+struct NoteSourcePanel: View {
+  let store: Store
+  let dot: String
+  let note: Int
+
+  var body: some View {
+    switch store.memories[dot]?.sources[note]?.shown {
+    case .failed(let message)?:
+      Text(verbatim: "\(message) · click to close").font(.caption2).foregroundStyle(.red)
+        .onTapGesture { store.memories[dot]?.closeSource(note) }
+    case .loaded(let read)?:
+      VStack(alignment: .leading, spacing: 4) {
+        Text(verbatim: sourceSummary(read, dot: dot)).font(.caption2).foregroundStyle(.secondary)
+        if let message = read.message {
+          Text("The message, as the conversation's data:").font(.caption2).foregroundStyle(.tertiary)
+          Text(verbatim: message.text.isEmpty ? "(no text)" : message.text)
+            .font(.caption).textSelection(.enabled)
+            .accessibilityIdentifier("memory-source-text-\(note)")
+          if !message.tools.isEmpty {
+            Text(verbatim: "Tools: \(message.tools.joined(separator: ", "))").font(.caption2).foregroundStyle(.tertiary)
+          }
+          if message.truncated {
+            Text("Only the start of the message is shown.").font(.caption2).foregroundStyle(.tertiary)
+          }
+        }
+      }
+      .padding(6)
+      .background(RoundedRectangle(cornerRadius: 8).fill(.white.opacity(0.04)))
+    default:
+      EmptyView()
+    }
   }
 }
 

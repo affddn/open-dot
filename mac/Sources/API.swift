@@ -323,6 +323,53 @@ struct MemoryNote: Decodable, Equatable, Identifiable {
   let updatedAt: Double
   let updatedBy: String
   let text: String
+  /// Where the dot saved it from. Nil means unknown, and older daemons send none.
+  var source: NoteSource? = nil
+}
+
+/// The dot's session and the message whose dot_note saved a note, as open-dot confirmed them.
+/// `edited` means the note changed since, so this is where it was first saved, not proof of its text.
+struct NoteSource: Decodable, Equatable {
+  let sessionID: String
+  let messageID: String
+  let edited: Bool
+}
+
+/// A saved note that contains every word searched for, as a short snippet.
+struct NoteMatch: Decodable, Equatable, Identifiable {
+  let id: Int
+  let version: Int
+  let updatedAt: Double
+  let updatedBy: String
+  let snippet: String
+  var source: NoteSource? = nil
+}
+
+/// The notes a search found, most recently changed first. `more` means some weren't returned.
+struct NoteSearch: Decodable, Equatable {
+  let query: String
+  let results: [NoteMatch]
+  let more: Bool
+}
+
+/// What the daemon read of a note's source: "found" with its message, or "unknown", "unavailable"
+/// or "gone" with why not. The message's text is the conversation's data, shown as is.
+struct NoteSourceRead: Decodable, Equatable {
+  struct Message: Decodable, Equatable {
+    let id: String
+    let sessionID: String
+    let role: String
+    let text: String
+    let truncated: Bool
+    let tools: [String]
+    let time: Double
+  }
+
+  let note: Int
+  let state: String
+  var edited: Bool? = nil
+  var reason: String? = nil
+  var message: Message? = nil
 }
 
 struct MemoryResponsibility: Decodable, Equatable, Identifiable {
@@ -628,6 +675,20 @@ enum APIError: Error {
     let data = approve ? try await send("POST", "\(path)/approve") : try await send("DELETE", path)
     return try decode(Body.self, data).supervision
   }
+
+  /// The dot's saved notes that contain every word in `query`. Reads only open-dot's own notes.
+  func searchNotes(_ dot: String, query: String) async throws -> NoteSearch {
+    let words = query.addingPercentEncoding(withAllowedCharacters: Self.unreserved) ?? ""
+    return try decode(NoteSearch.self, await send("GET", "/dots/\(escape(dot))/memory/search?q=\(words)"))
+  }
+
+  /// The message a note was saved from, which the daemon reads from the dot's exact bound
+  /// conversation, checked before and after. Never retried on its own.
+  func noteSource(_ dot: String, note: Int) async throws -> NoteSourceRead {
+    try decode(NoteSourceRead.self, await send("GET", "/dots/\(escape(dot))/memory/notes/\(note)/source"))
+  }
+
+  private static let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 
   /// Adds the owner's note. Never retried on its own.
   func addNote(_ dot: String, text: String) async throws -> MemoryNote {

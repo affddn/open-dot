@@ -285,6 +285,11 @@ export const notes = sqliteTable("notes", {
   createdAt: integer("created_at").notNull(),
   updatedAt: integer("updated_at"),
   ...versioned(),
+  // The dot's bound session and the assistant message whose dot_note saved it, as the plugin
+  // confirmed them through OpenCode's public session.context. Null means unknown: older notes,
+  // the owner's, and any whose call couldn't be confirmed. Edits never change them.
+  sourceSession: text("source_session"),
+  sourceMessage: text("source_message"),
 });
 
 export type Note = typeof notes.$inferSelect;

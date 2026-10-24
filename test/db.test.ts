@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { openDatabase } from "../src/db";
+import { readMemory } from "../src/memory";
 import {
   feed,
   hiddenMessages,
@@ -32,8 +33,8 @@ import {
 
 const repoMigrations = join(import.meta.dir, "..", "drizzle");
 
-// 0024 appends columns to these, so earlier migrations' tests compare only their first columns.
-const polished = ["slack_apps", "slack_events"];
+// 0024 and 0025 append columns to these, so earlier migrations' tests compare only their first columns.
+const polished = ["slack_apps", "slack_events", "notes"];
 
 type LedgerRow = { seq: number; id: unknown; hash: string; created_at: number };
 
@@ -829,6 +830,9 @@ test("0020 adds memory versions that legacy writers still advance, and keeps eve
       { name: "updated_at", notnull: 0, dflt_value: null },
       { name: "version", notnull: 1, dflt_value: "1" },
       { name: "updated_by", notnull: 1, dflt_value: "'dot'" },
+      // 0025 then adds where a note was saved from.
+      { name: "source_session" },
+      { name: "source_message" },
     ]);
     expect(added("reminders").map((column) => column.name)).toEqual([
       "updated_at",
@@ -1219,7 +1223,10 @@ test("0024 appends nullable Slack polish columns, keeps every 0023 row, and leav
           ? ["prompts", "manifest_version", "update_state", "update_at", "update_note"]
           : name === "slack_events"
             ? ["status_at", "stream", "stream_id", "stream_ts", "stream_text", "title"]
-            : [],
+            : // 0025 then adds where a note was saved from.
+              name === "notes"
+              ? ["source_session", "source_message"]
+              : [],
       );
     }
     expect(tables.map((name) => [name, rows(db.$client, name)])).toEqual(before);
@@ -1245,6 +1252,86 @@ test("0024 appends nullable Slack polish columns, keeps every 0023 row, and leav
     db.$client.close();
     db = openDatabase(path);
     expectLedger(db.$client, ledger, "0024");
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0025 appends nullable note sources, keeps every 0024 row and trigger, and old notes stay unknown", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-note-sources-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0025");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run("insert into notes (dot,text,created_at) values ('jojo','Old decision',2)");
+  old.run(
+    "insert into notes (dot,text,created_at,updated_at,version,updated_by) values ('jojo','Owner note',3,4,2,'owner')",
+  );
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
+  );
+  const rows = (sqlite: Database, name: string) =>
+    sqlite
+      .query(
+        `select ${(columns.get(name) as { name: string }[]).map((c) => `"${c.name}"`).join(",")} from "${name}"`,
+      )
+      .all();
+  const before = tables.map((name) => [name, rows(old, name)]);
+  const ledger = ledgerOf(old);
+  const triggers = triggerSQL(old);
+  old.close();
+  let db = openDatabase(path);
+  try {
+    expect(tableNames(db.$client)).toEqual(tables);
+    for (const name of tables) {
+      const after = db.$client.query<{ name: string }, []>(`pragma table_info("${name}")`).all();
+      const stored = columns.get(name) ?? [];
+      expect(after.slice(0, stored.length)).toEqual(stored as { name: string }[]);
+      expect(after.slice(stored.length)).toMatchObject(
+        name === "notes"
+          ? [
+              { name: "source_session", notnull: 0, dflt_value: null, pk: 0 },
+              { name: "source_message", notnull: 0, dflt_value: null, pk: 0 },
+            ]
+          : [],
+      );
+    }
+    expect(tables.map((name) => [name, rows(db.$client, name)])).toEqual(before);
+    expect(triggerSQL(db.$client)).toEqual(triggers);
+    expectLedger(db.$client, ledger, "0025");
+    expect(readMemory(db, "jojo").notes.map((note) => [note.text, note.source])).toEqual([
+      ["Old decision", null],
+      ["Owner note", null],
+    ]);
+    // The version trigger still advances a legacy edit and leaves the source alone.
+    db.$client.run(
+      "update notes set source_session = 'ses_jojo', source_message = 'msg_1' where id = 1",
+    );
+    db.$client.run("update notes set text = 'Legacy edit' where id = 1");
+    expect(db.select().from(notes).get()).toMatchObject({
+      text: "Legacy edit",
+      version: 3,
+      sourceSession: "ses_jojo",
+      sourceMessage: "msg_1",
+    });
+    expect(readMemory(db, "jojo").notes[0]?.source).toEqual({
+      sessionID: "ses_jojo",
+      messageID: "msg_1",
+      edited: true,
+    });
+    db.$client.close();
+    db = openDatabase(path);
+    expectLedger(db.$client, ledger, "0025");
   } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });

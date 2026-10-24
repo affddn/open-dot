@@ -176,6 +176,13 @@
       "when": 1792768700028,
       "tag": "0024_slack_polish",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "6",
+      "when": 1792799852291,
+      "tag": "0025_note_sources",
+      "breakpoints": true
     }
   ]
 }

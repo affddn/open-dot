@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, ne } from "drizzle-orm";
+import { and, asc, desc, eq, ne, sql } from "drizzle-orm";
 import type { Db } from "./db";
 import {
   type Note,
@@ -32,7 +32,82 @@ const meta = (row: {
   updatedBy: row.updatedBy,
 });
 
-export const noteView = (row: Note) => ({ ...meta(row), text: row.text });
+/**
+ * Where a note was saved from, or null when that's unknown. `edited` means the note changed since,
+ * so the source shows where it was first saved, never that its current text came from there.
+ */
+export const noteSource = (row: Note) =>
+  row.sourceSession && row.sourceMessage
+    ? { sessionID: row.sourceSession, messageID: row.sourceMessage, edited: row.version > 1 }
+    : null;
+
+export const noteView = (row: Note) => ({ ...meta(row), text: row.text, source: noteSource(row) });
+
+/** The longest search, in UTF-16 code units, its most words, and its most results. */
+export const searchTextLimit = 200;
+const searchTerms = 8;
+export const searchResultLimit = 50;
+export const searchDefaultLimit = 20;
+const snippetLength = 160;
+
+/** Lowercases code point by code point, keeping where each folded unit came from in `text`. */
+const fold = (text: string) => {
+  let folded = "";
+  const origin: number[] = [];
+  let at = 0;
+  for (const character of text) {
+    const lower = character.toLowerCase();
+    folded += lower;
+    for (let unit = 0; unit < lower.length; unit++) origin.push(at);
+    at += character.length;
+  }
+  origin.push(at);
+  return { folded, origin };
+};
+
+/** Up to 160 characters of the note around its first match, on one line. */
+const snippet = (text: string, start: number) => {
+  let from = Math.max(0, Math.min(start - 60, text.length - snippetLength));
+  let to = Math.min(text.length, from + snippetLength);
+  // Never split a surrogate pair.
+  if (from > 0 && /[\uDC00-\uDFFF]/.test(text[from] ?? "")) from--;
+  if (to < text.length && /[\uDC00-\uDFFF]/.test(text[to] ?? "")) to++;
+  const line = text.slice(from, to).replace(/\s+/g, " ").trim();
+  return `${from > 0 ? "…" : ""}${line}${to < text.length ? "…" : ""}`;
+};
+
+/** The words of a search, lowercased and each once, or why it can't run. */
+export function parseSearch(value: unknown): string[] | Invalid {
+  const text = memoryText(value, "The search");
+  if (invalid(text)) return text;
+  if (text.length > searchTextLimit)
+    return { invalid: `The search must be at most ${searchTextLimit} characters.` };
+  const words = [...new Set(fold(text).folded.split(/\s+/).filter(Boolean))];
+  if (words.length > searchTerms) return { invalid: `Search for at most ${searchTerms} words.` };
+  return words;
+}
+
+/**
+ * The dot's saved notes that contain every word, ignoring case, most recently changed first, each
+ * with a snippet. It reads the notes table itself, so there's no index to go stale: an edit or
+ * delete shows in the next search, and rebuilding it means reading the notes again.
+ */
+export function searchNotes(db: Db, dot: string, words: readonly string[], limit: number) {
+  const matched = db
+    .select()
+    .from(notes)
+    .where(eq(notes.dot, dot))
+    .orderBy(desc(sql`coalesce(${notes.updatedAt}, ${notes.createdAt})`), desc(notes.id))
+    .all()
+    .flatMap((row) => {
+      const { folded, origin } = fold(row.text);
+      const found = words.map((word) => folded.indexOf(word));
+      if (found.some((at) => at < 0)) return [];
+      const { text: _text, ...view } = noteView(row);
+      return [{ ...view, snippet: snippet(row.text, origin[Math.min(...found)] ?? 0) }];
+    });
+  return { results: matched.slice(0, limit), more: matched.length > limit };
+}
 
 export const responsibilityView = (row: Responsibility) => ({
   ...meta(row),

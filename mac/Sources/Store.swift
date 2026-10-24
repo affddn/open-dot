@@ -1050,6 +1050,45 @@ struct MessageWindow: Equatable {
         let message = Self.describeMemory(error, "Not added", unknown: "It may have been added; it shows on the next refresh.")
         memories[name, default: MemoryState()].finishAdd(.failure(MemoryInvalid(message)))
       }
+      rerunSearch(name)
+    }
+  }
+
+  /// Searches the dot's saved notes for the words in its search box. A blank box clears the search.
+  func searchNotes(_ name: String) {
+    let query = memories[name]?.searchDraft ?? ""
+    guard let run = memories[name, default: MemoryState()].startSearch(query) else { return }
+    search(name, run)
+  }
+
+  /// Searches again for the words last searched, so an edit, delete or new note shows at once.
+  private func rerunSearch(_ name: String) {
+    guard let run = memories[name]?.rerunSearch() else { return }
+    search(name, run)
+  }
+
+  private func search(_ name: String, _ run: MemoryState.SearchRun) {
+    Task {
+      do {
+        let found = try await api.searchNotes(name, query: run.query)
+        _ = memories[name]?.finishSearch(run, .success(found))
+      } catch {
+        _ = memories[name]?.finishSearch(run, .failure(MemoryInvalid("Search failed. \(Self.describe(error))")))
+      }
+    }
+  }
+
+  /// Reads where a note was saved from, which the daemon reads from the dot's own conversation.
+  /// A failure says why and is never retried on its own.
+  func readSource(_ name: String, note: Int, version: Int, source: NoteSource) {
+    guard let number = memories[name, default: MemoryState()].startSource(note, version: version, source) else { return }
+    Task {
+      do {
+        let read = try await api.noteSource(name, note: note)
+        _ = memories[name]?.finishSource(note, number, .success(read))
+      } catch {
+        _ = memories[name]?.finishSource(note, number, .failure(MemoryInvalid("Source not shown. \(Self.describe(error))")))
+      }
     }
   }
 
@@ -1155,6 +1194,8 @@ struct MessageWindow: Equatable {
         let message = Self.describeMemory(error, "Not saved", unknown: "It may have been saved; the next refresh shows what the daemon has.")
         memories[name, default: MemoryState()].finish(key, .failed(message))
       }
+      // A search answered during any change is dropped, so it runs again once the change settles.
+      rerunSearch(name)
     }
   }
 
@@ -1185,7 +1226,9 @@ struct MessageWindow: Equatable {
     let read = memories[name, default: MemoryState()].startRead()
     do {
       let memory = try await api.memory(name)
-      _ = memories[name, default: MemoryState()].apply(read, memory)
+      let before = memories[name]?.memory?.notes
+      // The dot's own notes, added or forgotten, show in the search too.
+      if memories[name, default: MemoryState()].apply(read, memory), before != memory.notes { rerunSearch(name) }
       await refreshAudit(name)
     } catch {
       guard memories[name]?.isCurrent(read) == true else { return }
@@ -1344,6 +1387,9 @@ struct MessageWindow: Equatable {
     let list = result.messages
     let statuses = result.statuses
     let recent = result.recentEmojis
+    // Latest reads run one at a time, so this is the binding now. A rebinding closes the Memory
+    // view's note sources, which were read under the old binding.
+    if memories[name]?.boundSession != result.sessionID { memories[name, default: MemoryState()].bind(result.sessionID) }
     // Discard polls begun before or during a write.
     guard epoch == writeEpoch[name, default: 0],
       !reacting.contains(where: { $0.dot == name }), !hiding.contains(where: { $0.dot == name }) else { return }
