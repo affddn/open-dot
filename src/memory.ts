@@ -172,7 +172,7 @@ export const isID = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 
 /** Text the owner typed: not blank, bounded, and no control characters except newline and tab. */
-const memoryText = (value: unknown, name: string): string | Invalid => {
+export const memoryText = (value: unknown, name: string): string | Invalid => {
   if (typeof value !== "string") return { invalid: `${name} must be a string.` };
   const text = value.trim();
   if (!text) return { invalid: `${name} can't be blank.` };

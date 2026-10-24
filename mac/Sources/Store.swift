@@ -1154,6 +1154,68 @@ struct MessageWindow: Equatable {
     }
   }
 
+  /// Saves the owner's new feed trigger as a draft to review, then reads the memory again. A draft
+  /// runs nothing. A failed or unanswered save says so and is never sent again on its own.
+  func createTrigger(_ name: String) {
+    guard var state = memories[name], !state.savingTrigger else { return }
+    let body: Data
+    do {
+      body = try JSONSerialization.data(withJSONObject: try state.triggerDraft.fields())
+    } catch {
+      memories[name]?.notice = (error as? MemoryInvalid)?.message ?? "\(error)"
+      return
+    }
+    let sent = state.triggerDraft
+    state.savingTrigger = true
+    state.notice = nil
+    memories[name] = state
+    Task {
+      do {
+        _ = try await api.createTrigger(name, body: body)
+        if memories[name]?.triggerDraft == sent { memories[name]?.triggerDraft = TriggerDraft() }
+      } catch {
+        memories[name, default: MemoryState()].notice = Self.describeMemory(error, "Not saved", unknown: "A draft may have been saved; the next refresh shows what the daemon has.")
+      }
+      memories[name]?.savingTrigger = false
+      await refreshMemory(name)
+    }
+  }
+
+  /// Reads which saved feed events a trigger matches. The daemon changes nothing; a preview the
+  /// owner closed meanwhile stays closed.
+  func previewTrigger(_ name: String, _ trigger: FeedTrigger) {
+    guard memories[name]?.previews[trigger.id] != .loading else { return }
+    memories[name, default: MemoryState()].previews[trigger.id] = .loading
+    Task {
+      let shown: PreviewShown
+      do {
+        shown = .loaded(try await api.previewTrigger(name, trigger.id))
+      } catch {
+        shown = .failed("Preview failed. \(Self.describe(error))")
+      }
+      guard memories[name]?.previews[trigger.id] == .loading else { return }
+      memories[name]?.previews[trigger.id] = shown
+    }
+  }
+
+  /// Enables or resumes a trigger at the revision the owner confirmed, pauses it or revokes it,
+  /// then reads the memory again. Never sent again on its own.
+  func changeTrigger(_ name: String, _ trigger: FeedTrigger, _ action: TriggerAction) {
+    guard memories[name, default: MemoryState()].triggering.insert(trigger.id).inserted else { return }
+    memories[name]?.notice = nil
+    memories[name]?.previews[trigger.id] = nil
+    Task {
+      do {
+        try await api.changeTrigger(name, trigger, action)
+      } catch {
+        let refused = action == .enable ? "Not enabled" : action == .pause ? "Not paused" : "Not revoked"
+        memories[name, default: MemoryState()].notice = Self.describeMemory(error, refused, unknown: "It may have changed; the next refresh shows what the daemon has.")
+      }
+      memories[name]?.triggering.remove(trigger.id)
+      await refreshMemory(name)
+    }
+  }
+
   /// Sends the edit at the version the owner started from. Nothing changed closes the editor.
   func saveMemory(_ name: String, _ key: MemoryKey) {
     guard let draft = memories[name]?.drafts[key] else { return }

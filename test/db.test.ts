@@ -35,6 +35,8 @@ const repoMigrations = join(import.meta.dir, "..", "drizzle");
 
 // 0024 and 0025 append columns to these, so earlier migrations' tests compare only their first columns.
 const polished = ["slack_apps", "slack_events", "notes"];
+// 0026 adds these tables, so earlier migrations' tests leave them out.
+const later = ["feed_triggers", "trigger_occurrences"];
 
 type LedgerRow = { seq: number; id: unknown; hash: string; created_at: number };
 
@@ -819,7 +821,9 @@ test("0020 adds memory versions that legacy writers still advance, and keeps eve
     expect(rows(db.$client)).toEqual(before);
     // 0022 and 0023 then add supervisions and requests.
     expect(
-      tableNames(db.$client).filter((name) => name !== "supervisions" && name !== "requests"),
+      tableNames(db.$client).filter(
+        (name) => name !== "supervisions" && name !== "requests" && !later.includes(name),
+      ),
     ).toEqual(tables);
     const added = (name: string) =>
       db.$client
@@ -982,7 +986,9 @@ test("0021 adds a nullable schedule that legacy status writers pause, and keeps 
     expect(rows(db.$client)).toEqual(before);
     // 0022 then adds supervisions and outbox.supervision, and 0023 requests.
     expect(
-      tableNames(db.$client).filter((name) => name !== "supervisions" && name !== "requests"),
+      tableNames(db.$client).filter(
+        (name) => name !== "supervisions" && name !== "requests" && !later.includes(name),
+      ),
     ).toEqual(tables);
     expect(
       db.$client
@@ -1065,7 +1071,9 @@ test("0022 adds supervisions and a nullable outbox.supervision, and keeps every 
   old.close();
   let db = openDatabase(path);
   try {
-    expect(tableNames(db.$client)).toEqual([...tables, "requests", "supervisions"].toSorted());
+    expect(tableNames(db.$client).filter((name) => !later.includes(name))).toEqual(
+      [...tables, "requests", "supervisions"].toSorted(),
+    );
     for (const name of tables) {
       const after = db.$client.query(`pragma table_info("${name}")`).all();
       expect(after.slice(0, columns.get(name)?.length)).toEqual(columns.get(name) ?? []);
@@ -1141,7 +1149,9 @@ test("0023 adds only requests, one row per session, kind and request, and keeps 
   old.close();
   let db = openDatabase(path);
   try {
-    expect(tableNames(db.$client)).toEqual([...tables, "requests"].toSorted());
+    expect(tableNames(db.$client).filter((name) => !later.includes(name))).toEqual(
+      [...tables, "requests"].toSorted(),
+    );
     for (const name of tables) {
       const after = db.$client.query(`pragma table_info("${name}")`).all();
       if (polished.includes(name))
@@ -1212,7 +1222,7 @@ test("0024 appends nullable Slack polish columns, keeps every 0023 row, and leav
   old.close();
   let db = openDatabase(path);
   try {
-    expect(tableNames(db.$client)).toEqual(tables);
+    expect(tableNames(db.$client).filter((name) => !later.includes(name))).toEqual(tables);
     for (const name of tables) {
       const after = db.$client.query<{ name: string }, []>(`pragma table_info("${name}")`).all();
       const stored = columns.get(name) ?? [];
@@ -1292,7 +1302,7 @@ test("0025 appends nullable note sources, keeps every 0024 row and trigger, and 
   old.close();
   let db = openDatabase(path);
   try {
-    expect(tableNames(db.$client)).toEqual(tables);
+    expect(tableNames(db.$client).filter((name) => !later.includes(name))).toEqual(tables);
     for (const name of tables) {
       const after = db.$client.query<{ name: string }, []>(`pragma table_info("${name}")`).all();
       const stored = columns.get(name) ?? [];
@@ -1332,6 +1342,73 @@ test("0025 appends nullable note sources, keeps every 0024 row and trigger, and 
     db.$client.close();
     db = openDatabase(path);
     expectLedger(db.$client, ledger, "0025");
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0026 adds only the feed trigger tables, keeps every 0025 table, row and trigger, and keys occurrences once", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-feed-triggers-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0026");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run(
+    "insert into responsibilities (dot,goal,next_action,status,created_at,updated_at) values ('jojo','Reviews','Read','active',1,1)",
+  );
+  old.run(
+    "insert into outbox (session_id,message_id,text,state,created_at) values ('ses_jojo','msg_old','Hi','pending',1)",
+  );
+  old.run(
+    "insert into feed (source,source_id,reason,title,context,updated_at,state,created_at) values ('github','T1','Review requested','Old','opzero1/open-dot',5,'unread',1)",
+  );
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+  const before = rows(old);
+  const ledger = ledgerOf(old);
+  const triggers = triggerSQL(old);
+  old.close();
+  let db = openDatabase(path);
+  try {
+    expect(tableNames(db.$client)).toEqual([...tables, ...later].toSorted());
+    for (const name of tables)
+      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(
+        columns.get(name) ?? [],
+      );
+    expect(rows(db.$client)).toEqual(before);
+    expect(triggerSQL(db.$client)).toEqual(triggers);
+    expectLedger(db.$client, ledger, "0026");
+    db.$client.run(
+      "insert into feed_triggers (dot,responsibility,session_id,source,repository,reasons,task,revision,state,created_at,updated_at) values ('jojo',1,'ses_jojo','github','opzero1/open-dot','[\"Review requested\"]','Review it','r','draft',1,1)",
+    );
+    const occurrence = (sourceID: string, at: number) =>
+      db.$client.run(
+        `insert into trigger_occurrences (trigger_id,source,source_id,activity_at,epoch,state,event,created_at) values (1,'github','${sourceID}',${at},1,'baseline','{}',1)`,
+      );
+    occurrence("T1", 5);
+    // Later activity on the same item is a new occurrence; the same activity is refused.
+    occurrence("T1", 6);
+    expect(() => occurrence("T1", 5)).toThrow();
+    expect(db.$client.query("select epoch, baseline_at from feed_triggers").get()).toEqual({
+      epoch: 0,
+      baseline_at: null,
+    });
+    db.$client.close();
+    db = openDatabase(path);
+    expectLedger(db.$client, ledger, "0026");
   } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });

@@ -46,6 +46,7 @@ import {
   supervisionNotice,
 } from "./supervise";
 import { queueReport } from "./slack-agents";
+import { fireTriggers, wakeAllowed } from "./triggers";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Message = typeof outbox.$inferSelect;
@@ -79,7 +80,8 @@ const nextOccurrence = (dueAt: number, every: number, now: number) =>
 /**
  * Moves each due reminder into the outbox, and moves a repeating one to its next occurrence.
  * Each claim needs the version it read, so a reminder the owner or dot changed or cancelled since
- * is neither sent from the stale read nor overwritten; the next tick reads it again.
+ * is neither sent from the stale read nor overwritten; the next tick reads it again. Then it runs
+ * scheduled responsibilities and the owner's feed triggers, all database-only.
  */
 export function claimDue(db: Db, now: number) {
   const due = db
@@ -135,6 +137,7 @@ export function claimDue(db: Db, now: number) {
     });
   }
   claimSchedules(db, now);
+  fireTriggers(db, now);
 }
 
 /**
@@ -267,9 +270,11 @@ const admit = (db: Db, message: Message, permit?: Message) =>
     const opencode = yield* OpenCode;
     const ref = { sessionID: message.sessionID, messageID: message.messageID };
     const from = message.state;
+    // A dot_send needs its binding, and a feed trigger's wake its trigger, binding and responsibility.
     const allowed = () =>
-      message.supervision === null ||
-      canSend(db, message.supervision, message.fromDot, message.sessionID);
+      (message.supervision === null ||
+        canSend(db, message.supervision, message.fromDot, message.sessionID)) &&
+      wakeAllowed(db, message.messageID, message.sessionID);
     const resumed = () => permit === undefined || stillPermits(db, permit);
     const cancel = () => {
       db.update(outbox)

@@ -437,12 +437,83 @@ struct Supervision: Decodable, Equatable, Identifiable {
   var modeTitle: String { mode == "send" ? "watch and send" : "watch only" }
 }
 
+/// The GitHub reasons a feed trigger can filter on, as the daemon's feed labels them.
+let triggerReasons = ["Review requested", "Mentioned", "Team mentioned", "Assigned", "Comment", "Author"]
+
+/// A GitHub feed event a trigger matched, as the daemon read it from its own feed. Its title is
+/// GitHub's data, shown as plain text.
+struct TriggerEvent: Decodable, Equatable {
+  let sourceID: String
+  let reason: String
+  let repository: String
+  let title: String
+  let url: String?
+  let updatedAt: Double
+}
+
+/// The owner's rule that wakes the dot about one responsibility when its GitHub feed shows new
+/// activity in one repository for the chosen reasons. Only the owner enables it, at `revision`;
+/// its filter and task never change.
+struct FeedTrigger: Decodable, Equatable, Identifiable {
+  struct Wake: Decodable, Equatable {
+    let messageID: String
+    let at: Double
+    let events: [TriggerEvent]
+    /// "queued", "sending", "admitted" (OpenCode has it, not that the dot finished), "cancelled" or "unknown".
+    let delivery: String
+  }
+
+  struct Skip: Decodable, Equatable {
+    let at: Double
+    let reason: String?
+    let event: TriggerEvent
+  }
+
+  let id: Int
+  let responsibility: Int
+  let sessionID: String
+  let repository: String
+  let reasons: [String]
+  let task: String
+  let revision: String
+  /// "draft", "active" or "paused".
+  let state: String
+  let createdAt: Double
+  let confirmedAt: Double?
+  let baselineAt: Double?
+  let lastWake: Wake?
+  let baselined: Int
+  let skippedCount: Int
+  let skipped: [Skip]
+}
+
+/// The saved feed events a trigger's filter matches, newest first, and the exact wake text the
+/// newest would make. Reading it changes nothing.
+struct TriggerPreview: Decodable, Equatable {
+  struct Match: Decodable, Equatable {
+    let event: TriggerEvent
+    /// "queued", "skipped", "baseline", "pending" or "ignored".
+    let outcome: String
+    var reason: String? = nil
+  }
+
+  let total: Int
+  let matches: [Match]
+  let sample: String?
+}
+
+enum TriggerAction {
+  case enable, pause, revoke
+}
+
 struct Memory: Decodable, Equatable {
   var notes: [MemoryNote]
   var responsibilities: [MemoryResponsibility]
   var reminders: [MemoryReminder]
   /// Requested and active supervisions. Older daemons send none.
   var supervisions: [Supervision]? = nil
+  /// Draft, active and paused feed triggers. Older daemons send none.
+  var triggers: [FeedTrigger]? = nil
 }
 
 enum MemoryKind: String {
@@ -674,6 +745,30 @@ enum APIError: Error {
     let path = "/dots/\(escape(dot))/memory/supervisions/\(id)"
     let data = approve ? try await send("POST", "\(path)/approve") : try await send("DELETE", path)
     return try decode(Body.self, data).supervision
+  }
+
+  /// Saves a draft feed trigger, which runs nothing until the owner enables it. Never retried on its own.
+  func createTrigger(_ dot: String, body: Data) async throws -> FeedTrigger {
+    struct Body: Decodable { let trigger: FeedTrigger }
+    return try decode(Body.self, await send("POST", "/dots/\(escape(dot))/memory/triggers", body: body)).trigger
+  }
+
+  /// The saved feed events a trigger matches. The daemon only reads.
+  func previewTrigger(_ dot: String, _ id: Int) async throws -> TriggerPreview {
+    try decode(TriggerPreview.self, await send("GET", "/dots/\(escape(dot))/memory/triggers/\(id)/preview"))
+  }
+
+  /// Enables or resumes a trigger at the revision the owner reviewed, pauses it or revokes it.
+  /// Never retried on its own.
+  func changeTrigger(_ dot: String, _ trigger: FeedTrigger, _ action: TriggerAction) async throws {
+    let path = "/dots/\(escape(dot))/memory/triggers/\(trigger.id)"
+    switch action {
+    case .enable:
+      let body = try JSONSerialization.data(withJSONObject: ["revision": trigger.revision])
+      _ = try await send("POST", "\(path)/enable", body: body)
+    case .pause: _ = try await send("POST", "\(path)/pause")
+    case .revoke: _ = try await send("DELETE", path)
+    }
   }
 
   /// The dot's saved notes that contain every word in `query`. Reads only open-dot's own notes.

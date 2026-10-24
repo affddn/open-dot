@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  index,
   integer,
   primaryKey,
   sqliteTable,
@@ -476,6 +477,84 @@ export const feed = sqliteTable(
 );
 
 export type FeedItem = typeof feed.$inferSelect;
+
+/** A GitHub feed event a trigger matched, as the daemon read it from its own feed table. */
+export interface TriggerEvent {
+  readonly feedID: number;
+  readonly sourceID: string;
+  readonly reason: string;
+  readonly repository: string;
+  readonly title: string;
+  readonly url: string | null;
+  readonly updatedAt: number;
+}
+
+/**
+ * The owner's rule that wakes one dot about one active responsibility when its GitHub feed shows
+ * new activity in one repository for one of the chosen reasons. Only the owner's API makes one,
+ * as a "draft", and only the owner's confirmation of its exact `revision` makes it "active". Its
+ * filter, task, dot, responsibility and session never change: to change one, revoke it and make
+ * another. `epoch` counts enables; each enable or resume baselines existing activity and sets
+ * `baseline_at`, and only later activity wakes the dot.
+ */
+export const feedTriggers = sqliteTable("feed_triggers", {
+  id: integer().primaryKey({ autoIncrement: true }),
+  dot: text()
+    .notNull()
+    .references(() => dots.name),
+  responsibility: integer()
+    .notNull()
+    .references(() => responsibilities.id),
+  // The dot's ready session when the owner made it. A wake goes only there.
+  sessionID: text("session_id").notNull(),
+  source: text({ enum: ["github"] }).notNull(),
+  // owner/name, lowercased; matched exactly against the feed item's lowercased repository.
+  repository: text().notNull(),
+  // Feed reason labels, such as "Review requested", each once.
+  reasons: text({ mode: "json" }).$type<string[]>().notNull(),
+  // The owner's own instruction, sent unchanged with every wake.
+  task: text().notNull(),
+  // SHA-256 of the fixed configuration, which the owner's confirmation must name.
+  revision: text().notNull(),
+  state: text({ enum: ["draft", "active", "paused", "revoked"] }).notNull(),
+  epoch: integer().notNull().default(0),
+  baselineAt: integer("baseline_at"),
+  createdAt: integer("created_at").notNull(),
+  confirmedAt: integer("confirmed_at"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+export type FeedTrigger = typeof feedTriggers.$inferSelect;
+
+/**
+ * Each distinct activity a trigger saw, keyed by the feed item's source ID and its activity time,
+ * never by poll or title, so repeated polls and restarts add nothing. "baseline": it existed when
+ * the trigger was enabled or resumed, and never wakes. "queued": a wake with `message_id` was put
+ * in the outbox in the same transaction. "skipped": it never runs, for `reason`.
+ */
+export const triggerOccurrences = sqliteTable(
+  "trigger_occurrences",
+  {
+    id: integer().primaryKey({ autoIncrement: true }),
+    triggerID: integer("trigger_id")
+      .notNull()
+      .references(() => feedTriggers.id),
+    source: text({ enum: ["github"] }).notNull(),
+    sourceID: text("source_id").notNull(),
+    activityAt: integer("activity_at").notNull(),
+    // The trigger's epoch when this was seen. A wake from an earlier epoch is never sent.
+    epoch: integer().notNull(),
+    state: text({ enum: ["baseline", "queued", "skipped"] }).notNull(),
+    reason: text(),
+    messageID: text("message_id"),
+    event: text({ mode: "json" }).$type<TriggerEvent>().notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [
+    unique().on(table.triggerID, table.source, table.sourceID, table.activityAt),
+    index("trigger_occurrences_message").on(table.messageID),
+  ],
+);
 
 /** Each message the owner sent a dot from Slack, and the dot's reply on its way back there. */
 export const slack = sqliteTable("slack", {

@@ -136,7 +136,7 @@ export async function output(command: string[]) {
   }
 }
 
-const githubReasons: Record<string, string> = {
+export const githubReasons: Record<string, string> = {
   review_requested: "Review requested",
   mention: "Mentioned",
   team_mention: "Team mentioned",

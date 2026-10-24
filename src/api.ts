@@ -49,6 +49,18 @@ import { quoted, quoteText, replyPrompt } from "./replies";
 import { answerSummary, needsYou, requestView } from "./requests";
 import { approveBinding, endBinding, openSupervisions, supervisionView } from "./supervise";
 import {
+  createTrigger,
+  enableTrigger,
+  findTrigger,
+  listTriggers,
+  parseTrigger,
+  pauseTrigger,
+  previewTrigger,
+  revokeTrigger,
+  type TriggerChange,
+  triggerView,
+} from "./triggers";
+import {
   type Dot,
   feed,
   type FeedItem,
@@ -1025,6 +1037,83 @@ const supervisionRoute = (
   return error(404, "There's no such binding for this dot.");
 };
 
+const triggerAnswer = (db: Db, change: TriggerChange) => {
+  if ("saved" in change) return Response.json({ trigger: triggerView(db, change.saved) });
+  if ("conflict" in change)
+    return Response.json(
+      { error: `${change.why} Nothing changed.`, current: triggerView(db, change.conflict) },
+      { status: 409 },
+    );
+  return error(404, "There's no such trigger for this dot.");
+};
+
+/**
+ * The owner's feed triggers. `GET …/memory/triggers` lists them; `POST` saves a draft. `GET …/<id>/preview` reads
+ * the saved feed events it matches without changing anything, `POST …/<id>/enable` with the
+ * reviewed `{revision}` enables or resumes it, `POST …/<id>/pause` pauses it and `DELETE …/<id>`
+ * revokes it. None starts a turn.
+ */
+const triggerRoute = async (
+  db: Db,
+  dot: Dot,
+  request: Request,
+  rawID: string | undefined,
+  extra: string[],
+) => {
+  const { method } = request;
+  const body = async () => {
+    const value = await messageBody(request, memoryBodyLimit).catch(() => undefined);
+    return value instanceof Response ? value : { read: value };
+  };
+  if (rawID === undefined) {
+    if (method === "GET")
+      return Response.json({
+        triggers: listTriggers(db, dot.name).map((row) => triggerView(db, row)),
+      });
+    if (method !== "POST") return error(404, "Not found");
+    const input = await body();
+    if (input instanceof Response) return input;
+    const parsed = parseTrigger(input.read);
+    if ("invalid" in parsed) return error(400, parsed.invalid);
+    const created = createTrigger(db, dot.name, parsed);
+    return "saved" in created
+      ? Response.json({ trigger: triggerView(db, created.saved) }, { status: 201 })
+      : error(created.status, created.refused);
+  }
+  if (!positive.test(rawID) || !Number.isSafeInteger(Number(rawID)))
+    return error(404, "There's no such trigger for this dot.");
+  const id = Number(rawID);
+  const [action, ...more] = extra;
+  if (more.length) return error(404, "Not found");
+  if (action === undefined && method === "DELETE")
+    return triggerAnswer(db, revokeTrigger(db, dot.name, id));
+  if (action === "pause" && method === "POST")
+    return triggerAnswer(db, pauseTrigger(db, dot.name, id));
+  if (action === "preview" && method === "GET") {
+    const row = findTrigger(db, dot.name, id);
+    return row
+      ? Response.json(previewTrigger(db, row))
+      : error(404, "There's no such trigger for this dot.");
+  }
+  if (action === "enable" && method === "POST") {
+    const input = await body();
+    if (input instanceof Response) return input;
+    const sent = input.read;
+    const revision =
+      typeof sent === "object" &&
+      sent !== null &&
+      !Array.isArray(sent) &&
+      Object.keys(sent).length === 1 &&
+      "revision" in sent
+        ? sent.revision
+        : undefined;
+    if (typeof revision !== "string" || !/^[0-9a-f]{64}$/.test(revision))
+      return error(400, "Send {revision}, the revision you reviewed.");
+    return triggerAnswer(db, enableTrigger(db, dot.name, id, revision));
+  }
+  return error(404, "Not found");
+};
+
 /** `GET …/memory/search?q=<words>[&limit=<1–50>]`: the dot's notes that contain every word. */
 const search = (db: Db, dot: string, request: Request) => {
   const query = new URL(request.url).searchParams;
@@ -1133,12 +1222,14 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
   if (!dot) return error(404, `There's no dot named "${name}".`);
   const { method } = request;
   if (kind === "supervisions") return supervisionRoute(db, dot.name, method, rawID, extra);
+  if (kind === "triggers") return triggerRoute(db, dot, request, rawID, extra);
   if (extra.length) return error(404, "Not found");
   if (kind === undefined)
     return method === "GET"
       ? Response.json({
           ...readMemory(db, dot.name),
           supervisions: openSupervisions(db, dot.name).map(supervisionView),
+          triggers: listTriggers(db, dot.name).map((row) => triggerView(db, row)),
         })
       : error(404, "Not found");
   if (kind === "search")

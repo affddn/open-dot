@@ -84,6 +84,41 @@ struct MemoryDraft: Equatable {
   }
 }
 
+/// A new feed trigger the owner is writing. Saving makes a draft to review; it runs nothing.
+struct TriggerDraft: Equatable {
+  var open = false
+  var responsibility: Int?
+  var repository = ""
+  var reasons: Set<String> = ["Review requested"]
+  var task = ""
+
+  /// What to send, or a message for a value the daemon would refuse, so nothing is sent.
+  func fields() throws -> [String: Any] {
+    guard let responsibility else { throw MemoryInvalid("Pick an active responsibility.") }
+    let repo = repository.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard repo.range(of: "^[a-z0-9][a-z0-9-]{0,38}/[a-z0-9._-]{1,100}$", options: .regularExpression) != nil else {
+      throw MemoryInvalid("Name the repository as owner/name, as GitHub shows it.")
+    }
+    guard !reasons.isEmpty else { throw MemoryInvalid("Pick at least one reason.") }
+    let text = task.trimmingCharacters(in: .whitespacesAndNewlines)
+    if text.isEmpty { throw MemoryInvalid("Write the instruction the dot gets with each wake.") }
+    if text.utf16.count > memoryTextLimit { throw MemoryInvalid("The instruction must be at most \(memoryTextLimit) characters.") }
+    return [
+      "responsibility": responsibility,
+      "repository": repo,
+      "reasons": triggerReasons.filter { reasons.contains($0) },
+      "task": text,
+    ]
+  }
+}
+
+/// A trigger's preview as shown: loading, the daemon's read, or why it failed.
+enum PreviewShown: Equatable {
+  case loading
+  case loaded(TriggerPreview)
+  case failed(String)
+}
+
 struct MemoryInvalid: Error, Equatable {
   let message: String
   init(_ message: String) { self.message = message }
@@ -104,6 +139,11 @@ struct MemoryState {
   var noteDraft = ""
   /// Supervisions being approved or ended.
   var supervising: Set<Int> = []
+  /// The new trigger form, triggers being changed, whether a draft is being saved, and open previews.
+  var triggerDraft = TriggerDraft()
+  var triggering: Set<Int> = []
+  var savingTrigger = false
+  var previews: [Int: PreviewShown] = [:]
   private(set) var saving: Set<MemoryKey> = []
   private(set) var adding = false
   private var writes = 0
@@ -416,6 +456,7 @@ struct MemoryView: View {
           section("Responsibilities") {
             if memory.responsibilities.isEmpty { empty }
             ForEach(memory.responsibilities) { MemoryRow(store: store, dot: name, item: .responsibility($0)) }
+            TriggerList(store: store, dot: name, memory: memory)
           }
           section("Scheduled reminders") {
             if memory.reminders.isEmpty { empty }
@@ -871,5 +912,261 @@ struct SupervisionRow: View {
     }
     guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
     store.changeSupervision(dot, binding, approve: approve)
+  }
+}
+
+/// The daemon's bounds on wakes, mirrored for the confirmation text.
+let triggerWakesPerHour = 3
+let triggerWakeEvents = 5
+
+/// What the owner confirms before enabling or resuming: the exact filter, destination and
+/// instruction, and the revision the confirmation is bound to.
+func triggerConfirmation(_ trigger: FeedTrigger, dot: String, goal: String?) -> String {
+  """
+  When GitHub activity in \(trigger.repository) for \(trigger.reasons.joined(separator: ", ")) reaches your feed, \(dot) is woken in its conversation \(trigger.sessionID) about responsibility #\(trigger.responsibility)\(goal.map { " (\($0))" } ?? "") with this instruction, sent unchanged:
+
+  \(trigger.task)
+
+  Each event's title and details go with it as GitHub's data, never as instructions. Activity already in the feed is recorded without waking. At most \(triggerWakesPerHour) wakes an hour, \(triggerWakeEvents) events each; the rest are skipped and listed here. Revision \(trigger.revision.prefix(12)).
+  """
+}
+
+/// A trigger's last wake, skips and binding, in one line.
+func triggerSummary(_ trigger: FeedTrigger, now: Date = Date()) -> String {
+  var parts: [String] = []
+  if let wake = trigger.lastWake {
+    let delivery = wake.delivery == "admitted" ? "OpenCode has it" : wake.delivery
+    parts.append("Last wake \(ago(wake.at, now: now)), \(wake.events.count) \(wake.events.count == 1 ? "event" : "events"), \(delivery)")
+  } else {
+    parts.append("No wake yet")
+  }
+  if trigger.skippedCount > 0 { parts.append("\(trigger.skippedCount) skipped") }
+  if trigger.baselined > 0 { parts.append("\(trigger.baselined) recorded without waking") }
+  parts.append("bound to \(trigger.sessionID)")
+  return parts.joined(separator: " · ")
+}
+
+/// What a previewed event did or would do.
+func triggerOutcome(_ match: TriggerPreview.Match) -> String {
+  switch match.outcome {
+  case "queued": "a wake was queued; check its delivery status"
+  case "skipped": "skipped: \(match.reason ?? "no reason saved")"
+  case "baseline": "already in the feed, recorded without waking"
+  case "pending": "awaiting the next check of the binding, responsibility and wake limits"
+  default: "came before the trigger was enabled, so it never runs"
+  }
+}
+
+/// The owner's feed triggers, under the responsibilities they wake the dot about, and a form for
+/// a new one. Saving makes a draft; only Enable, after showing its exact filter and instruction,
+/// runs it. Nothing here starts a turn.
+struct TriggerList: View {
+  let store: Store
+  let dot: String
+  let memory: Memory
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      Text("Feed triggers").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+      ForEach(memory.triggers ?? []) { trigger in
+        TriggerRow(store: store, dot: dot, trigger: trigger, goal: memory.responsibilities.first { $0.id == trigger.responsibility }?.goal)
+      }
+      if store.memories[dot]?.triggerDraft.open == true {
+        form
+      } else {
+        Button("New feed trigger…") { store.memories[dot, default: MemoryState()].triggerDraft.open = true }
+          .buttonStyle(.plain)
+          .font(.caption2.weight(.semibold))
+          .disabled(active.isEmpty)
+          .opacity(active.isEmpty ? 0.4 : 1)
+          .accessibilityIdentifier("trigger-new")
+      }
+    }
+  }
+
+  private var active: [MemoryResponsibility] { memory.responsibilities.filter { $0.status == "active" } }
+
+  private var form: some View {
+    let draft = Binding { store.memories[dot]?.triggerDraft ?? TriggerDraft() } set: { store.memories[dot, default: MemoryState()].triggerDraft = $0 }
+    let saving = store.memories[dot]?.savingTrigger == true
+    return VStack(alignment: .leading, spacing: 6) {
+      Picker("Responsibility", selection: draft.responsibility) {
+        Text("Choose a responsibility").tag(Int?.none)
+        ForEach(active) { Text(verbatim: "#\($0.id) \($0.goal)").tag(Int?.some($0.id)) }
+      }
+      .accessibilityIdentifier("trigger-responsibility")
+      TextField("GitHub repository, owner/name", text: draft.repository)
+        .textFieldStyle(.plain)
+        .accessibilityIdentifier("trigger-repository")
+      LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), alignment: .leading)], alignment: .leading) {
+        ForEach(triggerReasons, id: \.self) { reason in
+          Toggle(reason, isOn: Binding {
+            draft.wrappedValue.reasons.contains(reason)
+          } set: { on in
+            if on { draft.wrappedValue.reasons.insert(reason) } else { draft.wrappedValue.reasons.remove(reason) }
+          })
+          .toggleStyle(.checkbox)
+        }
+      }
+      .font(.caption)
+      TextField("Instruction the dot gets with each wake", text: draft.task, axis: .vertical)
+        .lineLimit(2...6)
+        .accessibilityIdentifier("trigger-task")
+      Text("Saving makes a draft for you to review and preview. Nothing runs until you enable it.")
+        .font(.caption2).foregroundStyle(.secondary)
+      HStack {
+        Spacer()
+        Button("Cancel") { store.memories[dot]?.triggerDraft.open = false }
+        Button(saving ? "Saving…" : "Save Draft") { store.createTrigger(dot) }
+          .disabled(saving)
+          .accessibilityIdentifier("trigger-save")
+      }
+      .buttonStyle(.plain)
+      .font(.caption.weight(.semibold))
+    }
+    .padding(8)
+    .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.05)))
+  }
+}
+
+/// One feed trigger: its exact filter and instruction, its last wake and skips, and the owner's
+/// preview, enable or resume, pause and revoke. Every change asks first.
+struct TriggerRow: View {
+  let store: Store
+  let dot: String
+  let trigger: FeedTrigger
+  let goal: String?
+
+  var body: some View {
+    let busy = store.memories[dot]?.triggering.contains(trigger.id) == true
+    VStack(alignment: .leading, spacing: 4) {
+      HStack(alignment: .firstTextBaseline) {
+        Text(verbatim: "\(trigger.repository) · \(trigger.reasons.joined(separator: ", "))")
+          .font(.callout.weight(.medium)).textSelection(.enabled)
+        Spacer()
+        Text(trigger.state == "draft" ? "Draft, not enabled" : trigger.state == "paused" ? "Paused" : "Active")
+          .font(.caption2)
+          .foregroundStyle(trigger.state == "active" ? AnyShapeStyle(.green) : AnyShapeStyle(.secondary))
+      }
+      Text(verbatim: "Wakes \(dot) about responsibility #\(trigger.responsibility)\(goal.map { ": \($0)" } ?? "")")
+        .font(.caption).foregroundStyle(.secondary)
+      Text(verbatim: trigger.task).font(.caption).textSelection(.enabled)
+        .accessibilityIdentifier("trigger-task-\(trigger.id)")
+      Text(verbatim: triggerSummary(trigger)).font(.caption2).foregroundStyle(.tertiary).textSelection(.enabled)
+        .accessibilityIdentifier("trigger-summary-\(trigger.id)")
+      if let wake = trigger.lastWake {
+        DisclosureGroup("Last wake") {
+          VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(wake.events.enumerated()), id: \.offset) { _, event in
+              Text(verbatim: "\(event.title) · \(event.reason)").font(.caption2).textSelection(.enabled)
+            }
+            Text(verbatim: wake.messageID).font(.caption2.monospaced()).foregroundStyle(.tertiary).textSelection(.enabled)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.caption2)
+        .accessibilityIdentifier("trigger-last-wake-\(trigger.id)")
+      }
+      if !trigger.skipped.isEmpty {
+        DisclosureGroup("Skipped (\(trigger.skippedCount))") {
+          VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(trigger.skipped.enumerated()), id: \.offset) { _, skip in
+              Text(verbatim: "\(skip.event.title): \(skip.reason ?? "skipped"), \(ago(skip.at))")
+                .font(.caption2).textSelection(.enabled)
+            }
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.caption2)
+        .accessibilityIdentifier("trigger-skipped-\(trigger.id)")
+      }
+      preview
+      HStack(spacing: 10) {
+        Spacer()
+        if busy {
+          Text("Saving…").font(.caption2).foregroundStyle(.secondary)
+        } else {
+          if store.memories[dot]?.previews[trigger.id] == nil {
+            Button("Preview") { store.previewTrigger(dot, trigger) }
+              .accessibilityIdentifier("trigger-preview-\(trigger.id)")
+          } else {
+            Button("Hide Preview") { store.memories[dot]?.previews[trigger.id] = nil }
+          }
+          if trigger.state == "active" {
+            Button("Pause…") { confirm(.pause) }
+              .accessibilityIdentifier("trigger-pause-\(trigger.id)")
+          } else {
+            Button(trigger.state == "paused" ? "Resume…" : "Enable…") { confirm(.enable) }
+              .accessibilityIdentifier("trigger-enable-\(trigger.id)")
+          }
+          Button(trigger.state == "draft" ? "Discard…" : "Revoke…") { confirm(.revoke) }
+            .accessibilityIdentifier("trigger-revoke-\(trigger.id)")
+        }
+      }
+      .buttonStyle(.plain)
+      .font(.caption2.weight(.semibold))
+    }
+    .padding(8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.05)))
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("memory-trigger-\(trigger.id)")
+  }
+
+  /// The saved events the filter matches, as GitHub's data in plain text, and the exact wake text.
+  @ViewBuilder private var preview: some View {
+    switch store.memories[dot]?.previews[trigger.id] {
+    case .loading?:
+      Text("Reading the saved feed…").font(.caption2).foregroundStyle(.secondary)
+    case .failed(let message)?:
+      Text(verbatim: "\(message) · click to close").font(.caption2).foregroundStyle(.red)
+        .onTapGesture { store.memories[dot]?.previews[trigger.id] = nil }
+    case .loaded(let read)?:
+      VStack(alignment: .leading, spacing: 4) {
+        Text(verbatim: read.total == 0
+          ? "No saved feed event matches yet. Previewing queued nothing."
+          : "\(read.total) saved feed \(read.total == 1 ? "event matches" : "events match"), newest first. Previewing queued nothing.")
+          .font(.caption2).foregroundStyle(.secondary)
+        ForEach(Array(read.matches.enumerated()), id: \.offset) { _, match in
+          Text(verbatim: "\(match.event.title) · \(match.event.reason) · \(triggerOutcome(match))")
+            .font(.caption2).textSelection(.enabled)
+        }
+        if let sample = read.sample {
+          Text("The wake about the newest would read exactly:").font(.caption2).foregroundStyle(.tertiary)
+          Text(verbatim: sample).font(.caption2.monospaced()).textSelection(.enabled)
+            .accessibilityIdentifier("trigger-sample-\(trigger.id)")
+        }
+      }
+      .padding(6)
+      .background(RoundedRectangle(cornerRadius: 8).fill(.white.opacity(0.04)))
+    case nil:
+      EmptyView()
+    }
+  }
+
+  /// Asks first, with Cancel as the default for Return and Escape. Enabling shows the exact
+  /// filter, destination and instruction, and sends the revision shown.
+  private func confirm(_ action: TriggerAction) {
+    let alert = NSAlert()
+    switch action {
+    case .enable:
+      let resume = trigger.state == "paused"
+      alert.messageText = resume ? "Resume this feed trigger?" : "Enable this feed trigger?"
+      alert.informativeText = triggerConfirmation(trigger, dot: dot, goal: goal)
+      alert.addButton(withTitle: "Cancel")
+      alert.addButton(withTitle: resume ? "Resume" : "Enable")
+    case .pause:
+      alert.messageText = "Pause this feed trigger?"
+      alert.informativeText = "Wakes not yet sent are cancelled. Activity while it's paused never runs, even after you resume it."
+      alert.addButton(withTitle: "Cancel")
+      alert.addButton(withTitle: "Pause")
+    case .revoke:
+      alert.messageText = trigger.state == "draft" ? "Discard this draft?" : "Revoke this feed trigger?"
+      alert.informativeText = "Wakes not yet sent are cancelled. To use it again, create a new trigger."
+      alert.addButton(withTitle: "Cancel")
+      alert.addButton(withTitle: trigger.state == "draft" ? "Discard" : "Revoke").hasDestructiveAction = true
+    }
+    guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
+    store.changeTrigger(dot, trigger, action)
   }
 }
