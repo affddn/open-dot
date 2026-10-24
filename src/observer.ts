@@ -526,21 +526,26 @@ const start = (db: Db, job: ObserverJob) =>
         release(db, started);
       return;
     }
-    // Checked again just before the model call, and the call charged twice its estimate before
-    // it's made, so a call whose outcome is lost still counts.
-    // The charge and its time are saved immediately before the call, so the call counts on the
-    // day it's made; reaching the budget with it stops the rest of that day.
-    const late = blocked(db, started, prompt.from, prompt.estimate);
-    const callAt = Date.now();
-    const charged =
-      !late &&
-      db
-        .update(observerJobs)
-        .set({ charged: 2 * prompt.estimate, chargedAt: callAt, updatedAt: callAt })
-        .where(and(eq(observerJobs.id, job.id), eq(observerJobs.state, "started")))
-        .returning()
-        .get();
-    if (charged) stopped(db, job.dot, callAt);
+    // Checked again just before the model call, against the budget as it is in this same
+    // transaction, which saves twice the estimate as the call's charge, with its time, and the
+    // day's stop if that charge reaches the budget: all of it, or none. So a call whose outcome
+    // is lost still counts, on the day it's made.
+    const { late, charged } = db.transaction(
+      (tx) => {
+        const lastCheck = blocked(db, started, prompt.from, prompt.estimate);
+        if (lastCheck) return { late: lastCheck, charged: undefined };
+        const callAt = Date.now();
+        const saved = tx
+          .update(observerJobs)
+          .set({ charged: 2 * prompt.estimate, chargedAt: callAt, updatedAt: callAt })
+          .where(and(eq(observerJobs.id, job.id), eq(observerJobs.state, "started")))
+          .returning()
+          .get();
+        if (saved) stopped(db, job.dot, callAt);
+        return { late: undefined, charged: saved };
+      },
+      { behavior: "immediate" },
+    );
     if (!charged) {
       if (finish(db, started, "cancelled", late ?? "Changed before its prompt; nothing was sent."))
         release(db, started);
@@ -617,19 +622,24 @@ const poll = (db: Db, job: ObserverJob) =>
     // meanwhile: a cost already known is always recorded, and stops the rest of the day once
     // today's total reaches the budget. A sum that may be short keeps that charge on top. Only
     // then is the answer used, and only while the job is still wanted.
-    if (usage) {
-      const total =
-        usage.input + usage.output + usage.reasoning + usage.cacheRead + usage.cacheWrite;
-      db.update(observerJobs)
-        .set({
-          used: total - usage.cacheRead,
-          cached: usage.cacheRead,
-          charged: usage.complete ? total : total + 2 * job.estimate,
-        })
-        .where(eq(observerJobs.id, job.id))
-        .run();
-      stopped(db, job.dot, Date.now());
-    }
+    // The cost and the day's stop are saved in one transaction: both, or neither.
+    if (usage)
+      db.transaction(
+        (tx) => {
+          const total =
+            usage.input + usage.output + usage.reasoning + usage.cacheRead + usage.cacheWrite;
+          tx.update(observerJobs)
+            .set({
+              used: total - usage.cacheRead,
+              cached: usage.cacheRead,
+              charged: usage.complete ? total : total + 2 * job.estimate,
+            })
+            .where(eq(observerJobs.id, job.id))
+            .run();
+          stopped(db, job.dot, Date.now());
+        },
+        { behavior: "immediate" },
+      );
     if (!wanted(db, job, "running")) {
       stale();
       return;

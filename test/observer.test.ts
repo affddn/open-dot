@@ -1383,3 +1383,104 @@ test("the latest completed compaction is found past any number of running or fai
   );
   expect(Exit.isFailure(broken)).toBe(true);
 });
+
+/** Makes saving the day's stop fail, as a crash just before it would leave the rest undone. */
+const failStop = () =>
+  db.$client.run(
+    "CREATE TRIGGER inject_stop BEFORE UPDATE OF stopped_day ON ledger_state WHEN NEW.stopped_day IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected failure before the stop'); END",
+  );
+const allowStop = () => db.$client.run("DROP TRIGGER inject_stop");
+
+test("a call's charge and the day's stop it reaches are saved together or not at all", async () => {
+  observerOn();
+  enough();
+  work();
+  const estimate = observerPrompt(db, jobs()[0] as ObserverJob).estimate;
+  saveArchiveSettings(db, "jojo", { observerDailyTokens: 2 * estimate }, 2);
+  fake.state.onPrompt = () => {};
+  failStop();
+  // The failure lands between the charge and the stop: neither is saved, and nothing is sent.
+  expect(
+    await pass().then(
+      () => "saved",
+      () => "failed",
+    ),
+  ).toBe("failed");
+  expect(jobs()[0]).toMatchObject({ state: "started", charged: null, chargedAt: null });
+  expect(stateOf(db, "jojo").stoppedDay).toBeNull();
+  expect(fake.state.prompted).toEqual([]);
+  // After a restart its outcome is unknown, never sent again; nothing was spent.
+  allowStop();
+  fake = fakeOpenCode();
+  await pass();
+  expect(jobs()[0]?.state).toBe("unknown");
+  expect(fake.state.prompted).toEqual([]);
+  // An unknown job keeps its dot busy for two hours; let that pass.
+  db.update(observerJobs)
+    .set({ startedAt: Date.now() - 3 * 60 * 60_000 })
+    .where(eq(observerJobs.id, 1))
+    .run();
+  // The next call's charge reaches the budget: charge and stop are saved together, so raising
+  // the budget, or a restart, doesn't bring a second call today.
+  message(`more ${"t".repeat(tokenJobChars)}`);
+  work();
+  saveArchiveSettings(
+    db,
+    "jojo",
+    { observerDailyTokens: 2 * observerPrompt(db, jobs().at(-1) as ObserverJob).estimate },
+    3,
+  );
+  fake.state.onPrompt = () => {};
+  await pass();
+  expect(jobs().at(-1)).toMatchObject({ state: "running" });
+  expect(stateOf(db, "jojo").stoppedDay).toBe(dayStart(Date.now()));
+  saveArchiveSettings(db, "jojo", { observerDailyTokens: 2_000_000 }, 4);
+  db.update(observerJobs).set({ state: "done" }).run();
+  message(`again ${"u".repeat(tokenJobChars)}`);
+  fake = fakeOpenCode();
+  work();
+  await pass();
+  expect(fake.state.prompted).toEqual([]);
+  expect(jobs().at(-1)?.error).toBe(
+    "Today's budget is used up; the observer stops until tomorrow.",
+  );
+});
+
+test("a reported cost and the day's stop it reaches are saved together or not at all", async () => {
+  const job = await runningJob();
+  const budget = settingsOf(db, "jojo").observerDailyTokens;
+  fake.state.messageTurns.set(job.promptMessage ?? "", succeeded);
+  fake.state.usage.set(job.scratchSession ?? "", reported(budget + 1_000));
+  failStop();
+  expect(
+    await pass().then(
+      () => "saved",
+      () => "failed",
+    ),
+  ).toBe("failed");
+  // Neither the cost nor the stop: the charge made before the call stays, and the job runs on.
+  expect(jobs()[0]).toMatchObject({
+    state: "running",
+    used: null,
+    cached: null,
+    charged: 2 * job.estimate,
+  });
+  expect(stateOf(db, "jojo").stoppedDay).toBeNull();
+  // The next pass, after a restart, saves both; then a raised budget doesn't lift the stop.
+  allowStop();
+  const restarted = fakeOpenCode();
+  restarted.state.messageTurns = fake.state.messageTurns;
+  restarted.state.usage = fake.state.usage;
+  fake = restarted;
+  await pass();
+  expect(jobs()[0]).toMatchObject({ state: "done", charged: budget + 1_000 });
+  expect(stateOf(db, "jojo").stoppedDay).toBe(dayStart(Date.now()));
+  saveArchiveSettings(db, "jojo", { observerDailyTokens: 2_000_000 }, 5);
+  message(`more ${"v".repeat(tokenJobChars)}`);
+  work();
+  await pass();
+  expect(fake.state.prompted).toEqual([]);
+  expect(jobs().at(-1)?.error).toBe(
+    "Today's budget is used up; the observer stops until tomorrow.",
+  );
+});
