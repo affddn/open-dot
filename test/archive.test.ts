@@ -309,6 +309,11 @@ test("the owner's API shows and changes the archive switches", async () => {
   expect(status).toMatchObject({ archive: true, backfill: false, sessionID: "ses_jojo" });
   expect(status.since).toBeGreaterThan(0);
   expect((await request("DELETE")).status).toBe(404);
+  // Automatic recall is its own switch, off until the owner turns it on.
+  expect(status).toMatchObject({ autoRecall: false });
+  expect((await request("PUT", '{"autoRecall":1}')).status).toBe(400);
+  const recalling = await request("PUT", '{"autoRecall":true}');
+  expect(await recalling.json()).toMatchObject({ archive: true, autoRecall: true });
   expect(fake.state.pages).toEqual([]);
 });
 

@@ -1729,3 +1729,66 @@ test("0030 adds the archive and an index of every note, kept by triggers for leg
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("0031 appends only auto_recall, off, to memory_settings and keeps every 0030 row", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-auto-recall-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0031");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run(
+    "insert into memory_settings (dot,archive,backfill,archive_since,updated_at) values ('jojo',1,0,5,5)",
+  );
+  old.run(
+    "insert into archive (dot,session_id,message_id,role,text,created_at,archived_at) values ('jojo','ses_jojo','msg_1','owner','Lisbon budget',5,6)",
+  );
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [
+      name,
+      sqlite
+        .query<Record<string, unknown>, []>(`select * from "${name}"`)
+        .all()
+        .map(({ auto_recall: _added, ...rest }) => rest),
+    ]);
+  const before = rows(old);
+  const ledger = ledgerOf(old);
+  const triggers = old
+    .query("select name, sql from sqlite_master where type='trigger' order by name")
+    .all();
+  old.close();
+  const db = openDatabase(path);
+  try {
+    expect(tableNames(db.$client)).toEqual(tables);
+    for (const name of tables) {
+      const after = db.$client.query(`pragma table_info("${name}")`).all();
+      const was = columns.get(name) ?? [];
+      expect(after.slice(0, was.length)).toEqual(was);
+      expect(after.length - was.length).toBe(name === "memory_settings" ? 1 : 0);
+    }
+    expect(rows(db.$client)).toEqual(before);
+    expect(db.$client.query("select auto_recall from memory_settings").all()).toEqual([
+      { auto_recall: 0 },
+    ]);
+    expect(
+      db.$client
+        .query("select name, sql from sqlite_master where type='trigger' order by name")
+        .all(),
+    ).toEqual(triggers);
+    expectLedger(db.$client, ledger, "0031");
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

@@ -298,7 +298,8 @@ export type Note = typeof notes.$inferSelect;
 /**
  * The owner's memory switches for a dot. A dot without a row has every layer off. `archive` lets
  * the daemon copy the bound conversation's owner and dot text into `archive`; without `backfill`
- * only messages from `archive_since` on are copied.
+ * only messages from `archive_since` on are copied. `auto_recall` (migration 0031) adds strong
+ * archive matches for the owner's latest message to the dot's memory each request.
  */
 export const memorySettings = sqliteTable("memory_settings", {
   dot: text()
@@ -309,6 +310,8 @@ export const memorySettings = sqliteTable("memory_settings", {
   // When the archive was last switched on; earlier messages are copied only with backfill.
   archiveSince: integer("archive_since"),
   updatedAt: integer("updated_at").notNull(),
+  // Each request with a new owner message gets up to three strong archive matches at its tail.
+  autoRecall: integer("auto_recall", { mode: "boolean" }).notNull().default(false),
 });
 
 /** An assistant message the walk saw unfinished, read again by ID until it's done. */

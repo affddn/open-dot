@@ -66,9 +66,9 @@ export const fold = (text: string) => {
 };
 
 /** Up to 160 characters of the note around its first match, on one line. */
-export const snippet = (text: string, start: number) => {
-  let from = Math.max(0, Math.min(start - 60, text.length - snippetLength));
-  let to = Math.min(text.length, from + snippetLength);
+export const snippet = (text: string, start: number, length = snippetLength) => {
+  let from = Math.max(0, Math.min(start - Math.floor(length * 0.375), text.length - length));
+  let to = Math.min(text.length, from + length);
   // Never split a surrogate pair.
   if (from > 0 && /[\uDC00-\uDFFF]/.test(text[from] ?? "")) from--;
   if (to < text.length && /[\uDC00-\uDFFF]/.test(text[to] ?? "")) to++;

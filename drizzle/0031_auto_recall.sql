@@ -1,0 +1,1 @@
+ALTER TABLE `memory_settings` ADD `auto_recall` integer DEFAULT false NOT NULL;

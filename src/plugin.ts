@@ -4,7 +4,17 @@ import { Session, SessionMessage } from "@opencode/client/effect";
 import { Plugin } from "@opencode/plugin";
 import { and, asc, count, desc, eq, gt, isNull, ne, or } from "drizzle-orm";
 import { Schema } from "effect";
-import { recall, recallDefault, recallLimit, recallOffsetLimit, zoom, zoomLength } from "./archive";
+import {
+  autoRecall,
+  recall,
+  recallDefault,
+  recalledBlock,
+  recallLimit,
+  recallOffsetLimit,
+  settingsOf,
+  zoom,
+  zoomLength,
+} from "./archive";
 import { type Db, openDatabase } from "./db";
 import { unreadFeed } from "./feed";
 import { databasePath, outputDirectory, workDirectory, worktreeDirectory } from "./home";
@@ -39,6 +49,7 @@ import {
   systemTimeZone,
 } from "./schedule";
 import {
+  type Dot,
   dots,
   type FeedItem,
   notes,
@@ -1073,6 +1084,40 @@ ${dataJSON(part)}
       });
     });
 
+    /**
+     * Automatic recall for the owner's latest message in the current turn: the newest owner
+     * message since the last turn end in public context, or none for a wake, a notice or another
+     * dot's message. One owner message gets one block, reused on every request of its turn, held
+     * only in memory. Its hits skip every message the context shows. No model call is made.
+     */
+    let recalled: { readonly key: string; readonly text: string } | undefined;
+    const recallFor = (
+      binding: Dot,
+      items: readonly { readonly id: string; readonly type: string; readonly text?: string }[],
+    ) => {
+      const switches = settingsOf(db, name);
+      if (!switches.archive || !switches.autoRecall) return "";
+      const turn = items.slice(items.findLastIndex((item) => item.type === "idle") + 1);
+      const users = turn.filter((item) => item.type === "user");
+      const sources = messageSources(
+        db,
+        binding.sessionID,
+        users.map((item) => item.id),
+      );
+      const latest = users.findLast(
+        (item) => messageKind("user", sources.get(item.id)) === "owner",
+      );
+      if (!latest) return "";
+      const key = `${binding.sessionID}\n${latest.id}`;
+      if (recalled?.key === key) return recalled.text;
+      const source = sources.get(latest.id);
+      const own =
+        source?.quote?.prompt ?? source?.feed?.prompt ?? source?.ownerText ?? latest.text ?? "";
+      const visible = new Set(items.map((item) => item.id));
+      recalled = { key, text: recalledBlock(autoRecall(db, binding, own, visible)) };
+      return recalled.text;
+    };
+
     // Memory goes near the tail on each request, like OpenCode's own reminders. In the system
     // prompt, the dot kept answering from its first turn's memory, and every change busted the cache.
     await context.session.hook("context", async (event) => {
@@ -1080,11 +1125,12 @@ ${dataJSON(part)}
       if (event.sessionID !== binding?.sessionID) return;
       const current = bound(event.sessionID);
       let feedback = "";
+      let recalledTail = "";
       if (current) {
-        const history = (await context.session.context({ sessionID: current.sessionID })).slice(
-          -100,
-        );
+        const items = await context.session.context({ sessionID: current.sessionID });
         if (!bound(event.sessionID)) return;
+        recalledTail = recallFor(current, items);
+        const history = items.slice(-100);
         const sources = messageSources(
           db,
           current.sessionID,
@@ -1120,7 +1166,7 @@ ${snapshot}
         event.messages.at(-1)?.role === "user" ? event.messages.length - 1 : event.messages.length;
       event.messages.splice(at, 0, {
         role: "user",
-        content: [{ type: "text", text: memory(db, name) + feedback }],
+        content: [{ type: "text", text: memory(db, name) + feedback + recalledTail }],
       });
     });
 
