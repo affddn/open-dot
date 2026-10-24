@@ -302,6 +302,10 @@ struct MessageWindow: Equatable {
   var exportingArtifacts: Set<Int> = []
   var libraryNotices: [Int: String] = [:]
   var memories: [String: MemoryState] = [:]
+  /// Observation sources the owner opened, by "dot/observation/message": the read, or why it failed.
+  var observationSources: [String: Result<ObservationSourceRead, MemoryInvalid>] = [:]
+  /// Dots whose older observed rows are being read.
+  var loadingObservations: Set<String> = []
   /// Each dot's AGENTS.md editor, kept while the notch folds or another dot or view is shown.
   var instructions: [String: InstructionsState] = [:]
   var thumbnails: [AttachmentKey: NSImage] = [:]
@@ -1281,6 +1285,29 @@ struct MessageWindow: Equatable {
     }
   }
 
+  /// Reads the next older page of observed rows and appends what isn't shown yet. It only reads;
+  /// a refresh shows the newest page again.
+  func loadOlderObservations(_ name: String) {
+    guard let before = memories[name]?.memory?.observationsNext, loadingObservations.insert(name).inserted else { return }
+    Task {
+      defer { loadingObservations.remove(name) }
+      guard let page = try? await api.observations(name, before: before) else { return }
+      _ = memories[name]?.appendObservations(page, before: before)
+    }
+  }
+
+  /// Opens one source of an observation from the daemon's archive, as plain text. Never retried.
+  func openObservationSource(_ name: String, observation: Int, message: String) {
+    let key = "\(name)/\(observation)/\(message)"
+    Task {
+      do {
+        observationSources[key] = .success(try await api.observationSource(name, observation: observation, message: message))
+      } catch {
+        observationSources[key] = .failure(MemoryInvalid("Couldn't open it. \(Self.describe(error))"))
+      }
+    }
+  }
+
   /// Sends the edit at the version the owner started from. Nothing changed closes the editor.
   func saveMemory(_ name: String, _ key: MemoryKey) {
     guard let draft = memories[name]?.drafts[key] else { return }
@@ -1306,6 +1333,7 @@ struct MessageWindow: Equatable {
     switch item {
     case .note(let note): version = note.version
     case .reminder(let reminder): version = reminder.version
+    case .observation(let row): version = row.version
     case .responsibility: return
     }
     change(name, item.key, version: version, body: nil)

@@ -2,7 +2,7 @@ import {
   AbsolutePath,
   OpenCode as Client,
   Form,
-  type Model,
+  Model,
   Permission,
   Session,
   SessionMessage,
@@ -367,11 +367,16 @@ export interface Entry {
  */
 export interface HistoryItem {
   readonly id: string;
-  readonly type: "user" | "assistant" | "idle" | "other";
+  readonly type: "user" | "assistant" | "idle" | "compaction" | "other";
   readonly text: string;
-  /** False for an assistant message OpenCode hasn't finished, whose text may still grow. */
+  /**
+   * False for an assistant message OpenCode hasn't finished, whose text may still grow, or a
+   * compaction still running. A compaction's summary is never read.
+   */
   readonly complete: boolean;
   readonly time: number;
+  /** A completed compaction OpenCode kept as a provider's native window, not text. */
+  readonly native?: boolean;
 }
 
 const historyItem = (item: SessionMessage.Info): HistoryItem => {
@@ -386,6 +391,14 @@ const historyItem = (item: SessionMessage.Info): HistoryItem => {
         .join("\n")
         .trim(),
       complete: item.time.completed !== undefined,
+    };
+  if (item.type === "compaction")
+    return {
+      ...base,
+      type: "compaction",
+      text: "",
+      complete: item.status === "completed",
+      native: item.status === "completed" && item.native !== undefined,
     };
   return { ...base, type: item.type === "idle" ? "idle" : "other", text: "" };
 };
@@ -417,6 +430,107 @@ const entry = (item: SessionMessage.Info): Entry[] =>
           },
         ]
       : [];
+
+/**
+ * A session's token use, as OpenCode 2.1.1 records each assistant message's: uncached `input`,
+ * visible `output`, `reasoning`, and `cacheRead` and `cacheWrite`, which don't overlap, so their
+ * sum is OpenCode's own `TokenUsage.total`.
+ */
+export interface Usage {
+  readonly input: number;
+  readonly output: number;
+  readonly reasoning: number;
+  readonly cacheRead: number;
+  readonly cacheWrite: number;
+  /** False when a message hasn't finished, or reports no usage, so the sum may be short. */
+  readonly complete: boolean;
+}
+
+/** The most usage pages `sumUsage` reads before it gives up rather than undercount. */
+export const usagePageLimit = 50;
+
+/**
+ * Sums every assistant message's usage, following the public cursor page by page. A cursor given
+ * twice, or more pages than `usagePageLimit`, fails: an undercount is never returned as complete.
+ */
+export const sumUsage = <E>(
+  list: (cursor?: string) => Effect.Effect<
+    {
+      readonly items: readonly {
+        tokens?:
+          | {
+              readonly input: number;
+              readonly output: number;
+              readonly reasoning: number;
+              readonly cache: { readonly read: number; readonly write: number };
+            }
+          | undefined;
+        complete: boolean;
+      }[];
+      readonly next: string | undefined;
+    },
+    E
+  >,
+) =>
+  Effect.gen(function* () {
+    const total = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+    let complete = true;
+    let any = false;
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let pages = 0; pages < usagePageLimit; pages++) {
+      const page = yield* list(cursor);
+      for (const item of page.items) {
+        any = true;
+        if (!item.complete || !item.tokens) complete = false;
+        if (!item.tokens) continue;
+        total.input += item.tokens.input;
+        total.output += item.tokens.output;
+        total.reasoning += item.tokens.reasoning;
+        total.cacheRead += item.tokens.cache.read;
+        total.cacheWrite += item.tokens.cache.write;
+      }
+      if (!page.next || !page.items.length) return any ? { ...total, complete } : undefined;
+      if (seen.has(page.next))
+        return yield* new OpenCodeError({ message: "OpenCode returned a usage page twice" });
+      seen.add(page.next);
+      cursor = page.next;
+    }
+    return yield* new OpenCodeError({ message: "Too many messages to sum the usage of" });
+  });
+
+/** The most compaction pages `latestCompleted` reads before it gives up rather than guess. */
+export const compactionPageLimit = 100;
+
+/**
+ * The newest completed compaction, walking a session's compactions newest first, page by page,
+ * past running or failed ones. Undefined only when the history ends with none completed. A cursor
+ * given twice, or more pages than `compactionPageLimit`, fails: the mode is then unknown.
+ */
+export const latestCompleted = <E>(
+  list: (cursor?: string) => Effect.Effect<
+    {
+      readonly items: readonly { id: string; completed: boolean; native: boolean }[];
+      readonly next: string | undefined;
+    },
+    E
+  >,
+) =>
+  Effect.gen(function* () {
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let pages = 0; pages < compactionPageLimit; pages++) {
+      const page = yield* list(cursor);
+      const found = page.items.find((item) => item.completed);
+      if (found) return { id: found.id, native: found.native };
+      if (!page.next || !page.items.length) return undefined;
+      if (seen.has(page.next))
+        return yield* new OpenCodeError({ message: "OpenCode returned a compaction page twice" });
+      seen.add(page.next);
+      cursor = page.next;
+    }
+    return yield* new OpenCodeError({ message: "Too many compactions to find the latest" });
+  });
 
 /** The few OpenCode calls open-dot makes. Absence is a value, every other failure is an OpenCodeError. */
 export class OpenCode extends Context.Service<
@@ -483,6 +597,30 @@ export class OpenCode extends Context.Service<
       limit: number,
       cursor?: string,
     ) => Effect.Effect<{ items: readonly HistoryItem[]; next: string | undefined }, OpenCodeError>;
+    /**
+     * Creates an observer's scratch session with the caller's ID, in a directory that isn't a
+     * dot's, with the owner's configured `provider/model`, and every tool denied.
+     */
+    readonly createScratch: (input: {
+      readonly id: string;
+      readonly directory: string;
+      readonly title: string;
+      readonly model: string;
+    }) => Effect.Effect<void, OpenCodeError>;
+    /** The session's latest completed compaction, or undefined when it has none. */
+    readonly latestCompaction: (
+      sessionID: string,
+    ) => Effect.Effect<
+      { readonly id: string; readonly native: boolean } | undefined,
+      OpenCodeError
+    >;
+    /**
+     * What all of a session's assistant messages report using, read page by page: OpenCode's
+     * five disjoint counts, uncached input, visible output, reasoning, cache reads and cache
+     * writes. `complete` is false when a message is unfinished or reports nothing. Undefined
+     * when the session has no assistant message.
+     */
+    readonly usage: (sessionID: string) => Effect.Effect<Usage | undefined, OpenCodeError>;
     /** One history item by ID, or undefined once OpenCode doesn't have it. */
     readonly historyItem: (
       ref: MessageRef,
@@ -813,6 +951,76 @@ export class OpenCode extends Context.Service<
               })),
               Effect.mapError(failed(`Could not read session ${sessionID}`)),
             ),
+        createScratch: ({ id, directory, title, model }) =>
+          Effect.try(() => Model.Ref.parse(model)).pipe(
+            Effect.flatMap((ref) =>
+              client.session.create({
+                id: Session.ID.make(id),
+                title,
+                model: ref,
+                location: { directory: AbsolutePath.make(directory) },
+                permissions: [{ action: "*", resource: "*", effect: "deny" as const }],
+              }),
+            ),
+            Effect.asVoid,
+            Effect.mapError(failed(`Could not create session ${id}`)),
+          ),
+        latestCompaction: (sessionID) =>
+          latestCompleted((cursor) =>
+            client.message
+              .list(
+                cursor
+                  ? { sessionID: Session.ID.make(sessionID), cursor, limit: 50, type: "compaction" }
+                  : {
+                      sessionID: Session.ID.make(sessionID),
+                      order: "desc",
+                      limit: 50,
+                      type: "compaction",
+                    },
+              )
+              .pipe(
+                Effect.map((page) => ({
+                  items: page.data.flatMap((item) =>
+                    item.type === "compaction"
+                      ? [
+                          {
+                            id: item.id,
+                            completed: item.status === "completed",
+                            native: item.status === "completed" && item.native !== undefined,
+                          },
+                        ]
+                      : [],
+                  ),
+                  next: page.data.length ? page.cursor.next : undefined,
+                })),
+                Effect.mapError(failed(`Could not read session ${sessionID}`)),
+              ),
+          ),
+        usage: (sessionID) =>
+          sumUsage((cursor) =>
+            client.message
+              .list(
+                cursor
+                  ? { sessionID: Session.ID.make(sessionID), cursor, limit: 200, type: "assistant" }
+                  : {
+                      sessionID: Session.ID.make(sessionID),
+                      order: "asc",
+                      limit: 200,
+                      type: "assistant",
+                    },
+              )
+              .pipe(
+                Effect.map((page) => ({
+                  items: page.data.flatMap((item) =>
+                    item.type === "assistant"
+                      ? [{ tokens: item.tokens, complete: item.time.completed !== undefined }]
+                      : [],
+                  ),
+                  next: page.data.length ? page.cursor.next : undefined,
+                })),
+                Effect.mapError(failed(`Could not read session ${sessionID}`)),
+              ),
+          ),
         historyItem: ({ sessionID, messageID }) =>
           client.session.message
             .get({

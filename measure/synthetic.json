@@ -1,0 +1,3074 @@
+{
+  "synthetic": true,
+  "description": "Entirely synthetic conversation and questions about a fictional project, Orchard. No real person, company or fact is described. Use it only to check the harness; real measurement needs a private fixture made from real early facts after some real use.",
+  "dot": "measure",
+  "sessionID": "ses_measure",
+  "visibleTail": 40,
+  "summary": "## Conversation summary (synthetic, frozen)\n- Working on the fictional project Orchard with the dot.\n- The design system is named Quince.\n- The incident channel is #orchard-fire.\n- Status updates should be bullet points.\n- Routine requests about the calendar, replies and reminders.",
+  "messages": [
+    {
+      "id": "msg_syn_0001",
+      "role": "owner",
+      "text": "The staging database for Orchard is called pear-staging.",
+      "time": 1060000
+    },
+    {
+      "id": "msg_syn_0002",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 1120000
+    },
+    {
+      "id": "msg_syn_0003",
+      "role": "owner",
+      "text": "We picked Fastify over Express for the Orchard API.",
+      "time": 1180000
+    },
+    {
+      "id": "msg_syn_0004",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 1240000
+    },
+    {
+      "id": "msg_syn_0005",
+      "role": "owner",
+      "text": "The Orchard launch date is the 14th of March.",
+      "time": 1300000
+    },
+    {
+      "id": "msg_syn_0006",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 1360000
+    },
+    {
+      "id": "msg_syn_0007",
+      "role": "owner",
+      "text": "Marisol owns the billing migration.",
+      "time": 1420000
+    },
+    {
+      "id": "msg_syn_0008",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 1480000
+    },
+    {
+      "id": "msg_syn_0009",
+      "role": "owner",
+      "text": "Invoices must be kept for seven years.",
+      "time": 1540000
+    },
+    {
+      "id": "msg_syn_0010",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 1600000
+    },
+    {
+      "id": "msg_syn_0011",
+      "role": "owner",
+      "text": "I prefer weekly summaries on Friday afternoons.",
+      "time": 1660000
+    },
+    {
+      "id": "msg_syn_0012",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 1720000
+    },
+    {
+      "id": "msg_syn_0013",
+      "role": "owner",
+      "text": "Never schedule meetings before 10am for me.",
+      "time": 1780000
+    },
+    {
+      "id": "msg_syn_0014",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 1840000
+    },
+    {
+      "id": "msg_syn_0015",
+      "role": "owner",
+      "text": "The design system is named Quince.",
+      "time": 1900000
+    },
+    {
+      "id": "msg_syn_0016",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 1960000
+    },
+    {
+      "id": "msg_syn_0017",
+      "role": "owner",
+      "text": "Rate limits for the public API are 600 requests per minute.",
+      "time": 2020000
+    },
+    {
+      "id": "msg_syn_0018",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 2080000
+    },
+    {
+      "id": "msg_syn_0019",
+      "role": "owner",
+      "text": "We decided to drop support for Internet Explorer.",
+      "time": 2140000
+    },
+    {
+      "id": "msg_syn_0020",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 2200000
+    },
+    {
+      "id": "msg_syn_0021",
+      "role": "owner",
+      "text": "The mobile app will use React Native, not Flutter.",
+      "time": 2260000
+    },
+    {
+      "id": "msg_syn_0022",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 2320000
+    },
+    {
+      "id": "msg_syn_0023",
+      "role": "owner",
+      "text": "Our on-call rotation changes every Tuesday.",
+      "time": 2380000
+    },
+    {
+      "id": "msg_syn_0024",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 2440000
+    },
+    {
+      "id": "msg_syn_0025",
+      "role": "owner",
+      "text": "The quarterly offsite is in Lisbon this year.",
+      "time": 2500000
+    },
+    {
+      "id": "msg_syn_0026",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 2560000
+    },
+    {
+      "id": "msg_syn_0027",
+      "role": "owner",
+      "text": "Use the plum bucket for analytics exports.",
+      "time": 2620000
+    },
+    {
+      "id": "msg_syn_0028",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 2680000
+    },
+    {
+      "id": "msg_syn_0029",
+      "role": "owner",
+      "text": "My manager is Teodora.",
+      "time": 2740000
+    },
+    {
+      "id": "msg_syn_0030",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 2800000
+    },
+    {
+      "id": "msg_syn_0031",
+      "role": "owner",
+      "text": "Feature flags live in LaunchDarkly project orchard-flags.",
+      "time": 2860000
+    },
+    {
+      "id": "msg_syn_0032",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 2920000
+    },
+    {
+      "id": "msg_syn_0033",
+      "role": "owner",
+      "text": "The search index rebuild runs nightly at 02:30.",
+      "time": 2980000
+    },
+    {
+      "id": "msg_syn_0034",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 3040000
+    },
+    {
+      "id": "msg_syn_0035",
+      "role": "owner",
+      "text": "We agreed the error budget is 0.5 percent per month.",
+      "time": 3100000
+    },
+    {
+      "id": "msg_syn_0036",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 3160000
+    },
+    {
+      "id": "msg_syn_0037",
+      "role": "owner",
+      "text": "I'm allergic to peanuts, remember for team lunches.",
+      "time": 3220000
+    },
+    {
+      "id": "msg_syn_0038",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 3280000
+    },
+    {
+      "id": "msg_syn_0039",
+      "role": "owner",
+      "text": "The customer pilot is with Brightwater Logistics.",
+      "time": 3340000
+    },
+    {
+      "id": "msg_syn_0040",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 3400000
+    },
+    {
+      "id": "msg_syn_0041",
+      "role": "owner",
+      "text": "Budget for contractors is capped at 30k per quarter.",
+      "time": 3460000
+    },
+    {
+      "id": "msg_syn_0042",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 3520000
+    },
+    {
+      "id": "msg_syn_0043",
+      "role": "owner",
+      "text": "The old CRM gets switched off on June 30th.",
+      "time": 3580000
+    },
+    {
+      "id": "msg_syn_0044",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 3640000
+    },
+    {
+      "id": "msg_syn_0045",
+      "role": "owner",
+      "text": "We will write release notes in Notion, not Confluence.",
+      "time": 3700000
+    },
+    {
+      "id": "msg_syn_0046",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 3760000
+    },
+    {
+      "id": "msg_syn_0047",
+      "role": "owner",
+      "text": "The incident channel is #orchard-fire.",
+      "time": 3820000
+    },
+    {
+      "id": "msg_syn_0048",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 3880000
+    },
+    {
+      "id": "msg_syn_0049",
+      "role": "owner",
+      "text": "Password rotation for service accounts happens every 90 days.",
+      "time": 3940000
+    },
+    {
+      "id": "msg_syn_0050",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 4000000
+    },
+    {
+      "id": "msg_syn_0051",
+      "role": "owner",
+      "text": "Kenji is the security reviewer for Orchard.",
+      "time": 4060000
+    },
+    {
+      "id": "msg_syn_0052",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 4120000
+    },
+    {
+      "id": "msg_syn_0053",
+      "role": "owner",
+      "text": "The data warehouse moved to Snowflake in spring.",
+      "time": 4180000
+    },
+    {
+      "id": "msg_syn_0054",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 4240000
+    },
+    {
+      "id": "msg_syn_0055",
+      "role": "owner",
+      "text": "I want code reviews within one business day.",
+      "time": 4300000
+    },
+    {
+      "id": "msg_syn_0056",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 4360000
+    },
+    {
+      "id": "msg_syn_0057",
+      "role": "owner",
+      "text": "The pricing page experiment uses three tiers.",
+      "time": 4420000
+    },
+    {
+      "id": "msg_syn_0058",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 4480000
+    },
+    {
+      "id": "msg_syn_0059",
+      "role": "owner",
+      "text": "Open question: should Orchard support SSO at launch?",
+      "time": 4540000
+    },
+    {
+      "id": "msg_syn_0060",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 4600000
+    },
+    {
+      "id": "msg_syn_0061",
+      "role": "owner",
+      "text": "The demo account email is demo@orchard.example.",
+      "time": 4660000
+    },
+    {
+      "id": "msg_syn_0062",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 4720000
+    },
+    {
+      "id": "msg_syn_0063",
+      "role": "owner",
+      "text": "The design review happens on alternate Wednesdays.",
+      "time": 4780000
+    },
+    {
+      "id": "msg_syn_0064",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 4840000
+    },
+    {
+      "id": "msg_syn_0065",
+      "role": "owner",
+      "text": "We committed to a 99.9 percent uptime SLA.",
+      "time": 4900000
+    },
+    {
+      "id": "msg_syn_0066",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 4960000
+    },
+    {
+      "id": "msg_syn_0067",
+      "role": "owner",
+      "text": "Lunch-and-learn talks are recorded and kept for a year.",
+      "time": 5020000
+    },
+    {
+      "id": "msg_syn_0068",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 5080000
+    },
+    {
+      "id": "msg_syn_0069",
+      "role": "owner",
+      "text": "The Orchard logo color is deep teal.",
+      "time": 5140000
+    },
+    {
+      "id": "msg_syn_0070",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 5200000
+    },
+    {
+      "id": "msg_syn_0071",
+      "role": "owner",
+      "text": "Backups are tested on the first Monday of each month.",
+      "time": 5260000
+    },
+    {
+      "id": "msg_syn_0072",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 5320000
+    },
+    {
+      "id": "msg_syn_0073",
+      "role": "owner",
+      "text": "I'd like status updates in bullet points, not paragraphs.",
+      "time": 5380000
+    },
+    {
+      "id": "msg_syn_0074",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 5440000
+    },
+    {
+      "id": "msg_syn_0075",
+      "role": "owner",
+      "text": "The partner API key belongs to the integrations team.",
+      "time": 5500000
+    },
+    {
+      "id": "msg_syn_0076",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 5560000
+    },
+    {
+      "id": "msg_syn_0077",
+      "role": "owner",
+      "text": "Mobile releases go out every other Thursday.",
+      "time": 5620000
+    },
+    {
+      "id": "msg_syn_0078",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 5680000
+    },
+    {
+      "id": "msg_syn_0079",
+      "role": "owner",
+      "text": "We chose Postgres 17 for the new ledger service.",
+      "time": 5740000
+    },
+    {
+      "id": "msg_syn_0080",
+      "role": "dot",
+      "text": "Got it, noted.",
+      "time": 5800000
+    },
+    {
+      "id": "msg_syn_0081",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 0)",
+      "time": 5860000
+    },
+    {
+      "id": "msg_syn_0082",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 1)",
+      "time": 5920000
+    },
+    {
+      "id": "msg_syn_0083",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 2)",
+      "time": 5980000
+    },
+    {
+      "id": "msg_syn_0084",
+      "role": "dot",
+      "text": "Looks good to me. (routine 3)",
+      "time": 6040000
+    },
+    {
+      "id": "msg_syn_0085",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 4)",
+      "time": 6100000
+    },
+    {
+      "id": "msg_syn_0086",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 5)",
+      "time": 6160000
+    },
+    {
+      "id": "msg_syn_0087",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 6)",
+      "time": 6220000
+    },
+    {
+      "id": "msg_syn_0088",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 7)",
+      "time": 6280000
+    },
+    {
+      "id": "msg_syn_0089",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 8)",
+      "time": 6340000
+    },
+    {
+      "id": "msg_syn_0090",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 9)",
+      "time": 6400000
+    },
+    {
+      "id": "msg_syn_0091",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 10)",
+      "time": 6460000
+    },
+    {
+      "id": "msg_syn_0092",
+      "role": "dot",
+      "text": "Looks good to me. (routine 11)",
+      "time": 6520000
+    },
+    {
+      "id": "msg_syn_0093",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 12)",
+      "time": 6580000
+    },
+    {
+      "id": "msg_syn_0094",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 13)",
+      "time": 6640000
+    },
+    {
+      "id": "msg_syn_0095",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 14)",
+      "time": 6700000
+    },
+    {
+      "id": "msg_syn_0096",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 15)",
+      "time": 6760000
+    },
+    {
+      "id": "msg_syn_0097",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 16)",
+      "time": 6820000
+    },
+    {
+      "id": "msg_syn_0098",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 17)",
+      "time": 6880000
+    },
+    {
+      "id": "msg_syn_0099",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 18)",
+      "time": 6940000
+    },
+    {
+      "id": "msg_syn_0100",
+      "role": "dot",
+      "text": "Looks good to me. (routine 19)",
+      "time": 7000000
+    },
+    {
+      "id": "msg_syn_0101",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 20)",
+      "time": 7060000
+    },
+    {
+      "id": "msg_syn_0102",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 21)",
+      "time": 7120000
+    },
+    {
+      "id": "msg_syn_0103",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 22)",
+      "time": 7180000
+    },
+    {
+      "id": "msg_syn_0104",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 23)",
+      "time": 7240000
+    },
+    {
+      "id": "msg_syn_0105",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 24)",
+      "time": 7300000
+    },
+    {
+      "id": "msg_syn_0106",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 25)",
+      "time": 7360000
+    },
+    {
+      "id": "msg_syn_0107",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 26)",
+      "time": 7420000
+    },
+    {
+      "id": "msg_syn_0108",
+      "role": "dot",
+      "text": "Looks good to me. (routine 27)",
+      "time": 7480000
+    },
+    {
+      "id": "msg_syn_0109",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 28)",
+      "time": 7540000
+    },
+    {
+      "id": "msg_syn_0110",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 29)",
+      "time": 7600000
+    },
+    {
+      "id": "msg_syn_0111",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 30)",
+      "time": 7660000
+    },
+    {
+      "id": "msg_syn_0112",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 31)",
+      "time": 7720000
+    },
+    {
+      "id": "msg_syn_0113",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 32)",
+      "time": 7780000
+    },
+    {
+      "id": "msg_syn_0114",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 33)",
+      "time": 7840000
+    },
+    {
+      "id": "msg_syn_0115",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 34)",
+      "time": 7900000
+    },
+    {
+      "id": "msg_syn_0116",
+      "role": "dot",
+      "text": "Looks good to me. (routine 35)",
+      "time": 7960000
+    },
+    {
+      "id": "msg_syn_0117",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 36)",
+      "time": 8020000
+    },
+    {
+      "id": "msg_syn_0118",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 37)",
+      "time": 8080000
+    },
+    {
+      "id": "msg_syn_0119",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 38)",
+      "time": 8140000
+    },
+    {
+      "id": "msg_syn_0120",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 39)",
+      "time": 8200000
+    },
+    {
+      "id": "msg_syn_0121",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 40)",
+      "time": 8260000
+    },
+    {
+      "id": "msg_syn_0122",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 41)",
+      "time": 8320000
+    },
+    {
+      "id": "msg_syn_0123",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 42)",
+      "time": 8380000
+    },
+    {
+      "id": "msg_syn_0124",
+      "role": "dot",
+      "text": "Looks good to me. (routine 43)",
+      "time": 8440000
+    },
+    {
+      "id": "msg_syn_0125",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 44)",
+      "time": 8500000
+    },
+    {
+      "id": "msg_syn_0126",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 45)",
+      "time": 8560000
+    },
+    {
+      "id": "msg_syn_0127",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 46)",
+      "time": 8620000
+    },
+    {
+      "id": "msg_syn_0128",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 47)",
+      "time": 8680000
+    },
+    {
+      "id": "msg_syn_0129",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 48)",
+      "time": 8740000
+    },
+    {
+      "id": "msg_syn_0130",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 49)",
+      "time": 8800000
+    },
+    {
+      "id": "msg_syn_0131",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 50)",
+      "time": 8860000
+    },
+    {
+      "id": "msg_syn_0132",
+      "role": "dot",
+      "text": "Looks good to me. (routine 51)",
+      "time": 8920000
+    },
+    {
+      "id": "msg_syn_0133",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 52)",
+      "time": 8980000
+    },
+    {
+      "id": "msg_syn_0134",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 53)",
+      "time": 9040000
+    },
+    {
+      "id": "msg_syn_0135",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 54)",
+      "time": 9100000
+    },
+    {
+      "id": "msg_syn_0136",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 55)",
+      "time": 9160000
+    },
+    {
+      "id": "msg_syn_0137",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 56)",
+      "time": 9220000
+    },
+    {
+      "id": "msg_syn_0138",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 57)",
+      "time": 9280000
+    },
+    {
+      "id": "msg_syn_0139",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 58)",
+      "time": 9340000
+    },
+    {
+      "id": "msg_syn_0140",
+      "role": "dot",
+      "text": "Looks good to me. (routine 59)",
+      "time": 9400000
+    },
+    {
+      "id": "msg_syn_0141",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 60)",
+      "time": 9460000
+    },
+    {
+      "id": "msg_syn_0142",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 61)",
+      "time": 9520000
+    },
+    {
+      "id": "msg_syn_0143",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 62)",
+      "time": 9580000
+    },
+    {
+      "id": "msg_syn_0144",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 63)",
+      "time": 9640000
+    },
+    {
+      "id": "msg_syn_0145",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 64)",
+      "time": 9700000
+    },
+    {
+      "id": "msg_syn_0146",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 65)",
+      "time": 9760000
+    },
+    {
+      "id": "msg_syn_0147",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 66)",
+      "time": 9820000
+    },
+    {
+      "id": "msg_syn_0148",
+      "role": "dot",
+      "text": "Looks good to me. (routine 67)",
+      "time": 9880000
+    },
+    {
+      "id": "msg_syn_0149",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 68)",
+      "time": 9940000
+    },
+    {
+      "id": "msg_syn_0150",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 69)",
+      "time": 10000000
+    },
+    {
+      "id": "msg_syn_0151",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 70)",
+      "time": 10060000
+    },
+    {
+      "id": "msg_syn_0152",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 71)",
+      "time": 10120000
+    },
+    {
+      "id": "msg_syn_0153",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 72)",
+      "time": 10180000
+    },
+    {
+      "id": "msg_syn_0154",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 73)",
+      "time": 10240000
+    },
+    {
+      "id": "msg_syn_0155",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 74)",
+      "time": 10300000
+    },
+    {
+      "id": "msg_syn_0156",
+      "role": "dot",
+      "text": "Looks good to me. (routine 75)",
+      "time": 10360000
+    },
+    {
+      "id": "msg_syn_0157",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 76)",
+      "time": 10420000
+    },
+    {
+      "id": "msg_syn_0158",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 77)",
+      "time": 10480000
+    },
+    {
+      "id": "msg_syn_0159",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 78)",
+      "time": 10540000
+    },
+    {
+      "id": "msg_syn_0160",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 79)",
+      "time": 10600000
+    },
+    {
+      "id": "msg_syn_0161",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 80)",
+      "time": 10660000
+    },
+    {
+      "id": "msg_syn_0162",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 81)",
+      "time": 10720000
+    },
+    {
+      "id": "msg_syn_0163",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 82)",
+      "time": 10780000
+    },
+    {
+      "id": "msg_syn_0164",
+      "role": "dot",
+      "text": "Looks good to me. (routine 83)",
+      "time": 10840000
+    },
+    {
+      "id": "msg_syn_0165",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 84)",
+      "time": 10900000
+    },
+    {
+      "id": "msg_syn_0166",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 85)",
+      "time": 10960000
+    },
+    {
+      "id": "msg_syn_0167",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 86)",
+      "time": 11020000
+    },
+    {
+      "id": "msg_syn_0168",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 87)",
+      "time": 11080000
+    },
+    {
+      "id": "msg_syn_0169",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 88)",
+      "time": 11140000
+    },
+    {
+      "id": "msg_syn_0170",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 89)",
+      "time": 11200000
+    },
+    {
+      "id": "msg_syn_0171",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 90)",
+      "time": 11260000
+    },
+    {
+      "id": "msg_syn_0172",
+      "role": "dot",
+      "text": "Looks good to me. (routine 91)",
+      "time": 11320000
+    },
+    {
+      "id": "msg_syn_0173",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 92)",
+      "time": 11380000
+    },
+    {
+      "id": "msg_syn_0174",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 93)",
+      "time": 11440000
+    },
+    {
+      "id": "msg_syn_0175",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 94)",
+      "time": 11500000
+    },
+    {
+      "id": "msg_syn_0176",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 95)",
+      "time": 11560000
+    },
+    {
+      "id": "msg_syn_0177",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 96)",
+      "time": 11620000
+    },
+    {
+      "id": "msg_syn_0178",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 97)",
+      "time": 11680000
+    },
+    {
+      "id": "msg_syn_0179",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 98)",
+      "time": 11740000
+    },
+    {
+      "id": "msg_syn_0180",
+      "role": "dot",
+      "text": "Looks good to me. (routine 99)",
+      "time": 11800000
+    },
+    {
+      "id": "msg_syn_0181",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 100)",
+      "time": 11860000
+    },
+    {
+      "id": "msg_syn_0182",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 101)",
+      "time": 11920000
+    },
+    {
+      "id": "msg_syn_0183",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 102)",
+      "time": 11980000
+    },
+    {
+      "id": "msg_syn_0184",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 103)",
+      "time": 12040000
+    },
+    {
+      "id": "msg_syn_0185",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 104)",
+      "time": 12100000
+    },
+    {
+      "id": "msg_syn_0186",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 105)",
+      "time": 12160000
+    },
+    {
+      "id": "msg_syn_0187",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 106)",
+      "time": 12220000
+    },
+    {
+      "id": "msg_syn_0188",
+      "role": "dot",
+      "text": "Looks good to me. (routine 107)",
+      "time": 12280000
+    },
+    {
+      "id": "msg_syn_0189",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 108)",
+      "time": 12340000
+    },
+    {
+      "id": "msg_syn_0190",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 109)",
+      "time": 12400000
+    },
+    {
+      "id": "msg_syn_0191",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 110)",
+      "time": 12460000
+    },
+    {
+      "id": "msg_syn_0192",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 111)",
+      "time": 12520000
+    },
+    {
+      "id": "msg_syn_0193",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 112)",
+      "time": 12580000
+    },
+    {
+      "id": "msg_syn_0194",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 113)",
+      "time": 12640000
+    },
+    {
+      "id": "msg_syn_0195",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 114)",
+      "time": 12700000
+    },
+    {
+      "id": "msg_syn_0196",
+      "role": "dot",
+      "text": "Looks good to me. (routine 115)",
+      "time": 12760000
+    },
+    {
+      "id": "msg_syn_0197",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 116)",
+      "time": 12820000
+    },
+    {
+      "id": "msg_syn_0198",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 117)",
+      "time": 12880000
+    },
+    {
+      "id": "msg_syn_0199",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 118)",
+      "time": 12940000
+    },
+    {
+      "id": "msg_syn_0200",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 119)",
+      "time": 13000000
+    },
+    {
+      "id": "msg_syn_0201",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 120)",
+      "time": 13060000
+    },
+    {
+      "id": "msg_syn_0202",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 121)",
+      "time": 13120000
+    },
+    {
+      "id": "msg_syn_0203",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 122)",
+      "time": 13180000
+    },
+    {
+      "id": "msg_syn_0204",
+      "role": "dot",
+      "text": "Looks good to me. (routine 123)",
+      "time": 13240000
+    },
+    {
+      "id": "msg_syn_0205",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 124)",
+      "time": 13300000
+    },
+    {
+      "id": "msg_syn_0206",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 125)",
+      "time": 13360000
+    },
+    {
+      "id": "msg_syn_0207",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 126)",
+      "time": 13420000
+    },
+    {
+      "id": "msg_syn_0208",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 127)",
+      "time": 13480000
+    },
+    {
+      "id": "msg_syn_0209",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 128)",
+      "time": 13540000
+    },
+    {
+      "id": "msg_syn_0210",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 129)",
+      "time": 13600000
+    },
+    {
+      "id": "msg_syn_0211",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 130)",
+      "time": 13660000
+    },
+    {
+      "id": "msg_syn_0212",
+      "role": "dot",
+      "text": "Looks good to me. (routine 131)",
+      "time": 13720000
+    },
+    {
+      "id": "msg_syn_0213",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 132)",
+      "time": 13780000
+    },
+    {
+      "id": "msg_syn_0214",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 133)",
+      "time": 13840000
+    },
+    {
+      "id": "msg_syn_0215",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 134)",
+      "time": 13900000
+    },
+    {
+      "id": "msg_syn_0216",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 135)",
+      "time": 13960000
+    },
+    {
+      "id": "msg_syn_0217",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 136)",
+      "time": 14020000
+    },
+    {
+      "id": "msg_syn_0218",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 137)",
+      "time": 14080000
+    },
+    {
+      "id": "msg_syn_0219",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 138)",
+      "time": 14140000
+    },
+    {
+      "id": "msg_syn_0220",
+      "role": "dot",
+      "text": "Looks good to me. (routine 139)",
+      "time": 14200000
+    },
+    {
+      "id": "msg_syn_0221",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 140)",
+      "time": 14260000
+    },
+    {
+      "id": "msg_syn_0222",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 141)",
+      "time": 14320000
+    },
+    {
+      "id": "msg_syn_0223",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 142)",
+      "time": 14380000
+    },
+    {
+      "id": "msg_syn_0224",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 143)",
+      "time": 14440000
+    },
+    {
+      "id": "msg_syn_0225",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 144)",
+      "time": 14500000
+    },
+    {
+      "id": "msg_syn_0226",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 145)",
+      "time": 14560000
+    },
+    {
+      "id": "msg_syn_0227",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 146)",
+      "time": 14620000
+    },
+    {
+      "id": "msg_syn_0228",
+      "role": "dot",
+      "text": "Looks good to me. (routine 147)",
+      "time": 14680000
+    },
+    {
+      "id": "msg_syn_0229",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 148)",
+      "time": 14740000
+    },
+    {
+      "id": "msg_syn_0230",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 149)",
+      "time": 14800000
+    },
+    {
+      "id": "msg_syn_0231",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 150)",
+      "time": 14860000
+    },
+    {
+      "id": "msg_syn_0232",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 151)",
+      "time": 14920000
+    },
+    {
+      "id": "msg_syn_0233",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 152)",
+      "time": 14980000
+    },
+    {
+      "id": "msg_syn_0234",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 153)",
+      "time": 15040000
+    },
+    {
+      "id": "msg_syn_0235",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 154)",
+      "time": 15100000
+    },
+    {
+      "id": "msg_syn_0236",
+      "role": "dot",
+      "text": "Looks good to me. (routine 155)",
+      "time": 15160000
+    },
+    {
+      "id": "msg_syn_0237",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 156)",
+      "time": 15220000
+    },
+    {
+      "id": "msg_syn_0238",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 157)",
+      "time": 15280000
+    },
+    {
+      "id": "msg_syn_0239",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 158)",
+      "time": 15340000
+    },
+    {
+      "id": "msg_syn_0240",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 159)",
+      "time": 15400000
+    },
+    {
+      "id": "msg_syn_0241",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 160)",
+      "time": 15460000
+    },
+    {
+      "id": "msg_syn_0242",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 161)",
+      "time": 15520000
+    },
+    {
+      "id": "msg_syn_0243",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 162)",
+      "time": 15580000
+    },
+    {
+      "id": "msg_syn_0244",
+      "role": "dot",
+      "text": "Looks good to me. (routine 163)",
+      "time": 15640000
+    },
+    {
+      "id": "msg_syn_0245",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 164)",
+      "time": 15700000
+    },
+    {
+      "id": "msg_syn_0246",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 165)",
+      "time": 15760000
+    },
+    {
+      "id": "msg_syn_0247",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 166)",
+      "time": 15820000
+    },
+    {
+      "id": "msg_syn_0248",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 167)",
+      "time": 15880000
+    },
+    {
+      "id": "msg_syn_0249",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 168)",
+      "time": 15940000
+    },
+    {
+      "id": "msg_syn_0250",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 169)",
+      "time": 16000000
+    },
+    {
+      "id": "msg_syn_0251",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 170)",
+      "time": 16060000
+    },
+    {
+      "id": "msg_syn_0252",
+      "role": "dot",
+      "text": "Looks good to me. (routine 171)",
+      "time": 16120000
+    },
+    {
+      "id": "msg_syn_0253",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 172)",
+      "time": 16180000
+    },
+    {
+      "id": "msg_syn_0254",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 173)",
+      "time": 16240000
+    },
+    {
+      "id": "msg_syn_0255",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 174)",
+      "time": 16300000
+    },
+    {
+      "id": "msg_syn_0256",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 175)",
+      "time": 16360000
+    },
+    {
+      "id": "msg_syn_0257",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 176)",
+      "time": 16420000
+    },
+    {
+      "id": "msg_syn_0258",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 177)",
+      "time": 16480000
+    },
+    {
+      "id": "msg_syn_0259",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 178)",
+      "time": 16540000
+    },
+    {
+      "id": "msg_syn_0260",
+      "role": "dot",
+      "text": "Looks good to me. (routine 179)",
+      "time": 16600000
+    },
+    {
+      "id": "msg_syn_0261",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 180)",
+      "time": 16660000
+    },
+    {
+      "id": "msg_syn_0262",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 181)",
+      "time": 16720000
+    },
+    {
+      "id": "msg_syn_0263",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 182)",
+      "time": 16780000
+    },
+    {
+      "id": "msg_syn_0264",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 183)",
+      "time": 16840000
+    },
+    {
+      "id": "msg_syn_0265",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 184)",
+      "time": 16900000
+    },
+    {
+      "id": "msg_syn_0266",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 185)",
+      "time": 16960000
+    },
+    {
+      "id": "msg_syn_0267",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 186)",
+      "time": 17020000
+    },
+    {
+      "id": "msg_syn_0268",
+      "role": "dot",
+      "text": "Looks good to me. (routine 187)",
+      "time": 17080000
+    },
+    {
+      "id": "msg_syn_0269",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 188)",
+      "time": 17140000
+    },
+    {
+      "id": "msg_syn_0270",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 189)",
+      "time": 17200000
+    },
+    {
+      "id": "msg_syn_0271",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 190)",
+      "time": 17260000
+    },
+    {
+      "id": "msg_syn_0272",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 191)",
+      "time": 17320000
+    },
+    {
+      "id": "msg_syn_0273",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 192)",
+      "time": 17380000
+    },
+    {
+      "id": "msg_syn_0274",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 193)",
+      "time": 17440000
+    },
+    {
+      "id": "msg_syn_0275",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 194)",
+      "time": 17500000
+    },
+    {
+      "id": "msg_syn_0276",
+      "role": "dot",
+      "text": "Looks good to me. (routine 195)",
+      "time": 17560000
+    },
+    {
+      "id": "msg_syn_0277",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 196)",
+      "time": 17620000
+    },
+    {
+      "id": "msg_syn_0278",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 197)",
+      "time": 17680000
+    },
+    {
+      "id": "msg_syn_0279",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 198)",
+      "time": 17740000
+    },
+    {
+      "id": "msg_syn_0280",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 199)",
+      "time": 17800000
+    },
+    {
+      "id": "msg_syn_0281",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 200)",
+      "time": 17860000
+    },
+    {
+      "id": "msg_syn_0282",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 201)",
+      "time": 17920000
+    },
+    {
+      "id": "msg_syn_0283",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 202)",
+      "time": 17980000
+    },
+    {
+      "id": "msg_syn_0284",
+      "role": "dot",
+      "text": "Looks good to me. (routine 203)",
+      "time": 18040000
+    },
+    {
+      "id": "msg_syn_0285",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 204)",
+      "time": 18100000
+    },
+    {
+      "id": "msg_syn_0286",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 205)",
+      "time": 18160000
+    },
+    {
+      "id": "msg_syn_0287",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 206)",
+      "time": 18220000
+    },
+    {
+      "id": "msg_syn_0288",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 207)",
+      "time": 18280000
+    },
+    {
+      "id": "msg_syn_0289",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 208)",
+      "time": 18340000
+    },
+    {
+      "id": "msg_syn_0290",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 209)",
+      "time": 18400000
+    },
+    {
+      "id": "msg_syn_0291",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 210)",
+      "time": 18460000
+    },
+    {
+      "id": "msg_syn_0292",
+      "role": "dot",
+      "text": "Looks good to me. (routine 211)",
+      "time": 18520000
+    },
+    {
+      "id": "msg_syn_0293",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 212)",
+      "time": 18580000
+    },
+    {
+      "id": "msg_syn_0294",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 213)",
+      "time": 18640000
+    },
+    {
+      "id": "msg_syn_0295",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 214)",
+      "time": 18700000
+    },
+    {
+      "id": "msg_syn_0296",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 215)",
+      "time": 18760000
+    },
+    {
+      "id": "msg_syn_0297",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 216)",
+      "time": 18820000
+    },
+    {
+      "id": "msg_syn_0298",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 217)",
+      "time": 18880000
+    },
+    {
+      "id": "msg_syn_0299",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 218)",
+      "time": 18940000
+    },
+    {
+      "id": "msg_syn_0300",
+      "role": "dot",
+      "text": "Looks good to me. (routine 219)",
+      "time": 19000000
+    },
+    {
+      "id": "msg_syn_0301",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 220)",
+      "time": 19060000
+    },
+    {
+      "id": "msg_syn_0302",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 221)",
+      "time": 19120000
+    },
+    {
+      "id": "msg_syn_0303",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 222)",
+      "time": 19180000
+    },
+    {
+      "id": "msg_syn_0304",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 223)",
+      "time": 19240000
+    },
+    {
+      "id": "msg_syn_0305",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 224)",
+      "time": 19300000
+    },
+    {
+      "id": "msg_syn_0306",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 225)",
+      "time": 19360000
+    },
+    {
+      "id": "msg_syn_0307",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 226)",
+      "time": 19420000
+    },
+    {
+      "id": "msg_syn_0308",
+      "role": "dot",
+      "text": "Looks good to me. (routine 227)",
+      "time": 19480000
+    },
+    {
+      "id": "msg_syn_0309",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 228)",
+      "time": 19540000
+    },
+    {
+      "id": "msg_syn_0310",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 229)",
+      "time": 19600000
+    },
+    {
+      "id": "msg_syn_0311",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 230)",
+      "time": 19660000
+    },
+    {
+      "id": "msg_syn_0312",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 231)",
+      "time": 19720000
+    },
+    {
+      "id": "msg_syn_0313",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 232)",
+      "time": 19780000
+    },
+    {
+      "id": "msg_syn_0314",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 233)",
+      "time": 19840000
+    },
+    {
+      "id": "msg_syn_0315",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 234)",
+      "time": 19900000
+    },
+    {
+      "id": "msg_syn_0316",
+      "role": "dot",
+      "text": "Looks good to me. (routine 235)",
+      "time": 19960000
+    },
+    {
+      "id": "msg_syn_0317",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 236)",
+      "time": 20020000
+    },
+    {
+      "id": "msg_syn_0318",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 237)",
+      "time": 20080000
+    },
+    {
+      "id": "msg_syn_0319",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 238)",
+      "time": 20140000
+    },
+    {
+      "id": "msg_syn_0320",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 239)",
+      "time": 20200000
+    },
+    {
+      "id": "msg_syn_0321",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 240)",
+      "time": 20260000
+    },
+    {
+      "id": "msg_syn_0322",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 241)",
+      "time": 20320000
+    },
+    {
+      "id": "msg_syn_0323",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 242)",
+      "time": 20380000
+    },
+    {
+      "id": "msg_syn_0324",
+      "role": "dot",
+      "text": "Looks good to me. (routine 243)",
+      "time": 20440000
+    },
+    {
+      "id": "msg_syn_0325",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 244)",
+      "time": 20500000
+    },
+    {
+      "id": "msg_syn_0326",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 245)",
+      "time": 20560000
+    },
+    {
+      "id": "msg_syn_0327",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 246)",
+      "time": 20620000
+    },
+    {
+      "id": "msg_syn_0328",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 247)",
+      "time": 20680000
+    },
+    {
+      "id": "msg_syn_0329",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 248)",
+      "time": 20740000
+    },
+    {
+      "id": "msg_syn_0330",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 249)",
+      "time": 20800000
+    },
+    {
+      "id": "msg_syn_0331",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 250)",
+      "time": 20860000
+    },
+    {
+      "id": "msg_syn_0332",
+      "role": "dot",
+      "text": "Looks good to me. (routine 251)",
+      "time": 20920000
+    },
+    {
+      "id": "msg_syn_0333",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 252)",
+      "time": 20980000
+    },
+    {
+      "id": "msg_syn_0334",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 253)",
+      "time": 21040000
+    },
+    {
+      "id": "msg_syn_0335",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 254)",
+      "time": 21100000
+    },
+    {
+      "id": "msg_syn_0336",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 255)",
+      "time": 21160000
+    },
+    {
+      "id": "msg_syn_0337",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 256)",
+      "time": 21220000
+    },
+    {
+      "id": "msg_syn_0338",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 257)",
+      "time": 21280000
+    },
+    {
+      "id": "msg_syn_0339",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 258)",
+      "time": 21340000
+    },
+    {
+      "id": "msg_syn_0340",
+      "role": "dot",
+      "text": "Looks good to me. (routine 259)",
+      "time": 21400000
+    },
+    {
+      "id": "msg_syn_0341",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 260)",
+      "time": 21460000
+    },
+    {
+      "id": "msg_syn_0342",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 261)",
+      "time": 21520000
+    },
+    {
+      "id": "msg_syn_0343",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 262)",
+      "time": 21580000
+    },
+    {
+      "id": "msg_syn_0344",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 263)",
+      "time": 21640000
+    },
+    {
+      "id": "msg_syn_0345",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 264)",
+      "time": 21700000
+    },
+    {
+      "id": "msg_syn_0346",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 265)",
+      "time": 21760000
+    },
+    {
+      "id": "msg_syn_0347",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 266)",
+      "time": 21820000
+    },
+    {
+      "id": "msg_syn_0348",
+      "role": "dot",
+      "text": "Looks good to me. (routine 267)",
+      "time": 21880000
+    },
+    {
+      "id": "msg_syn_0349",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 268)",
+      "time": 21940000
+    },
+    {
+      "id": "msg_syn_0350",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 269)",
+      "time": 22000000
+    },
+    {
+      "id": "msg_syn_0351",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 270)",
+      "time": 22060000
+    },
+    {
+      "id": "msg_syn_0352",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 271)",
+      "time": 22120000
+    },
+    {
+      "id": "msg_syn_0353",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 272)",
+      "time": 22180000
+    },
+    {
+      "id": "msg_syn_0354",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 273)",
+      "time": 22240000
+    },
+    {
+      "id": "msg_syn_0355",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 274)",
+      "time": 22300000
+    },
+    {
+      "id": "msg_syn_0356",
+      "role": "dot",
+      "text": "Looks good to me. (routine 275)",
+      "time": 22360000
+    },
+    {
+      "id": "msg_syn_0357",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 276)",
+      "time": 22420000
+    },
+    {
+      "id": "msg_syn_0358",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 277)",
+      "time": 22480000
+    },
+    {
+      "id": "msg_syn_0359",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 278)",
+      "time": 22540000
+    },
+    {
+      "id": "msg_syn_0360",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 279)",
+      "time": 22600000
+    },
+    {
+      "id": "msg_syn_0361",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 280)",
+      "time": 22660000
+    },
+    {
+      "id": "msg_syn_0362",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 281)",
+      "time": 22720000
+    },
+    {
+      "id": "msg_syn_0363",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 282)",
+      "time": 22780000
+    },
+    {
+      "id": "msg_syn_0364",
+      "role": "dot",
+      "text": "Looks good to me. (routine 283)",
+      "time": 22840000
+    },
+    {
+      "id": "msg_syn_0365",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 284)",
+      "time": 22900000
+    },
+    {
+      "id": "msg_syn_0366",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 285)",
+      "time": 22960000
+    },
+    {
+      "id": "msg_syn_0367",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 286)",
+      "time": 23020000
+    },
+    {
+      "id": "msg_syn_0368",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 287)",
+      "time": 23080000
+    },
+    {
+      "id": "msg_syn_0369",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 288)",
+      "time": 23140000
+    },
+    {
+      "id": "msg_syn_0370",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 289)",
+      "time": 23200000
+    },
+    {
+      "id": "msg_syn_0371",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 290)",
+      "time": 23260000
+    },
+    {
+      "id": "msg_syn_0372",
+      "role": "dot",
+      "text": "Looks good to me. (routine 291)",
+      "time": 23320000
+    },
+    {
+      "id": "msg_syn_0373",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 292)",
+      "time": 23380000
+    },
+    {
+      "id": "msg_syn_0374",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 293)",
+      "time": 23440000
+    },
+    {
+      "id": "msg_syn_0375",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 294)",
+      "time": 23500000
+    },
+    {
+      "id": "msg_syn_0376",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 295)",
+      "time": 23560000
+    },
+    {
+      "id": "msg_syn_0377",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 296)",
+      "time": 23620000
+    },
+    {
+      "id": "msg_syn_0378",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 297)",
+      "time": 23680000
+    },
+    {
+      "id": "msg_syn_0379",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 298)",
+      "time": 23740000
+    },
+    {
+      "id": "msg_syn_0380",
+      "role": "dot",
+      "text": "Looks good to me. (routine 299)",
+      "time": 23800000
+    },
+    {
+      "id": "msg_syn_0381",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 300)",
+      "time": 23860000
+    },
+    {
+      "id": "msg_syn_0382",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 301)",
+      "time": 23920000
+    },
+    {
+      "id": "msg_syn_0383",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 302)",
+      "time": 23980000
+    },
+    {
+      "id": "msg_syn_0384",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 303)",
+      "time": 24040000
+    },
+    {
+      "id": "msg_syn_0385",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 304)",
+      "time": 24100000
+    },
+    {
+      "id": "msg_syn_0386",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 305)",
+      "time": 24160000
+    },
+    {
+      "id": "msg_syn_0387",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 306)",
+      "time": 24220000
+    },
+    {
+      "id": "msg_syn_0388",
+      "role": "dot",
+      "text": "Looks good to me. (routine 307)",
+      "time": 24280000
+    },
+    {
+      "id": "msg_syn_0389",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 308)",
+      "time": 24340000
+    },
+    {
+      "id": "msg_syn_0390",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 309)",
+      "time": 24400000
+    },
+    {
+      "id": "msg_syn_0391",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 310)",
+      "time": 24460000
+    },
+    {
+      "id": "msg_syn_0392",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 311)",
+      "time": 24520000
+    },
+    {
+      "id": "msg_syn_0393",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 312)",
+      "time": 24580000
+    },
+    {
+      "id": "msg_syn_0394",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 313)",
+      "time": 24640000
+    },
+    {
+      "id": "msg_syn_0395",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 314)",
+      "time": 24700000
+    },
+    {
+      "id": "msg_syn_0396",
+      "role": "dot",
+      "text": "Looks good to me. (routine 315)",
+      "time": 24760000
+    },
+    {
+      "id": "msg_syn_0397",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 316)",
+      "time": 24820000
+    },
+    {
+      "id": "msg_syn_0398",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 317)",
+      "time": 24880000
+    },
+    {
+      "id": "msg_syn_0399",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 318)",
+      "time": 24940000
+    },
+    {
+      "id": "msg_syn_0400",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 319)",
+      "time": 25000000
+    },
+    {
+      "id": "msg_syn_0401",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 320)",
+      "time": 25060000
+    },
+    {
+      "id": "msg_syn_0402",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 321)",
+      "time": 25120000
+    },
+    {
+      "id": "msg_syn_0403",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 322)",
+      "time": 25180000
+    },
+    {
+      "id": "msg_syn_0404",
+      "role": "dot",
+      "text": "Looks good to me. (routine 323)",
+      "time": 25240000
+    },
+    {
+      "id": "msg_syn_0405",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 324)",
+      "time": 25300000
+    },
+    {
+      "id": "msg_syn_0406",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 325)",
+      "time": 25360000
+    },
+    {
+      "id": "msg_syn_0407",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 326)",
+      "time": 25420000
+    },
+    {
+      "id": "msg_syn_0408",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 327)",
+      "time": 25480000
+    },
+    {
+      "id": "msg_syn_0409",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 328)",
+      "time": 25540000
+    },
+    {
+      "id": "msg_syn_0410",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 329)",
+      "time": 25600000
+    },
+    {
+      "id": "msg_syn_0411",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 330)",
+      "time": 25660000
+    },
+    {
+      "id": "msg_syn_0412",
+      "role": "dot",
+      "text": "Looks good to me. (routine 331)",
+      "time": 25720000
+    },
+    {
+      "id": "msg_syn_0413",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 332)",
+      "time": 25780000
+    },
+    {
+      "id": "msg_syn_0414",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 333)",
+      "time": 25840000
+    },
+    {
+      "id": "msg_syn_0415",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 334)",
+      "time": 25900000
+    },
+    {
+      "id": "msg_syn_0416",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 335)",
+      "time": 25960000
+    },
+    {
+      "id": "msg_syn_0417",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 336)",
+      "time": 26020000
+    },
+    {
+      "id": "msg_syn_0418",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 337)",
+      "time": 26080000
+    },
+    {
+      "id": "msg_syn_0419",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 338)",
+      "time": 26140000
+    },
+    {
+      "id": "msg_syn_0420",
+      "role": "dot",
+      "text": "Looks good to me. (routine 339)",
+      "time": 26200000
+    },
+    {
+      "id": "msg_syn_0421",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 340)",
+      "time": 26260000
+    },
+    {
+      "id": "msg_syn_0422",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 341)",
+      "time": 26320000
+    },
+    {
+      "id": "msg_syn_0423",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 342)",
+      "time": 26380000
+    },
+    {
+      "id": "msg_syn_0424",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 343)",
+      "time": 26440000
+    },
+    {
+      "id": "msg_syn_0425",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 344)",
+      "time": 26500000
+    },
+    {
+      "id": "msg_syn_0426",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 345)",
+      "time": 26560000
+    },
+    {
+      "id": "msg_syn_0427",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 346)",
+      "time": 26620000
+    },
+    {
+      "id": "msg_syn_0428",
+      "role": "dot",
+      "text": "Looks good to me. (routine 347)",
+      "time": 26680000
+    },
+    {
+      "id": "msg_syn_0429",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 348)",
+      "time": 26740000
+    },
+    {
+      "id": "msg_syn_0430",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 349)",
+      "time": 26800000
+    },
+    {
+      "id": "msg_syn_0431",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 350)",
+      "time": 26860000
+    },
+    {
+      "id": "msg_syn_0432",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 351)",
+      "time": 26920000
+    },
+    {
+      "id": "msg_syn_0433",
+      "role": "owner",
+      "text": "Can you check the weather tomorrow? (routine 352)",
+      "time": 26980000
+    },
+    {
+      "id": "msg_syn_0434",
+      "role": "dot",
+      "text": "Thanks, that helps. (routine 353)",
+      "time": 27040000
+    },
+    {
+      "id": "msg_syn_0435",
+      "role": "owner",
+      "text": "Please draft a reply to the vendor. (routine 354)",
+      "time": 27100000
+    },
+    {
+      "id": "msg_syn_0436",
+      "role": "dot",
+      "text": "Looks good to me. (routine 355)",
+      "time": 27160000
+    },
+    {
+      "id": "msg_syn_0437",
+      "role": "owner",
+      "text": "What's on my calendar today? (routine 356)",
+      "time": 27220000
+    },
+    {
+      "id": "msg_syn_0438",
+      "role": "dot",
+      "text": "Summarise the last thread for me. (routine 357)",
+      "time": 27280000
+    },
+    {
+      "id": "msg_syn_0439",
+      "role": "owner",
+      "text": "Remind me to stretch later. (routine 358)",
+      "time": 27340000
+    },
+    {
+      "id": "msg_syn_0440",
+      "role": "dot",
+      "text": "No updates on that yet. (routine 359)",
+      "time": 27400000
+    }
+  ],
+  "questions": [
+    {
+      "id": "q01",
+      "question": "What is the Orchard staging database called?",
+      "answer": "pear-staging",
+      "source": "msg_syn_0001",
+      "paraphrase": false
+    },
+    {
+      "id": "q02",
+      "question": "Which web framework did we choose for the Orchard API?",
+      "answer": "fastify",
+      "source": "msg_syn_0003",
+      "paraphrase": false
+    },
+    {
+      "id": "q03",
+      "question": "When does Orchard launch?",
+      "answer": "14th of march",
+      "source": "msg_syn_0005",
+      "paraphrase": false
+    },
+    {
+      "id": "q04",
+      "question": "Who is responsible for moving billing over?",
+      "answer": "marisol",
+      "source": "msg_syn_0007",
+      "paraphrase": true
+    },
+    {
+      "id": "q05",
+      "question": "How long do we retain invoices?",
+      "answer": "seven years",
+      "source": "msg_syn_0009",
+      "paraphrase": true
+    },
+    {
+      "id": "q06",
+      "question": "When do I want my weekly summary?",
+      "answer": "friday",
+      "source": "msg_syn_0011",
+      "paraphrase": false
+    },
+    {
+      "id": "q07",
+      "question": "What's my earliest acceptable meeting time?",
+      "answer": "10am",
+      "source": "msg_syn_0013",
+      "paraphrase": true
+    },
+    {
+      "id": "q08",
+      "question": "What is the design system called?",
+      "answer": "quince",
+      "source": "msg_syn_0015",
+      "paraphrase": false
+    },
+    {
+      "id": "q09",
+      "question": "What rate limit did we set on the public API?",
+      "answer": "600 requests",
+      "source": "msg_syn_0017",
+      "paraphrase": false
+    },
+    {
+      "id": "q10",
+      "question": "Do we still support Internet Explorer?",
+      "answer": "drop support",
+      "source": "msg_syn_0019",
+      "paraphrase": false
+    },
+    {
+      "id": "q11",
+      "question": "Which cross-platform toolkit is the mobile app built with?",
+      "answer": "react native",
+      "source": "msg_syn_0021",
+      "paraphrase": true
+    },
+    {
+      "id": "q12",
+      "question": "On which day does on-call rotate?",
+      "answer": "tuesday",
+      "source": "msg_syn_0023",
+      "paraphrase": false
+    },
+    {
+      "id": "q13",
+      "question": "Where is this year's quarterly offsite?",
+      "answer": "lisbon",
+      "source": "msg_syn_0025",
+      "paraphrase": false
+    },
+    {
+      "id": "q14",
+      "question": "Which storage bucket holds analytics exports?",
+      "answer": "plum",
+      "source": "msg_syn_0027",
+      "paraphrase": true
+    },
+    {
+      "id": "q15",
+      "question": "Who do I report to?",
+      "answer": "teodora",
+      "source": "msg_syn_0029",
+      "paraphrase": true
+    },
+    {
+      "id": "q16",
+      "question": "Which project stores Orchard feature flags?",
+      "answer": "orchard-flags",
+      "source": "msg_syn_0031",
+      "paraphrase": false
+    },
+    {
+      "id": "q17",
+      "question": "When does the search index rebuild run?",
+      "answer": "02:30",
+      "source": "msg_syn_0033",
+      "paraphrase": false
+    },
+    {
+      "id": "q18",
+      "question": "What is our monthly error budget?",
+      "answer": "0.5 percent",
+      "source": "msg_syn_0035",
+      "paraphrase": false
+    },
+    {
+      "id": "q19",
+      "question": "Any food allergies to consider for team lunches?",
+      "answer": "peanuts",
+      "source": "msg_syn_0037",
+      "paraphrase": true
+    },
+    {
+      "id": "q20",
+      "question": "Which customer is in the pilot?",
+      "answer": "brightwater",
+      "source": "msg_syn_0039",
+      "paraphrase": false
+    },
+    {
+      "id": "q21",
+      "question": "How much can we spend on contractors each quarter?",
+      "answer": "30k",
+      "source": "msg_syn_0041",
+      "paraphrase": true
+    },
+    {
+      "id": "q22",
+      "question": "When is the legacy CRM decommissioned?",
+      "answer": "june 30",
+      "source": "msg_syn_0043",
+      "paraphrase": true
+    },
+    {
+      "id": "q23",
+      "question": "Where do release notes get written?",
+      "answer": "notion",
+      "source": "msg_syn_0045",
+      "paraphrase": false
+    },
+    {
+      "id": "q24",
+      "question": "What's the incident Slack channel?",
+      "answer": "orchard-fire",
+      "source": "msg_syn_0047",
+      "paraphrase": false
+    },
+    {
+      "id": "q25",
+      "question": "How often are service account credentials rotated?",
+      "answer": "90 days",
+      "source": "msg_syn_0049",
+      "paraphrase": true
+    },
+    {
+      "id": "q26",
+      "question": "Who reviews Orchard for security?",
+      "answer": "kenji",
+      "source": "msg_syn_0051",
+      "paraphrase": false
+    },
+    {
+      "id": "q27",
+      "question": "Which warehouse do we use now?",
+      "answer": "snowflake",
+      "source": "msg_syn_0053",
+      "paraphrase": true
+    },
+    {
+      "id": "q28",
+      "question": "What's my expectation for review turnaround?",
+      "answer": "one business day",
+      "source": "msg_syn_0055",
+      "paraphrase": true
+    },
+    {
+      "id": "q29",
+      "question": "How many tiers does the pricing experiment have?",
+      "answer": "three tiers",
+      "source": "msg_syn_0057",
+      "paraphrase": false
+    },
+    {
+      "id": "q30",
+      "question": "Did we settle SSO support for launch?",
+      "answer": "sso",
+      "source": "msg_syn_0059",
+      "paraphrase": false
+    },
+    {
+      "id": "q31",
+      "question": "What's the demo account address?",
+      "answer": "demo@orchard.example",
+      "source": "msg_syn_0061",
+      "paraphrase": false
+    },
+    {
+      "id": "q32",
+      "question": "How often is design review?",
+      "answer": "alternate wednesdays",
+      "source": "msg_syn_0063",
+      "paraphrase": false
+    },
+    {
+      "id": "q33",
+      "question": "What uptime did we promise customers?",
+      "answer": "99.9",
+      "source": "msg_syn_0065",
+      "paraphrase": true
+    },
+    {
+      "id": "q34",
+      "question": "How long are lunch-and-learn recordings kept?",
+      "answer": "a year",
+      "source": "msg_syn_0067",
+      "paraphrase": true
+    },
+    {
+      "id": "q35",
+      "question": "What color is the Orchard logo?",
+      "answer": "teal",
+      "source": "msg_syn_0069",
+      "paraphrase": false
+    },
+    {
+      "id": "q36",
+      "question": "When do we test restores?",
+      "answer": "first monday",
+      "source": "msg_syn_0071",
+      "paraphrase": true
+    },
+    {
+      "id": "q37",
+      "question": "How should status updates be formatted?",
+      "answer": "bullet points",
+      "source": "msg_syn_0073",
+      "paraphrase": false
+    },
+    {
+      "id": "q38",
+      "question": "Which team owns the partner API key?",
+      "answer": "integrations team",
+      "source": "msg_syn_0075",
+      "paraphrase": false
+    },
+    {
+      "id": "q39",
+      "question": "What's the mobile release cadence?",
+      "answer": "every other thursday",
+      "source": "msg_syn_0077",
+      "paraphrase": true
+    },
+    {
+      "id": "q40",
+      "question": "Which database version does the ledger service use?",
+      "answer": "postgres 17",
+      "source": "msg_syn_0079",
+      "paraphrase": false
+    }
+  ],
+  "ledger": [
+    {
+      "kind": "fact",
+      "topic": "staging",
+      "text": "The staging database for Orchard is called pear-staging.",
+      "priority": 1,
+      "sources": ["msg_syn_0001"]
+    },
+    {
+      "kind": "fact",
+      "topic": "orchard",
+      "text": "The Orchard launch date is the 14th of March.",
+      "priority": 3,
+      "sources": ["msg_syn_0005"]
+    },
+    {
+      "kind": "fact",
+      "topic": "must",
+      "text": "Invoices must be kept for seven years.",
+      "priority": 2,
+      "sources": ["msg_syn_0009"]
+    },
+    {
+      "kind": "fact",
+      "topic": "schedule",
+      "text": "Never schedule meetings before 10am for me.",
+      "priority": 1,
+      "sources": ["msg_syn_0013"]
+    },
+    {
+      "kind": "fact",
+      "topic": "limits",
+      "text": "Rate limits for the public API are 600 requests per minute.",
+      "priority": 3,
+      "sources": ["msg_syn_0017"]
+    },
+    {
+      "kind": "fact",
+      "topic": "mobile",
+      "text": "The mobile app will use React Native, not Flutter.",
+      "priority": 2,
+      "sources": ["msg_syn_0021"]
+    },
+    {
+      "kind": "fact",
+      "topic": "quarterly",
+      "text": "The quarterly offsite is in Lisbon this year.",
+      "priority": 1,
+      "sources": ["msg_syn_0025"]
+    },
+    {
+      "kind": "fact",
+      "topic": "manager",
+      "text": "My manager is Teodora.",
+      "priority": 3,
+      "sources": ["msg_syn_0029"]
+    },
+    {
+      "kind": "fact",
+      "topic": "search",
+      "text": "The search index rebuild runs nightly at 02:30.",
+      "priority": 2,
+      "sources": ["msg_syn_0033"]
+    },
+    {
+      "kind": "fact",
+      "topic": "allergic",
+      "text": "I'm allergic to peanuts, remember for team lunches.",
+      "priority": 1,
+      "sources": ["msg_syn_0037"]
+    },
+    {
+      "kind": "fact",
+      "topic": "for",
+      "text": "Budget for contractors is capped at 30k per quarter.",
+      "priority": 3,
+      "sources": ["msg_syn_0041"]
+    },
+    {
+      "kind": "fact",
+      "topic": "will",
+      "text": "We will write release notes in Notion, not Confluence.",
+      "priority": 2,
+      "sources": ["msg_syn_0045"]
+    },
+    {
+      "kind": "fact",
+      "topic": "rotation",
+      "text": "Password rotation for service accounts happens every 90 days.",
+      "priority": 1,
+      "sources": ["msg_syn_0049"]
+    },
+    {
+      "kind": "fact",
+      "topic": "data",
+      "text": "The data warehouse moved to Snowflake in spring.",
+      "priority": 3,
+      "sources": ["msg_syn_0053"]
+    },
+    {
+      "kind": "fact",
+      "topic": "pricing",
+      "text": "The pricing page experiment uses three tiers.",
+      "priority": 2,
+      "sources": ["msg_syn_0057"]
+    },
+    {
+      "kind": "fact",
+      "topic": "demo",
+      "text": "The demo account email is demo@orchard.example.",
+      "priority": 1,
+      "sources": ["msg_syn_0061"]
+    },
+    {
+      "kind": "fact",
+      "topic": "committed",
+      "text": "We committed to a 99.9 percent uptime SLA.",
+      "priority": 3,
+      "sources": ["msg_syn_0065"]
+    },
+    {
+      "kind": "fact",
+      "topic": "orchard",
+      "text": "The Orchard logo color is deep teal.",
+      "priority": 2,
+      "sources": ["msg_syn_0069"]
+    },
+    {
+      "kind": "fact",
+      "topic": "like",
+      "text": "I'd like status updates in bullet points, not paragraphs.",
+      "priority": 1,
+      "sources": ["msg_syn_0073"]
+    },
+    {
+      "kind": "fact",
+      "topic": "releases",
+      "text": "Mobile releases go out every other Thursday.",
+      "priority": 3,
+      "sources": ["msg_syn_0077"]
+    }
+  ]
+}

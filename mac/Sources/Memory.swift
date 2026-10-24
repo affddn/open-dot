@@ -4,6 +4,11 @@ import SwiftUI
 /// The longest note, goal or next action the daemon accepts, and the longest repeat, in minutes.
 let memoryTextLimit = 2000
 let maxEveryMinutes = 365 * 24 * 60
+/// The longest observation text the daemon accepts.
+let observationTextLimit = 500
+/// What the observer's daily token budget means, in the daemon's own words.
+let dailyBudgetNote = "Daily budget. One in-flight job can overshoot it, and then the observer stops until tomorrow."
+
 
 /// An edit in progress: the item as it was when the owner started, which fixes the version sent,
 /// and the values being edited. It lives in the store, so it survives the panel folding away.
@@ -29,6 +34,7 @@ struct MemoryDraft: Equatable {
       due = Date(timeIntervalSince1970: reminder.dueAt / 1000)
       repeats = reminder.everyMinutes != nil
       every = reminder.everyMinutes ?? 60
+    case .observation(let row): text = row.text
     }
   }
 
@@ -37,12 +43,13 @@ struct MemoryDraft: Equatable {
     case .note(let note): note.version
     case .responsibility(let item): item.version
     case .reminder(let reminder): reminder.version
+    case .observation(let row): row.version
     }
   }
 
   var summary: String {
     switch base {
-    case .note: text
+    case .note, .observation: text
     case .responsibility: "\(goal)\nNext: \(nextAction)\nStatus: \(status)"
     case .reminder: "\(due.formatted()), \(repeats ? "every \(every) minutes" : "one-off")"
     }
@@ -62,6 +69,10 @@ struct MemoryDraft: Equatable {
     case .note(let note):
       let text = try checked(self.text, "A note")
       if text != note.text { fields["text"] = text }
+    case .observation(let row):
+      let text = try checked(self.text, "An observation")
+      if text.utf16.count > observationTextLimit { throw MemoryInvalid("An observation must be at most \(observationTextLimit) characters.") }
+      if text != row.text { fields["text"] = text }
     case .responsibility(let item):
       let goal = try checked(self.goal, "The goal")
       let next = try checked(self.nextAction, "The next action")
@@ -206,6 +217,17 @@ struct MemoryState {
     let shown = Set(memory.notes.map(\.id))
     sources = sources.filter { shown.contains($0.key) }
     for note in memory.notes { dropStaleSource(note) }
+    return true
+  }
+
+  /// Appends an older page of observed rows, only if the page shown still continues at `before`,
+  /// skipping rows already shown. False when a refresh or change came first.
+  mutating func appendObservations(_ page: ObservationPage, before: Int) -> Bool {
+    guard var memory, memory.observationsNext == before else { return false }
+    let shown = Set((memory.observations ?? []).map(\.id))
+    memory.observations = (memory.observations ?? []) + page.observations.filter { !shown.contains($0.id) }
+    memory.observationsNext = page.next
+    self.memory = memory
     return true
   }
 
@@ -369,6 +391,10 @@ struct MemoryState {
       if let index = memory.responsibilities.firstIndex(where: { $0.id == item.id }) { memory.responsibilities[index] = item } else { memory.responsibilities.append(item) }
     case .reminder(let reminder):
       if let index = memory.reminders.firstIndex(where: { $0.id == reminder.id }) { memory.reminders[index] = reminder } else { memory.reminders.append(reminder) }
+    case .observation(let row):
+      var rows = memory.observations ?? []
+      if let index = rows.firstIndex(where: { $0.id == row.id }) { rows[index] = row } else { rows.append(row) }
+      memory.observations = rows
     }
     self.memory = memory
   }
@@ -384,6 +410,7 @@ struct MemoryState {
       }
     case .responsibility: memory?.responsibilities.removeAll { $0.id == key.id }
     case .reminder: memory?.reminders.removeAll { $0.id == key.id }
+    case .observation: memory?.observations?.removeAll { $0.id == key.id }
     }
   }
 }
@@ -457,6 +484,27 @@ struct MemoryView: View {
             if memory.responsibilities.isEmpty { empty }
             ForEach(memory.responsibilities) { MemoryRow(store: store, dot: name, item: .responsibility($0)) }
             TriggerList(store: store, dot: name, memory: memory)
+          }
+          if let rows = memory.observations {
+            section("Observed") {
+              Text("What a background observer noted about this conversation. It may be wrong: edit or forget any row. Forgetting never deletes the messages it came from.")
+                .font(.caption2).foregroundStyle(.secondary)
+              Text(dailyBudgetNote)
+                .font(.caption2).foregroundStyle(.secondary)
+                .accessibilityIdentifier("observer-daily-budget")
+              if rows.isEmpty { empty }
+              ForEach(rows) { MemoryRow(store: store, dot: name, item: .observation($0)) }
+              if memory.observationsNext != nil {
+                Button(store.loadingObservations.contains(name) ? "Loading…" : "Load older") { store.loadOlderObservations(name) }
+                  .buttonStyle(.plain)
+                  .font(.caption2.weight(.semibold))
+                  .disabled(store.loadingObservations.contains(name))
+                  .accessibilityIdentifier("observations-older")
+              }
+              if let superseded = memory.observationsSuperseded, superseded > 0 {
+                Text("\(superseded) older observations were superseded.").font(.caption2).foregroundStyle(.tertiary)
+              }
+            }
           }
           section("Scheduled reminders") {
             if memory.reminders.isEmpty { empty }
@@ -637,6 +685,10 @@ struct MemoryRow: View {
     case .reminder(let reminder):
       Text(verbatim: reminder.text).font(.callout)
       Text(verbatim: when(reminder)).font(.caption).foregroundStyle(.secondary)
+    case .observation(let row):
+      Text(verbatim: row.text).font(.callout).textSelection(.enabled)
+      Text(verbatim: "\(row.kind) · \(row.topic) · priority \(row.priority)").font(.caption).foregroundStyle(.secondary)
+      ObservationSources(store: store, dot: dot, sources: row.sources, id: row.id)
     }
   }
 
@@ -645,6 +697,7 @@ struct MemoryRow: View {
     case .note(let note): memoryChange(note.updatedAt, by: note.updatedBy, dot: dot) + (note.source == nil ? " · source unknown" : "")
     case .responsibility(let item): memoryChange(item.updatedAt, by: item.updatedBy, dot: dot)
     case .reminder(let reminder): memoryChange(reminder.updatedAt, by: reminder.updatedBy, dot: dot)
+    case .observation(let row): memoryChange(row.updatedAt, by: row.updatedBy == "owner" ? "owner" : "the observer", dot: dot)
     }
   }
 
@@ -656,6 +709,7 @@ struct MemoryRow: View {
   private var removalTitle: String? {
     switch item {
     case .note: "Delete…"
+    case .observation: "Forget…"
     case .reminder: "Cancel…"
     case .responsibility: nil
     }
@@ -678,6 +732,8 @@ struct MemoryRow: View {
     switch item {
     case .note:
       TextField("Note", text: draft.text, axis: .vertical).lineLimit(1...6)
+    case .observation:
+      TextField("Observation", text: draft.text, axis: .vertical).lineLimit(1...6)
     case .responsibility:
       TextField("Goal", text: draft.goal, axis: .vertical).lineLimit(1...3)
       TextField("Next action", text: draft.nextAction, axis: .vertical).lineLimit(1...3)
@@ -723,6 +779,11 @@ struct MemoryRow: View {
       alert.informativeText = "\(dot) won't see it in its memory any more: \(note.text.prefix(200))"
       alert.addButton(withTitle: "Cancel")
       alert.addButton(withTitle: "Delete").hasDestructiveAction = true
+    case .observation(let row):
+      alert.messageText = "Forget this observation?"
+      alert.informativeText = "It leaves the ledger, and an observer job already running can't save it back. The archived messages it came from stay, so recall and later observations may still surface what they said: \(row.text.prefix(200))"
+      alert.addButton(withTitle: "Cancel")
+      alert.addButton(withTitle: "Forget").hasDestructiveAction = true
     case .reminder(let reminder):
       alert.messageText = "Cancel this reminder?"
       alert.informativeText = "It won't go off\(reminder.everyMinutes == nil ? "" : " again"): \(reminder.text.prefix(200))"
@@ -733,6 +794,48 @@ struct MemoryRow: View {
     }
     guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
     store.removeMemory(dot, item)
+  }
+}
+
+/// The archived messages an observation came from, as excerpts the daemon read from its archive.
+/// They are what was said, shown as plain text; nothing here is fetched or opened.
+struct ObservationSources: View {
+  let store: Store
+  let dot: String
+  let sources: [ObservationSource]
+  let id: Int
+
+  var body: some View {
+    DisclosureGroup("Sources (\(sources.count))") {
+      VStack(alignment: .leading, spacing: 4) {
+        ForEach(sources, id: \.messageID) { source in
+          VStack(alignment: .leading, spacing: 1) {
+            Text(verbatim: "\(source.from ?? "unknown") · \(source.date ?? "") · \(source.messageID)")
+              .font(.caption2.monospaced()).foregroundStyle(.secondary)
+            Text(verbatim: source.missing == true ? "No longer archived." : source.excerpt ?? "")
+              .font(.caption2).textSelection(.enabled)
+            if source.missing != true {
+              switch store.observationSources["\(dot)/\(id)/\(source.messageID)"] {
+              case .success(let read)?:
+                Text(verbatim: read.state == "found" ? (read.text ?? "") + (read.truncated == true ? "…" : "") : "No longer archived.")
+                  .font(.caption2).textSelection(.enabled)
+                  .accessibilityIdentifier("observation-source-text-\(id)-\(source.messageID)")
+              case .failure(let failure)?:
+                Text(verbatim: failure.message).font(.caption2).foregroundStyle(.red)
+              case nil:
+                Button("Open") { store.openObservationSource(dot, observation: id, message: source.messageID) }
+                  .buttonStyle(.plain).font(.caption2.weight(.semibold))
+                  .help("Show what was said, from open-dot's archive, as plain text.")
+                  .accessibilityIdentifier("observation-source-open-\(id)-\(source.messageID)")
+              }
+            }
+          }
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    .font(.caption2)
+    .accessibilityIdentifier("observation-sources-\(id)")
   }
 }
 

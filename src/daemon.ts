@@ -4,6 +4,7 @@ import { SessionMessage } from "@opencode/client/effect";
 import { and, asc, eq, gt, inArray, isNull, lte, ne, or, isNotNull } from "drizzle-orm";
 import { Effect, Exit, type Layer, Result, Schedule, Semaphore } from "effect";
 import { archiveAll, archivingDots } from "./archive";
+import { observePass, observerWork } from "./observer";
 import type { Db } from "./db";
 import { outputDirectory, worktreeDirectory } from "./home";
 import {
@@ -1263,7 +1264,8 @@ const report = (error: { readonly message: string }) =>
  * OpenCode. The worker, supervision and delivery pass, the answer pass, the Threads pass, the
  * scheduled run pass and the archive pass each connect on their own, the answer pass only when an
  * answer is queued, the run pass only while a run is open and the archive pass only while some
- * dot's archive is on. Only the answer loop sends answers, one at a time, so none is sent twice.
+ * dot's archive is on, and the observer pass only for a job of a dot whose observer is on. Only
+ * the answer loop sends answers, one at a time, so none is sent twice.
  */
 export const daemonLoops = (db: Db, layer: Layer.Layer<OpenCode, OpenCodeError>) => {
   const work = Effect.suspend(() => {
@@ -1302,6 +1304,19 @@ export const daemonLoops = (db: Db, layer: Layer.Layer<OpenCode, OpenCodeError>)
         )
       : Effect.void,
   );
+  // The database-only part always runs; OpenCode is reached only for a job of a dot whose
+  // observer is on. A pass that times out leaves jobs `started`, which the next one looks up.
+  const observing = Effect.suspend(() =>
+    observerWork(db, Date.now())
+      ? observePass(db).pipe(
+          Effect.provide(layer),
+          Effect.timeout("5 minutes"),
+          Effect.catch(() => Effect.void),
+        )
+      : Effect.void,
+  ).pipe(
+    Effect.catchDefect((defect) => Effect.sync(() => console.error(`Observer: ${String(defect)}`))),
+  );
   return Effect.all(
     [
       Effect.repeat(work, Schedule.spaced("1 second")),
@@ -1310,6 +1325,7 @@ export const daemonLoops = (db: Db, layer: Layer.Layer<OpenCode, OpenCodeError>)
       Effect.repeat(threads, Schedule.spaced("5 seconds")),
       Effect.repeat(runs, Schedule.spaced("5 seconds")),
       Effect.repeat(archiving, Schedule.spaced("10 seconds")),
+      Effect.repeat(observing, Schedule.spaced("10 seconds")),
     ],
     { concurrency: "unbounded", discard: true },
   );

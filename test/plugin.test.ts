@@ -4,11 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Plugin } from "@opencode/plugin";
 import { eq } from "drizzle-orm";
-import { Effect } from "effect";
-import { autoRecallBytes, saveArchiveSettings } from "../src/archive";
+import { Effect, Layer } from "effect";
+import { autoRecallBytes, saveArchiveSettings, settingsOf } from "../src/archive";
 import { openDatabase } from "../src/db";
+import { forgetObservation, settleHead } from "../src/ledger";
+import { observerOutputTokens } from "../src/observer";
+import { OpenCode, OpenCodeError } from "../src/opencode";
 import { createDot, findDot } from "../src/dots";
-import { databasePath, home, outputDirectory } from "../src/home";
+import { databasePath, home, observerDirectory, outputDirectory } from "../src/home";
 import { cancelReminder, editNote, editResponsibility } from "../src/memory";
 import plugin from "../src/plugin";
 import { saveReaction } from "../src/reactions";
@@ -16,6 +19,9 @@ import {
   archive,
   artifacts,
   dots,
+  ledger,
+  ledgerState,
+  observerJobs,
   feed,
   hiddenMessages,
   notes,
@@ -80,6 +86,7 @@ async function load(
 ) {
   const tools = new Map<string, FakeTool>();
   let hook: ContextHook | undefined;
+  let compactionHook: ContextHook | undefined;
   const reads: string[] = [];
   const turns: unknown[] = [];
   const context = {
@@ -106,8 +113,9 @@ async function load(
       synthetic: async (input: unknown) => {
         turns.push(input);
       },
-      hook: async (_name: string, callback: ContextHook) => {
-        hook = callback;
+      hook: async (name: string, callback: ContextHook) => {
+        if (name === "compaction") compactionHook = callback;
+        else hook = callback;
       },
     },
     // A dot never answers a permission request or question; any call here fails the test.
@@ -145,7 +153,17 @@ async function load(
     await hook?.(event);
     return event.messages;
   };
-  return { tools, injected, request, call, cleanup, reads, turns };
+  /** Runs the compaction hook on a compaction request's messages. */
+  const compacting = async (sessionID: string, messages: FakeMessage[]) => {
+    const event = { sessionID, messages: [...messages] };
+    await compactionHook?.(event);
+    return event.messages;
+  };
+  /** Runs the context hook on a raw event, as OpenCode passes it. */
+  const raw = async (event: unknown) => {
+    await hook?.(event as Parameters<ContextHook>[0]);
+  };
+  return { tools, injected, request, compacting, raw, call, cleanup, reads, turns };
 }
 
 test("issue27: model tool inputs cannot approve a binding or impersonate owner consent", async () => {
@@ -1252,11 +1270,14 @@ test("issue42: dot_recall and dot_zoom need the exact ready binding and frame bo
   message("msg_elsewhere", "ses_earlier", "sqlite from an earlier session");
   const loaded = await load(dot.directory);
   try {
-    // With the archive off, only notes are recalled and nothing can be opened.
-    expect(
-      data((await loaded.call("dot_recall", { query: "sqlite" })).content, "recall"),
-    ).toMatchObject([{ kind: "note", note: 1 }]);
-    expect(await fails(loaded.call("dot_zoom", { message_id: "msg_owner" }))).toBe(true);
+    // With the archive off, both answer so as a normal result; dot_search_notes still finds notes.
+    const off =
+      "The memory archive is off for this dot. dot_search_notes still searches your saved notes.";
+    expect((await loaded.call("dot_recall", { query: "sqlite" })).content).toBe(off);
+    expect((await loaded.call("dot_zoom", { message_id: "msg_owner" })).content).toBe(off);
+    expect(String((await loaded.call("dot_search_notes", { query: "sqlite" })).content)).toContain(
+      "Decided: SQLite for storage.",
+    );
 
     saveArchiveSettings(db, "jojo", { archive: true }, 1);
     const found = (await loaded.call("dot_recall", { query: "sqlite", limit: 1 })).content;
@@ -1546,6 +1567,521 @@ test("issue42 phase 2: a rebind during the context read adds nothing, and a new 
     expect(tail).not.toContain("<recalled-context>");
   } finally {
     await loaded.cleanup?.();
+    db.$client.close();
+  }
+});
+
+/** A ledger row as the observer saves it. */
+const observed = (
+  db: ReturnType<typeof openDatabase>,
+  text: string,
+  topic = "plans",
+  updatedAt = 1,
+) =>
+  db
+    .insert(ledger)
+    .values({
+      dot: "jojo",
+      sessionID: dot.sessionID,
+      kind: "decision",
+      topic,
+      text,
+      priority: 1,
+      validFrom: 1,
+      sources: ["msg_budget"],
+      updatedBy: "observer",
+      createdAt: updatedAt,
+      updatedAt,
+    })
+    .returning()
+    .get();
+
+const compactionItem = (id: string, native = false) =>
+  ({
+    id,
+    type: "compaction",
+    text: "",
+    time: { created: 0 },
+    status: "completed",
+    ...(native ? { native: { messages: [] } } : {}),
+  }) as HistoryItem;
+
+test("issue42 phase 3: the checkpoint leads every request until the next compaction, and the compaction hook sees it", async () => {
+  const db = openDatabase(databasePath());
+  archived(db, "msg_budget", "The quarterly budget for the Lisbon offsite is 40k euros.");
+  observed(db, "The Lisbon offsite budget is 40k.", "Lisbon offsite");
+  const history: HistoryItem[] = [
+    compactionItem("msg_compact"),
+    ownerAsk("msg_ask", "Hello again"),
+  ];
+  const loaded = await load(dot.directory, history);
+  const prompt: FakeMessage = { role: "user", content: [{ text: "Hello again" }] };
+  const earlier: FakeMessage = { role: "assistant", content: [{ text: "Earlier reply" }] };
+  try {
+    // Off by default: no checkpoint, even once one is built.
+    settleHead(db, {
+      id: 1,
+      dot: "jojo",
+      sessionID: dot.sessionID,
+      trigger: "msg_compact",
+      native: false,
+    });
+    expect((await loaded.request(dot.sessionID, [earlier, prompt]))[0]).toBe(earlier);
+    saveArchiveSettings(db, "jojo", { ledger: true, frozenHead: true }, 1);
+    // A later intent sets it; the same one settling again never would.
+    settleHead(db, {
+      id: 2,
+      dot: "jojo",
+      sessionID: dot.sessionID,
+      trigger: "msg_compact",
+      native: false,
+    });
+    const first = await loaded.request(dot.sessionID, [earlier, prompt]);
+    const head = first[0]?.content[0]?.text ?? "";
+    expect(head).toStartWith("# Observed checkpoint");
+    expect(head).toContain("The Lisbon offsite budget is 40k.");
+    expect(first.at(-1)).toBe(prompt);
+    // A new row since appears only in the tail, so the checkpoint stays the same text.
+    observed(db, "Flights are booked separately.", "Lisbon offsite", Date.now() + 1_000);
+    const second = await loaded.request(dot.sessionID, [earlier, prompt]);
+    expect(second[0]?.content[0]?.text).toBe(head);
+    expect(second.at(-2)?.content[0]?.text).toContain("<observed-since-checkpoint>");
+    expect(second.at(-2)?.content[0]?.text).toContain("Flights are booked separately.");
+    // The compaction request leads with it too.
+    const compacting = await loaded.compacting(dot.sessionID, [earlier, prompt]);
+    expect(compacting[0]?.content[0]?.text).toBe(head);
+    // A native compaction keeps phases 1 and 2 only.
+    history[0] = compactionItem("msg_compact", true);
+    expect((await loaded.request(dot.sessionID, [earlier, prompt]))[0]).toBe(earlier);
+    expect((await loaded.compacting(dot.sessionID, [earlier, prompt]))[0]).toBe(earlier);
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+});
+
+test("issue42 phase 3: ranked notes cap the list, and the ledger leads recall and zooms to its sources", async () => {
+  const db = openDatabase(databasePath());
+  for (let at = 0; at < 40; at++)
+    db.insert(notes)
+      .values({ dot: "jojo", text: `Note ${at} about lunch.`, createdAt: at })
+      .run();
+  db.insert(notes)
+    .values({ dot: "jojo", text: "Lisbon trip budget is fixed.", createdAt: 0 })
+    .run();
+  filler(db);
+  archived(db, "msg_budget", "The quarterly budget for the Lisbon offsite is 40k euros.");
+  const row = observed(db, "The Lisbon offsite budget is 40k.", "Lisbon offsite");
+  const loaded = await load(dot.directory, [ownerAsk("msg_ask", "What's the Lisbon budget?")]);
+  try {
+    // Unranked, every note is listed, as before.
+    expect(await loaded.injected(dot.sessionID)).toContain("- #40: Note 39 about lunch.");
+    saveArchiveSettings(db, "jojo", { rankNotes: true }, 1);
+    const ranked = await loaded.injected(dot.sessionID);
+    // The note matching the owner's message comes first; the rest are capped and counted.
+    expect(ranked.indexOf("Lisbon trip budget is fixed.")).toBeLessThan(ranked.indexOf("Note 39"));
+    expect(ranked).toContain("11 more saved notes aren't listed here");
+    expect(ranked).not.toContain("- #1: Note 0 about lunch.");
+
+    // dot_recall leads with observed rows only while the ledger is on.
+    const plain = String((await loaded.call("dot_recall", { query: "Lisbon budget" })).content);
+    expect(plain).not.toContain('"observed"');
+    saveArchiveSettings(db, "jojo", { archive: true, autoRecall: true, ledger: true }, 2);
+    const found = String((await loaded.call("dot_recall", { query: "Lisbon budget" })).content);
+    const results = JSON.parse(
+      found.slice(found.indexOf("<recall>\n") + 9, found.lastIndexOf("\n</recall>")),
+    ) as { kind: string; observation?: number }[];
+    expect(results[0]).toMatchObject({ kind: "observed", observation: row.id });
+    const zoomed = String((await loaded.call("dot_zoom", { observation: row.id })).content);
+    expect(zoomed).toContain("background observer's note");
+    expect(zoomed).toContain("The quarterly budget for the Lisbon offsite is 40k euros.");
+    expect(await fails(loaded.call("dot_zoom", { observation: row.id, message_id: "msg_x" }))).toBe(
+      true,
+    );
+    // Automatic recall puts the observed row first.
+    const tail = await loaded.injected(dot.sessionID);
+    const recalledJSON = tail.slice(
+      tail.indexOf("<recalled-context>\n") + 19,
+      tail.indexOf("\n</recalled-context>"),
+    );
+    expect(JSON.parse(recalledJSON)[0]).toMatchObject({ observation: row.id });
+    saveArchiveSettings(db, "jojo", { ledger: false }, 3);
+    expect((await loaded.call("dot_zoom", { observation: row.id })).content).toBe(
+      "The observed ledger is off for this dot.",
+    );
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+});
+
+test("issue42 phase 3: a forget, the ledger turned off or a native compaction strip observed recall at once", async () => {
+  const db = openDatabase(databasePath());
+  filler(db);
+  archived(db, "msg_budget", "The quarterly budget for the Lisbon offsite is 40k euros.");
+  const row = observed(db, "The Lisbon offsite budget is 40k.", "Lisbon offsite");
+  for (let at = 0; at < 35; at++)
+    db.insert(notes)
+      .values({ dot: "jojo", text: `Note ${at}.`, createdAt: at })
+      .run();
+  saveArchiveSettings(
+    db,
+    "jojo",
+    { archive: true, autoRecall: true, ledger: true, rankNotes: true },
+    1,
+  );
+  const history: HistoryItem[] = [ownerAsk("msg_ask", "What's the Lisbon offsite budget?")];
+  const loaded = await load(dot.directory, history);
+  const observedFirst = async () => {
+    const tail = await loaded.injected(dot.sessionID);
+    const entries = recalledData(tail) as { observation?: number }[] | undefined;
+    return entries?.some((entry) => entry.observation === row.id) ?? false;
+  };
+  try {
+    expect(await observedFirst()).toBe(true);
+    // Same owner message, but the row is forgotten: the cached block isn't reused.
+    expect(forgetObservation(db, "jojo", row.id, 1)).toEqual({ deleted: true });
+    expect(await observedFirst()).toBe(false);
+
+    // A row the observer adds mid-turn waits for the next owner message, or a settings change.
+    const again = observed(db, "The Lisbon offsite budget is 40k again.", "Lisbon offsite");
+    expect(await observedFirst()).toBe(false);
+    saveArchiveSettings(db, "jojo", { ledger: false }, 2);
+    expect(JSON.stringify(recalledData(await loaded.injected(dot.sessionID)) ?? [])).not.toContain(
+      '"observation"',
+    );
+    saveArchiveSettings(db, "jojo", { ledger: true }, 3);
+    expect(
+      recalledData(await loaded.injected(dot.sessionID))?.some(
+        (entry) => (entry as { observation?: number }).observation === again.id,
+      ),
+    ).toBe(true);
+
+    // After a native compaction, phases 1 and 2 only: no observed rows, notes listed in full,
+    // and the tools set the ledger aside.
+    history.unshift(compactionItem("msg_native", true));
+    const tail = await loaded.injected(dot.sessionID);
+    expect(JSON.stringify(recalledData(tail) ?? [])).not.toContain('"observation"');
+    expect(tail).toContain("- #1: Note 0.");
+    expect(tail).not.toContain("more saved notes aren't listed");
+    const found = String((await loaded.call("dot_recall", { query: "Lisbon budget" })).content);
+    expect(found).not.toContain('"observed"');
+    expect(String((await loaded.call("dot_zoom", { observation: again.id })).content)).toContain(
+      "set aside for this dot",
+    );
+    // Back on a text compaction, they return.
+    history[0] = compactionItem("msg_text");
+    expect(String((await loaded.call("dot_recall", { query: "Lisbon budget" })).content)).toContain(
+      '"observed"',
+    );
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+});
+
+test("issue42 phase 3: an observer scratch session's requests get the output cap and no tools", async () => {
+  const db = openDatabase(databasePath());
+  db.insert(observerJobs)
+    .values({
+      dot: "jojo",
+      sessionID: dot.sessionID,
+      kind: "tokens",
+      trigger: "t",
+      state: "running",
+      epoch: 0,
+      model: "fake/m",
+      scratchSession: "ses_scratch",
+      promptMessage: "msg_p",
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    .run();
+  const loaded = await load(observerDirectory("jojo"));
+  try {
+    const event = {
+      sessionID: "ses_scratch",
+      messages: [],
+      options: {} as Record<string, unknown>,
+      tools: { shell: {} } as Record<string, unknown>,
+    };
+    await loaded.raw(event);
+    expect(event.options.maxTokens).toBe(observerOutputTokens);
+    expect(event.tools).toEqual({});
+    // Any other session there is left alone, and no dot tools load.
+    const other = { sessionID: "ses_other", messages: [], options: {}, tools: { shell: {} } };
+    await loaded.raw(other);
+    expect(other.tools).toEqual({ shell: {} });
+    expect(loaded.tools.size).toBe(0);
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+});
+
+test("issue42 phase 3: switches changed within one millisecond still drop a cached observed recall", async () => {
+  const db = openDatabase(databasePath());
+  filler(db);
+  archived(db, "msg_budget", "The quarterly budget for the Lisbon offsite is 40k euros.");
+  const row = observed(db, "The Lisbon offsite budget is 40k.", "Lisbon offsite");
+  const fixed = 123_456_789;
+  saveArchiveSettings(db, "jojo", { archive: true, autoRecall: true, ledger: true }, fixed);
+  const loaded = await load(dot.directory, [
+    ownerAsk("msg_ask", "What's the Lisbon offsite budget?"),
+  ]);
+  const observedIDs = async () =>
+    ((recalledData(await loaded.injected(dot.sessionID)) ?? []) as { observation?: number }[])
+      .map((entry) => entry.observation)
+      .filter((id) => id !== undefined);
+  const { api } = await import("../src/api");
+  const put = (body: unknown) =>
+    api(
+      db,
+      "secret",
+      Layer.effect(OpenCode, Effect.fail(new OpenCodeError({ message: "down" }))),
+    )(
+      new Request(`http://127.0.0.1/dots/jojo/memory/archive`, {
+        method: "PUT",
+        headers: { authorization: "Bearer secret", "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    );
+  const clock = Date.now;
+  try {
+    expect(await observedIDs()).toEqual([row.id]);
+    // The owner's API writes at the very same millisecond the recall was cached at.
+    Date.now = () => fixed;
+    expect((await put({ ledger: false })).status).toBe(200);
+    expect(settingsOf(db, "jojo").updatedAt).toBe(fixed);
+    expect(await observedIDs()).toEqual([]);
+    expect((await put({ ledger: true })).status).toBe(200);
+    expect(await observedIDs()).toEqual([row.id]);
+    expect((await put({ autoRecall: false })).status).toBe(200);
+    expect(recalledData(await loaded.injected(dot.sessionID))).toBeUndefined();
+  } finally {
+    Date.now = clock;
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+});
+
+test("issue42 phase 3: dot_zoom refuses an observation when the ledger is turned off during its context read", async () => {
+  const db = openDatabase(databasePath());
+  archived(db, "msg_budget", "The quarterly budget for the Lisbon offsite is 40k euros.");
+  const row = observed(db, "The Lisbon offsite budget is 40k.", "Lisbon offsite");
+  saveArchiveSettings(db, "jojo", { archive: true, ledger: true }, 1);
+  let off = false;
+  const loaded = await load(dot.directory, [ownerAsk("msg_ask", "Budget?")], () => {
+    if (off) saveArchiveSettings(db, "jojo", { ledger: false }, 2);
+  });
+  try {
+    expect(String((await loaded.call("dot_zoom", { observation: row.id })).content)).toContain(
+      "The Lisbon offsite budget is 40k.",
+    );
+    off = true;
+    expect((await loaded.call("dot_zoom", { observation: row.id })).content).toBe(
+      "The observed ledger is off for this dot.",
+    );
+    expect(settingsOf(db, "jojo").ledger).toBe(false);
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+});
+
+/** Every tool the plugin registers, in order, with its description, schema and options. */
+const registry = (tools: Map<string, FakeTool>) =>
+  [...tools.values()].map((tool) => {
+    const { name, description, input, options } = tool as FakeTool & {
+      description: string;
+      input: unknown;
+      options: unknown;
+    };
+    return `${name}\n${description}\n${Bun.inspect(input, { depth: 30 })}\n${JSON.stringify(options)}`;
+  });
+
+test("issue42 cache: the tool list and every schema are identical under every switch combination", async () => {
+  const db = openDatabase(databasePath());
+  const switches = [
+    "archive",
+    "autoRecall",
+    "observer",
+    "ledger",
+    "frozenHead",
+    "rankNotes",
+  ] as const;
+  let baseline: string[] | undefined;
+  try {
+    for (let mask = 0; mask < 1 << switches.length; mask++) {
+      saveArchiveSettings(
+        db,
+        "jojo",
+        Object.fromEntries(switches.map((name, at) => [name, (mask & (1 << at)) !== 0])),
+        mask,
+      );
+      const loaded = await load(dot.directory);
+      const listed = registry(loaded.tools);
+      await loaded.cleanup?.();
+      baseline ??= listed;
+      expect(listed).toEqual(baseline);
+    }
+    expect(baseline).toContain(baseline?.find((each) => each.startsWith("dot_recall\n")));
+    expect(baseline?.some((each) => each.startsWith("dot_zoom\n"))).toBe(true);
+    // Toggling while loaded never changes what's registered either.
+    const loaded = await load(dot.directory);
+    const before = registry(loaded.tools);
+    saveArchiveSettings(db, "jojo", { archive: true, ledger: true }, 200);
+    await loaded.call("dot_recall", { query: "anything" });
+    saveArchiveSettings(db, "jojo", { archive: false, ledger: false }, 201);
+    await loaded.call("dot_recall", { query: "anything" });
+    expect(registry(loaded.tools)).toEqual(before);
+    expect(before).toEqual(baseline ?? []);
+    await loaded.cleanup?.();
+  } finally {
+    db.$client.close();
+  }
+});
+
+test("issue42 cache: the checkpoint keeps its exact bytes across requests, tool steps, time and observer updates", async () => {
+  const db = openDatabase(databasePath());
+  archived(db, "msg_budget", "The quarterly budget for the Lisbon offsite is 40k euros.");
+  const first = observed(db, "The Lisbon offsite budget is 40k.", "Lisbon offsite");
+  observed(db, "Flights are booked by the owner — ✈️ «déjà».", "Travel");
+  saveArchiveSettings(
+    db,
+    "jojo",
+    { archive: true, autoRecall: true, ledger: true, frozenHead: true },
+    1,
+  );
+  settleHead(db, {
+    id: 1,
+    dot: "jojo",
+    sessionID: dot.sessionID,
+    trigger: "msg_compact",
+    native: false,
+  });
+  const history: HistoryItem[] = [
+    compactionItem("msg_compact"),
+    ownerAsk("msg_ask", "Lisbon budget?"),
+  ];
+  const loaded = await load(dot.directory, history);
+  const earlier: FakeMessage = { role: "assistant", content: [{ text: "Earlier reply" }] };
+  const prompt: FakeMessage = { role: "user", content: [{ text: "Lisbon budget?" }] };
+  const headBytes = async () =>
+    Buffer.from(
+      (await loaded.request(dot.sessionID, [earlier, prompt]))[0]?.content[0]?.text ?? "",
+    );
+  const clock = Date.now;
+  try {
+    const head = await headBytes();
+    const text = head.toString("utf8");
+    expect(text).toStartWith("# Observed checkpoint");
+    expect(text).toContain("✈️ «déjà»");
+    // No times, counts or versions inside it.
+    expect(text).not.toMatch(/\d{4}-\d{2}-\d{2}T/);
+    for (const key of ['"validFrom"', '"latest"', '"count"', '"total"', '"version"', '"updatedAt"'])
+      expect(text).not.toContain(key);
+    // A tool step, time passing, and the observer adding and updating rows: the same bytes.
+    expect((await headBytes()).equals(head)).toBe(true);
+    Date.now = () => clock() + 3 * 60 * 60_000;
+    expect((await headBytes()).equals(head)).toBe(true);
+    observed(db, "A row observed since the checkpoint.", "Since", clock() + 1);
+    db.update(ledger)
+      .set({ priority: 3, text: "The Lisbon budget is now 45k." })
+      .where(eq(ledger.id, first.id))
+      .run();
+    expect((await headBytes()).equals(head)).toBe(true);
+    // The new row goes in the tail instead.
+    const tail = await loaded.injected(dot.sessionID);
+    expect(tail).toContain("A row observed since the checkpoint.");
+    // The compaction request leads with exactly the same message, and adds nothing of its own.
+    const parent = await loaded.request(dot.sessionID, [earlier, prompt]);
+    const compacting = await loaded.compacting(dot.sessionID, [earlier, prompt]);
+    expect(compacting).toEqual([parent[0] ?? earlier, earlier, prompt]);
+    expect(compacting[0]).not.toBe(earlier);
+    expect(parent.slice(0, 2)).toEqual(compacting.slice(0, 2));
+    // The owner forgets a row: the checkpoint goes away once, never shows it again, until the
+    // next compaction sets a new one.
+    Date.now = clock;
+    expect(forgetObservation(db, "jojo", first.id, 1)).toEqual({ deleted: true });
+    const without = await loaded.request(dot.sessionID, [earlier, prompt]);
+    expect(without[0]).toBe(earlier);
+    expect(JSON.stringify(without)).not.toContain("The Lisbon budget is now 45k.");
+    expect((await loaded.compacting(dot.sessionID, [earlier, prompt]))[0]).toBe(earlier);
+    history[0] = compactionItem("msg_compact_2");
+    settleHead(db, {
+      id: 2,
+      dot: "jojo",
+      sessionID: dot.sessionID,
+      trigger: "msg_compact_2",
+      native: false,
+    });
+    const renewed = await headBytes();
+    expect(renewed.toString("utf8")).not.toContain("Lisbon budget");
+    expect((await headBytes()).equals(renewed)).toBe(true);
+  } finally {
+    Date.now = clock;
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+});
+
+test("issue42 cache: dot_recall answers that the archive is off when it's turned off during its context read", async () => {
+  const db = openDatabase(databasePath());
+  archived(db, "msg_budget", "The quarterly budget for the Lisbon offsite is 40k euros.");
+  observed(db, "The Lisbon offsite budget is 40k.", "Lisbon offsite");
+  saveArchiveSettings(db, "jojo", { archive: true, ledger: true }, 1);
+  let off = false;
+  const loaded = await load(dot.directory, [ownerAsk("msg_ask", "Budget?")], () => {
+    if (off) saveArchiveSettings(db, "jojo", { archive: false }, 2);
+  });
+  try {
+    expect(String((await loaded.call("dot_recall", { query: "Lisbon budget" })).content)).toContain(
+      "Lisbon",
+    );
+    off = true;
+    expect((await loaded.call("dot_recall", { query: "Lisbon budget" })).content).toBe(
+      "The memory archive is off for this dot. dot_search_notes still searches your saved notes.",
+    );
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+});
+
+test("issue42 cache: settling the same compaction again changes nothing, nor brings back a head the owner took away", async () => {
+  const db = openDatabase(databasePath());
+  const row = observed(db, "The Lisbon offsite budget is 40k.", "Lisbon offsite");
+  saveArchiveSettings(db, "jojo", { archive: true, ledger: true, frozenHead: true }, 1);
+  const job = {
+    id: 7,
+    dot: "jojo",
+    sessionID: dot.sessionID,
+    trigger: "msg_compact",
+    native: false,
+  };
+  const head = () => db.select().from(ledgerState).get();
+  const clock = Date.now;
+  try {
+    settleHead(db, job);
+    const first = head();
+    // The observer adds and changes rows, time passes, and the same intent settles again.
+    observed(db, "A newer observation.", "Other", clock() + 1);
+    db.update(ledger).set({ text: "Changed by the observer." }).where(eq(ledger.id, row.id)).run();
+    Date.now = () => clock() + 60 * 60_000;
+    settleHead(db, job);
+    expect(head()).toEqual(first);
+    // The owner forgets the row: the head goes away, and the same intent can't restore it.
+    Date.now = clock;
+    expect(forgetObservation(db, "jojo", row.id, 1)).toEqual({ deleted: true });
+    settleHead(db, job);
+    expect(head()?.headText).toBeNull();
+    // Only a newer compaction's intent sets one again.
+    settleHead(db, { ...job, id: 8, trigger: "msg_compact_2" });
+    expect(head()?.headText).toContain("A newer observation.");
+    expect(head()?.headText).not.toContain("Lisbon");
+  } finally {
+    Date.now = clock;
     db.$client.close();
   }
 });

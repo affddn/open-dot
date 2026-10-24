@@ -312,6 +312,19 @@ export const memorySettings = sqliteTable("memory_settings", {
   updatedAt: integer("updated_at").notNull(),
   // Each request with a new owner message gets up to three strong archive matches at its tail.
   autoRecall: integer("auto_recall", { mode: "boolean" }).notNull().default(false),
+  // Migration 0032. `observer` runs background observer jobs in scratch sessions with
+  // `observer_model`, within `observer_daily_tokens` recorded per local day; `ledger` uses the
+  // observed rows in recall and the tail; `frozen_head` adds the checkpoint after a text
+  // compaction; `rank_notes` ranks and caps the saved notes each request lists.
+  observer: integer({ mode: "boolean" }).notNull().default(false),
+  ledger: integer({ mode: "boolean" }).notNull().default(false),
+  frozenHead: integer("frozen_head", { mode: "boolean" }).notNull().default(false),
+  rankNotes: integer("rank_notes", { mode: "boolean" }).notNull().default(false),
+  observerModel: text("observer_model"),
+  observerDailyTokens: integer("observer_daily_tokens").notNull().default(50_000),
+  // Advances whenever the archive, observer or observer model changes, so a job queued under
+  // other settings never runs or saves.
+  generation: integer().notNull().default(0),
 });
 
 /** An assistant message the walk saw unfinished, read again by ID until it's done. */
@@ -362,6 +375,134 @@ export const archive = sqliteTable(
 );
 
 export type Archived = typeof archive.$inferSelect;
+
+export const observationKinds = [
+  "decision",
+  "preference",
+  "commitment",
+  "fact",
+  "question",
+] as const;
+
+/**
+ * What a background observer noted about a dot's conversation, kept apart from the dot's own
+ * notes. A superseded row stays, pointing at its replacement; the owner may edit or forget any
+ * row, and forgetting deletes it, never the archived messages it came from.
+ */
+export const ledger = sqliteTable("ledger", {
+  id: integer().primaryKey({ autoIncrement: true }),
+  dot: text()
+    .notNull()
+    .references(() => dots.name),
+  sessionID: text("session_id").notNull(),
+  kind: text({ enum: observationKinds }).notNull(),
+  topic: text().notNull(),
+  text: text().notNull(),
+  // 1 is the most important, 3 the least.
+  priority: integer().notNull(),
+  validFrom: integer("valid_from").notNull(),
+  supersededBy: integer("superseded_by"),
+  // The archived messages it was observed from, by OpenCode message ID.
+  sources: text({ mode: "json" }).$type<readonly string[]>().notNull(),
+  job: integer(),
+  version: integer().notNull().default(1),
+  updatedBy: text("updated_by", { enum: ["observer", "owner"] }).notNull(),
+  createdAt: integer("created_at").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+export type Observation = typeof ledger.$inferSelect;
+
+/**
+ * Each dot's observer and checkpoint state. `epoch` advances whenever the owner edits or forgets
+ * a row, so a job begun before then saves nothing. `observed_through` is the last archive row a
+ * job was queued for. The head is the checkpoint text for one text compaction of one session.
+ */
+export const ledgerState = sqliteTable("ledger_state", {
+  dot: text()
+    .primaryKey()
+    .references(() => dots.name),
+  epoch: integer().notNull().default(0),
+  // How far jobs have claimed the archive: every row before `observed_through`, and that row's
+  // text before `observed_offset`. A job claims its chunk as it starts.
+  observedThrough: integer("observed_through").notNull().default(0),
+  observedOffset: integer("observed_offset").notNull().default(0),
+  // The job whose compaction set the head; an older compaction's job never replaces it.
+  headJob: integer("head_job"),
+  // Local midnight of the day the dot's recorded usage reached its daily budget: the observer
+  // makes no model call again that day, whatever its settings become.
+  stoppedDay: integer("stopped_day"),
+  headSession: text("head_session"),
+  headCompaction: text("head_compaction"),
+  headText: text("head_text"),
+  headAt: integer("head_at"),
+  // The rows the head shows, so recall doesn't repeat them.
+  headRows: text("head_rows", { mode: "json" }).$type<readonly number[]>(),
+});
+
+export const observerJobStates = [
+  "queued",
+  "started",
+  "running",
+  "done",
+  "failed",
+  "unknown",
+  "cancelled",
+] as const;
+
+/**
+ * A background observer job: queued for about 20k new archived tokens or a compaction of the
+ * dot's bound session. Its scratch session and prompt IDs are saved before any call; a lost
+ * outcome becomes `unknown` and is never sent again.
+ */
+export const observerJobs = sqliteTable(
+  "observer_jobs",
+  {
+    id: integer().primaryKey({ autoIncrement: true }),
+    dot: text()
+      .notNull()
+      .references(() => dots.name),
+    sessionID: text("session_id").notNull(),
+    kind: text({ enum: ["tokens", "compaction"] }).notNull(),
+    // The compaction's message ID, or the last archive row of a token job.
+    trigger: text().notNull(),
+    // A compaction OpenCode kept natively, which gets no checkpoint.
+    native: integer({ mode: "boolean" }).notNull().default(false),
+    // False while the compaction it stands for hasn't completed: it's queued when the archive
+    // walk first meets the compaction, so job IDs follow the conversation's order.
+    complete: integer({ mode: "boolean" }).notNull().default(true),
+    // The chunk it claimed as it started: from row `from_id` at `from_offset` to row `to_id` at
+    // `to_offset`, both in characters of that row's text. Zero until it starts.
+    fromID: integer("from_id").notNull().default(0),
+    fromOffset: integer("from_offset").notNull().default(0),
+    toID: integer("to_id").notNull().default(0),
+    toOffset: integer("to_offset").notNull().default(0),
+    generation: integer().notNull().default(0),
+    state: text({ enum: observerJobStates }).notNull(),
+    epoch: integer().notNull(),
+    model: text(),
+    scratchSession: text("scratch_session"),
+    promptMessage: text("prompt_message"),
+    // The prompt's estimate plus the output cap.
+    estimate: integer().notNull().default(0),
+    // What the scratch session's assistant messages report, once read: uncached input, output,
+    // reasoning and cache writes, and cache reads apart. Null while unknown.
+    used: integer(),
+    cached: integer(),
+    // What the job counts against the day's budget: twice its estimate, saved just before its
+    // model call, then what the provider reported once that's known in full. `charged_at` is
+    // when the call was made, so the charge belongs to that local day.
+    charged: integer(),
+    chargedAt: integer("charged_at"),
+    error: text(),
+    createdAt: integer("created_at").notNull(),
+    startedAt: integer("started_at"),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [unique().on(table.dot, table.sessionID, table.kind, table.trigger)],
+);
+
+export type ObserverJob = typeof observerJobs.$inferSelect;
 
 export const responsibilityStatuses = ["active", "done", "dropped"] as const;
 

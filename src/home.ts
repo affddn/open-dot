@@ -23,3 +23,6 @@ export const outputDirectory = (dot: string, id: number) =>
 
 /** The dot's Library: private, immutable copies of the deliverables it added. */
 export const libraryDirectory = (dot: string) => join(home(), "library", dot);
+
+/** Where a dot's observer scratch sessions run. Outside dots/, so they get no dot tools. */
+export const observerDirectory = (dot: string) => join(home(), "observer", dot);

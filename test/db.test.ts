@@ -63,7 +63,19 @@ const archiveTables = [
   "memory_fts_idx",
   "memory_settings",
 ];
-// 0026, 0027, 0028 and 0030 add these tables, so earlier migrations' tests leave them out.
+// 0032 adds the observed ledger, its state, observer jobs and the ledger's full-text index.
+const ledgerTables = [
+  "ledger",
+  "ledger_fts",
+  "ledger_fts_config",
+  "ledger_fts_content",
+  "ledger_fts_data",
+  "ledger_fts_docsize",
+  "ledger_fts_idx",
+  "ledger_state",
+  "observer_jobs",
+];
+// 0026, 0027, 0028, 0030 and 0032 add these tables, so earlier migrations' tests leave them out.
 const later = [
   "feed_triggers",
   "trigger_occurrences",
@@ -71,6 +83,7 @@ const later = [
   "run_workers",
   "artifacts",
   ...archiveTables,
+  ...ledgerTables,
 ];
 
 type LedgerRow = { seq: number; id: unknown; hash: string; created_at: number };
@@ -1496,7 +1509,14 @@ test("0027 adds only the run tables, keeps every 0026 table, row and trigger, an
   let db = openDatabase(path);
   try {
     expect(tableNames(db.$client)).toEqual(
-      [...tables, "artifacts", "responsibility_runs", "run_workers", ...archiveTables].toSorted(),
+      [
+        ...tables,
+        "artifacts",
+        "responsibility_runs",
+        "run_workers",
+        ...archiveTables,
+        ...ledgerTables,
+      ].toSorted(),
     );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     expect(rows(db.$client)).toEqual(before);
@@ -1551,7 +1571,9 @@ test("0028 adds only the artifacts table, keeps every 0027 table, row and trigge
   old.close();
   let db = openDatabase(path);
   try {
-    expect(tableNames(db.$client)).toEqual([...tables, "artifacts", ...archiveTables].toSorted());
+    expect(tableNames(db.$client)).toEqual(
+      [...tables, "artifacts", ...archiveTables, ...ledgerTables].toSorted(),
+    );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     expect(rows(db.$client)).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
@@ -1608,7 +1630,9 @@ test("0029 appends only nullable icon columns to slack_apps and keeps every 0028
   old.close();
   let db = openDatabase(path);
   try {
-    expect(tableNames(db.$client)).toEqual([...tables, ...archiveTables].toSorted());
+    expect(tableNames(db.$client)).toEqual(
+      [...tables, ...archiveTables, ...ledgerTables].toSorted(),
+    );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     const added = db.$client
       .query<{ name: string; notnull: number; dflt_value: unknown }, []>(
@@ -1678,7 +1702,9 @@ test("0030 adds the archive and an index of every note, kept by triggers for leg
       .all(`"${term}"`)
       .map((row) => row.id);
   try {
-    expect(tableNames(db.$client)).toEqual([...tables, ...archiveTables].toSorted());
+    expect(tableNames(db.$client)).toEqual(
+      [...tables, ...archiveTables, ...ledgerTables].toSorted(),
+    );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     expect(rows(db.$client)).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
@@ -1730,6 +1756,18 @@ test("0030 adds the archive and an index of every note, kept by triggers for leg
   }
 });
 
+// What 0031 and 0032 append to memory_settings.
+const laterSettings = [
+  "auto_recall",
+  "observer",
+  "ledger",
+  "frozen_head",
+  "rank_notes",
+  "observer_model",
+  "observer_daily_tokens",
+  "generation",
+];
+
 test("0031 appends only auto_recall, off, to memory_settings and keeps every 0030 row", () => {
   const directory = mkdtempSync(join(tmpdir(), "open-dot-auto-recall-migration-"));
   const migrations = join(directory, "drizzle");
@@ -1760,33 +1798,112 @@ test("0031 appends only auto_recall, off, to memory_settings and keeps every 003
       sqlite
         .query<Record<string, unknown>, []>(`select * from "${name}"`)
         .all()
-        .map(({ auto_recall: _added, ...rest }) => rest),
+        .map((row) =>
+          Object.fromEntries(Object.entries(row).filter(([key]) => !laterSettings.includes(key))),
+        ),
     ]);
   const before = rows(old);
   const ledger = ledgerOf(old);
-  const triggers = old
-    .query("select name, sql from sqlite_master where type='trigger' order by name")
-    .all();
+  const triggers = triggerSQL(old);
   old.close();
   const db = openDatabase(path);
   try {
-    expect(tableNames(db.$client)).toEqual(tables);
+    expect(tableNames(db.$client).filter((name) => !ledgerTables.includes(name))).toEqual(tables);
     for (const name of tables) {
       const after = db.$client.query(`pragma table_info("${name}")`).all();
       const was = columns.get(name) ?? [];
       expect(after.slice(0, was.length)).toEqual(was);
-      expect(after.length - was.length).toBe(name === "memory_settings" ? 1 : 0);
+      expect(after.length - was.length).toBe(name === "memory_settings" ? laterSettings.length : 0);
     }
     expect(rows(db.$client)).toEqual(before);
     expect(db.$client.query("select auto_recall from memory_settings").all()).toEqual([
       { auto_recall: 0 },
     ]);
+    expect(triggerSQL(db.$client)).toEqual(triggers);
+    expectLedger(db.$client, ledger, "0031");
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0032 adds the ledger and observer tables, every new switch off, and keeps every 0031 row", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-ledger-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0032");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run(
+    "insert into memory_settings (dot,archive,backfill,archive_since,updated_at,auto_recall) values ('jojo',1,0,5,5,1)",
+  );
+  old.run("insert into notes (dot,text,created_at) values ('jojo','Tea, not coffee.',1)");
+  const tables = tableNames(old);
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [
+      name,
+      sqlite
+        .query<Record<string, unknown>, []>(`select * from "${name}"`)
+        .all()
+        .map((row) =>
+          Object.fromEntries(
+            Object.entries(row).filter(([key]) => !laterSettings.slice(1).includes(key)),
+          ),
+        ),
+    ]);
+  const before = rows(old);
+  const ledgerOld = ledgerOf(old);
+  const triggers = triggerSQL(old);
+  old.close();
+  const db = openDatabase(path);
+  try {
+    expect(tableNames(db.$client)).toEqual([...tables, ...ledgerTables].toSorted());
+    expect(rows(db.$client)).toEqual(before);
+    expect(triggerSQL(db.$client)).toEqual(triggers);
+    expectLedger(db.$client, ledgerOld, "0032");
     expect(
       db.$client
-        .query("select name, sql from sqlite_master where type='trigger' order by name")
+        .query(
+          "select observer, ledger, frozen_head, rank_notes, observer_model, observer_daily_tokens from memory_settings",
+        )
         .all(),
-    ).toEqual(triggers);
-    expectLedger(db.$client, ledger, "0031");
+    ).toEqual([
+      {
+        observer: 0,
+        ledger: 0,
+        frozen_head: 0,
+        rank_notes: 0,
+        observer_model: null,
+        observer_daily_tokens: 50000,
+      },
+    ]);
+    for (const table of ["ledger", "ledger_state", "observer_jobs"])
+      expect(db.$client.query(`select * from ${table}`).all()).toEqual([]);
+    // The ledger's index follows every writer, as notes' does.
+    db.$client.run(
+      "insert into ledger (dot,session_id,kind,topic,text,priority,valid_from,sources,updated_by,created_at,updated_at) values ('jojo','ses_jojo','fact','travel','Lisbon in May','1',1,'[]','observer',1,1)",
+    );
+    const found = (term: string) =>
+      db.$client
+        .query<{ id: number }, [string]>(
+          "select rowid as id from ledger_fts where ledger_fts match ?",
+        )
+        .all(`"${term}"`)
+        .map((row) => row.id);
+    expect(found("lisbon")).toEqual([1]);
+    expect(found("travel")).toEqual([1]);
+    db.$client.run("update ledger set text = 'Porto in June' where id = 1");
+    expect(found("lisbon")).toEqual([]);
+    expect(found("porto")).toEqual([1]);
+    db.$client.run("delete from ledger");
+    expect(found("porto")).toEqual([]);
   } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });

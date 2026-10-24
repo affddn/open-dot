@@ -14,6 +14,7 @@ import {
   type Turn,
   type ThreadsWorker,
   type TurnEnd,
+  type Usage,
   type Waiting,
 } from "../src/opencode";
 import type { RequestAnswer } from "../src/schema";
@@ -98,6 +99,12 @@ export function fakeOpenCode() {
     pages: [] as (string | undefined)[],
     repeatCursor: false,
     onPage: () => {},
+    // Observer scratch sessions, in order; "lost" creates one but reports a failure.
+    scratches: [] as { id: string; directory: string; title: string; model: string }[],
+    scratch: "ok" as "ok" | "fail" | "lost",
+    // What each scratch session's assistant messages report using.
+    usage: new Map<string, Usage>(),
+    onScratch: () => {},
     create: "ok" as "ok" | "fail",
     prompt: "ok" as "ok" | "fail" | "lost",
   };
@@ -239,6 +246,23 @@ export function fakeOpenCode() {
           next: last ? (state.repeatCursor && cursor ? cursor : `after:${last.id}`) : undefined,
         });
       }),
+    createScratch: (input) =>
+      Effect.suspend(() => {
+        state.onScratch();
+        if (state.scratch === "fail") return broken("connection refused");
+        state.scratches.push(input);
+        state.sessions.add(input.id);
+        return state.scratch === "lost" ? broken("connection reset") : Effect.void;
+      }),
+    latestCompaction: (sessionID) =>
+      Effect.suspend(() => {
+        if (state.readFailure) return broken("history unavailable");
+        const found = (state.items.get(sessionID) ?? []).findLast(
+          (item) => item.type === "compaction" && item.complete,
+        );
+        return Effect.succeed(found && { id: found.id, native: found.native === true });
+      }),
+    usage: (sessionID) => Effect.sync(() => state.usage.get(sessionID)),
     historyItem: ({ sessionID, messageID }) =>
       Effect.suspend(() =>
         state.readFailure

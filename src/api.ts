@@ -5,6 +5,14 @@ import { and, desc, eq, inArray, isNotNull, isNull, lt, ne, or, sql } from "driz
 import { type Context, Effect, Layer, Result } from "effect";
 import { archiveStatus, parseArchiveSettings, saveArchiveSettings } from "./archive";
 import { avatarRevision, readAvatar } from "./avatar";
+import {
+  editObservation,
+  forgetObservation,
+  listLedger,
+  observationSource,
+  observationTextLimit,
+} from "./ledger";
+import { observerStatus } from "./observer";
 import { stopWorker } from "./daemon";
 import type { Db } from "./db";
 import type { HealthReport } from "./doctor";
@@ -1439,7 +1447,48 @@ const archiveRoute = async (db: Db, dot: Dot, request: Request, rawID: string | 
     if ("invalid" in change) return error(400, change.invalid);
     saveArchiveSettings(db, dot.name, change, Date.now());
   } else if (request.method !== "GET") return error(404, "Not found");
-  return Response.json(archiveStatus(db, dot));
+  return Response.json({ ...archiveStatus(db, dot), observerStatus: observerStatus(db, dot) });
+};
+
+/**
+ * `GET …/memory/observations[?before=<id>]` pages the dot's current observed rows, newest first.
+ * `GET …/memory/observations/<id>/sources/<message>` opens one of a row's sources from open-dot's
+ * archive, at most 4,000 characters, as data. Neither needs OpenCode.
+ */
+const observationRead = (
+  db: Db,
+  dot: string,
+  request: Request,
+  rawID: string | undefined,
+  extra: string[],
+) => {
+  if (rawID === undefined) {
+    const query = new URL(request.url).searchParams;
+    const before = query.get("before");
+    if (
+      [...query.keys()].some((key) => key !== "before") ||
+      query.getAll("before").length > 1 ||
+      (before !== null && (!positive.test(before) || !Number.isSafeInteger(Number(before))))
+    )
+      return error(400, "before must be an observation ID.");
+    return Response.json(listLedger(db, dot, before === null ? undefined : Number(before)));
+  }
+  const [part, rawMessage, ...more] = extra;
+  if (part !== "sources" || rawMessage === undefined || more.length) return error(404, "Not found");
+  let messageID: string;
+  try {
+    messageID = decodeURIComponent(rawMessage);
+  } catch {
+    return error(404, "Not found");
+  }
+  if (
+    !positive.test(rawID) ||
+    !Number.isSafeInteger(Number(rawID)) ||
+    !/^msg_[\w-]{1,100}$/.test(messageID)
+  )
+    return error(404, "There's no such source for this observation.");
+  const found = observationSource(db, dot, Number(rawID), messageID);
+  return found ? Response.json(found) : error(404, "There's no such source for this observation.");
 };
 
 /** How much of a source message's text is shown. */
@@ -1537,11 +1586,18 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
     return extra.length === 1 && method === "GET"
       ? runsRoute(db, dot.name, request, rawID ?? "")
       : error(404, "Not found");
+  if (kind === "observations" && method === "GET")
+    return observationRead(db, dot.name, request, rawID, extra);
   if (extra.length) return error(404, "Not found");
   if (kind === undefined)
     return method === "GET"
       ? Response.json({
           ...readMemory(db, dot.name),
+          ...(({ observations, next, superseded }) => ({
+            observations,
+            observationsNext: next,
+            observationsSuperseded: superseded,
+          }))(listLedger(db, dot.name)),
           supervisions: openSupervisions(db, dot.name).map(supervisionView),
           triggers: listTriggers(db, dot.name).map((row) => triggerView(db, row)),
         })
@@ -1551,7 +1607,12 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
       ? search(db, dot.name, request)
       : error(404, "Not found");
   if (kind === "archive") return archiveRoute(db, dot, request, rawID);
-  if (kind !== "notes" && kind !== "responsibilities" && kind !== "reminders")
+  if (
+    kind !== "notes" &&
+    kind !== "responsibilities" &&
+    kind !== "reminders" &&
+    kind !== "observations"
+  )
     return error(404, "Not found");
   const body = async () => {
     const value = await messageBody(request, memoryBodyLimit).catch(() => undefined);
@@ -1575,6 +1636,8 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
       return error(400, "Send ?version=<the version you saw>.");
     const version = Number(value);
     if (!Number.isSafeInteger(version)) return error(400, "Send ?version=<the version you saw>.");
+    if (kind === "observations")
+      return answer(forgetObservation(db, dot.name, id, version), "observation");
     return kind === "notes"
       ? answer(deleteNote(db, dot.name, id, version), "note")
       : answer(cancelReminder(db, dot.name, id, version), "reminder");
@@ -1586,6 +1649,13 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
     const edit = parseNoteEdit(input.read);
     if ("invalid" in edit) return error(400, edit.invalid);
     return answer(editNote(db, dot.name, id, edit.version, edit.text), "note");
+  }
+  if (kind === "observations") {
+    const edit = parseNoteEdit(input.read);
+    if ("invalid" in edit) return error(400, edit.invalid);
+    if (edit.text.length > observationTextLimit)
+      return error(400, `text must be at most ${observationTextLimit} characters.`);
+    return answer(editObservation(db, dot.name, id, edit.version, edit.text), "observation");
   }
   if (kind === "responsibilities") {
     const edit = parseResponsibilityEdit(input.read);

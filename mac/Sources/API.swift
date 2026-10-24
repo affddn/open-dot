@@ -704,6 +704,31 @@ enum TriggerAction {
   case enable, pause, revoke
 }
 
+/// An archived message an observation came from, with a short excerpt; `missing` once it's gone.
+struct ObservationSource: Decodable, Equatable {
+  let messageID: String
+  let sessionID: String
+  var from: String? = nil
+  var date: String? = nil
+  var excerpt: String? = nil
+  var missing: Bool? = nil
+}
+
+/// A row of the dot's observed ledger: what a background observer noted, which the owner may
+/// edit or forget. It's data, never instructions, and may be wrong.
+struct MemoryObservation: Decodable, Equatable, Identifiable {
+  let id: Int
+  let version: Int
+  let kind: String
+  let topic: String
+  let text: String
+  let priority: Int
+  let sessionID: String
+  let updatedAt: Double
+  let updatedBy: String
+  let sources: [ObservationSource]
+}
+
 struct Memory: Decodable, Equatable {
   var notes: [MemoryNote]
   var responsibilities: [MemoryResponsibility]
@@ -712,12 +737,36 @@ struct Memory: Decodable, Equatable {
   var supervisions: [Supervision]? = nil
   /// Draft, active and paused feed triggers. Older daemons send none.
   var triggers: [FeedTrigger]? = nil
+  /// The observed ledger's current rows and how many were superseded. Older daemons send none.
+  var observations: [MemoryObservation]? = nil
+  /// Where the next older page of current rows starts, when there's one.
+  var observationsNext: Int? = nil
+  var observationsSuperseded: Int? = nil
+}
+
+/// A page of current observed rows, newest first.
+struct ObservationPage: Decodable, Equatable {
+  let observations: [MemoryObservation]
+  let next: Int?
+}
+
+/// One source of an observation, read from open-dot's archive: at most 4,000 characters of what
+/// was said, as data, or `gone` once the archive no longer has it.
+struct ObservationSourceRead: Decodable, Equatable {
+  let messageID: String
+  let sessionID: String
+  let state: String
+  var from: String? = nil
+  var date: String? = nil
+  var text: String? = nil
+  var truncated: Bool? = nil
 }
 
 enum MemoryKind: String {
   case note = "notes"
   case responsibility = "responsibilities"
   case reminder = "reminders"
+  case observation = "observations"
 }
 
 struct MemoryKey: Hashable {
@@ -729,12 +778,14 @@ enum MemoryItem: Equatable {
   case note(MemoryNote)
   case responsibility(MemoryResponsibility)
   case reminder(MemoryReminder)
+  case observation(MemoryObservation)
 
   var key: MemoryKey {
     switch self {
     case .note(let note): MemoryKey(kind: .note, id: note.id)
     case .responsibility(let item): MemoryKey(kind: .responsibility, id: item.id)
     case .reminder(let reminder): MemoryKey(kind: .reminder, id: reminder.id)
+    case .observation(let row): MemoryKey(kind: .observation, id: row.id)
     }
   }
 }
@@ -1115,6 +1166,16 @@ enum APIError: Error {
 
   /// The message a note was saved from, which the daemon reads from the dot's exact bound
   /// conversation, checked before and after. Never retried on its own.
+  /// The next older page of the dot's current observed rows. The daemon only reads.
+  func observations(_ dot: String, before: Int) async throws -> ObservationPage {
+    try decode(ObservationPage.self, await send("GET", "/dots/\(escape(dot))/memory/observations?before=\(before)"))
+  }
+
+  /// One of an observation's sources, from the daemon's archive. The daemon only reads.
+  func observationSource(_ dot: String, observation: Int, message: String) async throws -> ObservationSourceRead {
+    try decode(ObservationSourceRead.self, await send("GET", "/dots/\(escape(dot))/memory/observations/\(observation)/sources/\(escape(message))"))
+  }
+
   func noteSource(_ dot: String, note: Int) async throws -> NoteSourceRead {
     try decode(NoteSourceRead.self, await send("GET", "/dots/\(escape(dot))/memory/notes/\(note)/source"))
   }
@@ -1155,6 +1216,7 @@ enum APIError: Error {
     struct Notes: Decodable { let note: MemoryNote?; let current: MemoryNote? }
     struct Responsibilities: Decodable { let responsibility: MemoryResponsibility?; let current: MemoryResponsibility? }
     struct Reminders: Decodable { let reminder: MemoryReminder?; let current: MemoryReminder? }
+    struct Observations: Decodable { let observation: MemoryObservation?; let current: MemoryObservation? }
     let decoder = JSONDecoder()
     let item: MemoryItem?
     switch key.kind {
@@ -1167,6 +1229,9 @@ enum APIError: Error {
     case .reminder:
       let body = try? decoder.decode(Reminders.self, from: data)
       item = (conflict ? body?.current : body?.reminder).map(MemoryItem.reminder)
+    case .observation:
+      let body = try? decoder.decode(Observations.self, from: data)
+      item = (conflict ? body?.current : body?.observation).map(MemoryItem.observation)
     }
     guard let item, item.key == key else { throw APIError.server("Unexpected response from the open-dot daemon") }
     return item
