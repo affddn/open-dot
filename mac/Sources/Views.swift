@@ -1386,10 +1386,14 @@ final class MenuAnchorView: NSView {
   /// Opens the menu of the message under a secondary click or Control-click, before the panel's
   /// Quit menu or a text view's own menu can. Returns false for any other event.
   static func handle(_ event: NSEvent) -> Bool {
-    guard event.type == .rightMouseDown || (event.type == .leftMouseDown && event.modifierFlags.contains(.control)),
-      let anchor = anchors.allObjects.last(where: { $0.contains(event) }) else { return false }
+    guard let anchor = anchor(for: event) else { return false }
     anchor.popUp(event)
     return true
+  }
+
+  static func anchor(for event: NSEvent) -> MenuAnchorView? {
+    guard event.type == .rightMouseDown || (event.type == .leftMouseDown && event.modifierFlags.contains(.control)) else { return nil }
+    return anchors.allObjects.last(where: { $0.contains(event) })
   }
 
   /// Opens a message's menu without a click, for VoiceOver's "Message actions".
@@ -1397,10 +1401,10 @@ final class MenuAnchorView: NSView {
     anchors.allObjects.first { $0.id == id }?.popUp(nil)
   }
 
-  /// Only the part of the message left visible by its scroll view counts.
+  /// Unclipped views can have a visibleRect larger than their bounds. Only their own visible content counts.
   private func contains(_ event: NSEvent) -> Bool {
     guard window === event.window, !isHiddenOrHasHiddenAncestor else { return false }
-    return visibleRect.contains(convert(event.locationInWindow, from: nil))
+    return bounds.intersection(visibleRect).contains(convert(event.locationInWindow, from: nil))
   }
 
   /// Both calls return once the menu closes, so the notch is held open just while it's up.

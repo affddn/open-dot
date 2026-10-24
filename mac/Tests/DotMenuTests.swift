@@ -1,10 +1,98 @@
 import AppKit
+import SwiftUI
 import XCTest
 @testable import open_dot_notch
 
 /// A dot tab's menu, the way back to the chat and the view shortcuts, driven in process: menu
 /// items are sent their own actions and keys are built as events, with no window shown.
 final class DotMenuTests: XCTestCase {
+  @MainActor func testExpandedTabContextClickMatchesOnlyTheClickedDot() async throws {
+    _ = NSApplication.shared
+    let store = try isolatedStore()
+    store.dots = ["jotaro", "jolyne"].map { Dot(name: $0, purpose: nil, busy: false, workers: []) }
+    store.selected = "jotaro"
+    for name in ["jotaro", "jolyne"] { store.instructions[name] = draft("mine") }
+    let hosting = NSHostingView(rootView: ExpandedView(store: store, topInset: 32))
+    let window = NSWindow(contentRect: NSRect(origin: .zero, size: expandedSize), styleMask: [.borderless], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = hosting
+    defer { window.contentView = nil; window.close() }
+    hosting.frame = NSRect(origin: .zero, size: expandedSize)
+    hosting.layoutSubtreeIfNeeded()
+    await eventually {
+      hosting.layoutSubtreeIfNeeded()
+      return menuAnchors(in: hosting).filter { $0.id.hasPrefix("dot-menu-") }.count == 2
+    }
+    XCTAssertFalse(window.isVisible, "This test must never show its window")
+    for expected in ["jotaro", "jolyne"] {
+      for (type, flags) in [(NSEvent.EventType.rightMouseDown, NSEvent.ModifierFlags()), (.leftMouseDown, .control)] {
+        for (id, pane) in [("dot-menu-memory", Store.Pane.memory), ("dot-menu-instructions", .instructions), ("dot-menu-library", .library), ("dot-menu-health", .health), ("dot-menu-slack", .slack)] {
+          store.openDot(expected == "jotaro" ? "jolyne" : "jotaro", .chat)
+          hosting.layoutSubtreeIfNeeded()
+          // Pane changes can move or rebuild tabs. Never reuse an anchor or point from a previous pane.
+          do {
+            let clicked = try XCTUnwrap(menuAnchors(in: hosting).first { $0.id == "dot-menu-\(expected)" })
+            let rect = clicked.convert(clicked.bounds, to: nil)
+            let point = NSPoint(x: rect.midX, y: rect.midY)
+            let event = try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: flags, timestamp: 0,
+              windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+            let resolved = try XCTUnwrap(MenuAnchorView.anchor(for: event))
+            print("ISSUE49 case=\(expected)/\(type.rawValue)/\(id) identity=\(ObjectIdentifier(clicked)) windowMatches=\(clicked.window === window) bounds=\(clicked.bounds) windowBounds=\(rect) resolved=\(resolved.id)")
+            XCTAssertTrue(resolved === clicked, "Only the clicked tab may resolve, regardless of weak registry order")
+            guard resolved === clicked else { continue }
+            try choose(resolved.makeMenu(resolved), id)
+          }
+          await eventually { store.selected == expected && store.pane == pane }
+          XCTAssertFalse(store.showingFeed)
+        }
+      }
+    }
+    XCTAssertFalse(window.isVisible)
+  }
+
+  @MainActor func testContextResolverExcludesNonContextAndUnavailableContent() throws {
+    _ = NSApplication.shared
+    let store = try isolatedStore()
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.borderless], backing: .buffered, defer: false)
+    let other = NSWindow(contentRect: window.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    for each in [window, other] { each.isReleasedWhenClosed = false }
+    defer { window.contentView = nil; window.close(); other.close() }
+    let parent = NSView(frame: NSRect(x: 20, y: 20, width: 160, height: 40))
+    parent.clipsToBounds = true
+    window.contentView?.addSubview(parent)
+    let anchor = MenuAnchorView(frame: NSRect(x: 0, y: 0, width: 100, height: 40))
+    anchor.store = store
+    anchor.clipsToBounds = false
+    parent.addSubview(anchor)
+    func event(_ point: NSPoint, type: NSEvent.EventType = .rightMouseDown, in target: NSWindow? = nil) throws -> NSEvent {
+      try XCTUnwrap(NSEvent.mouseEvent(with: type, location: anchor.convert(point, to: nil), modifierFlags: [], timestamp: 0,
+        windowNumber: (target ?? window).windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+    }
+    let inside = NSPoint(x: 10, y: 10)
+    let valid = try event(inside)
+    XCTAssertTrue(MenuAnchorView.anchor(for: valid) === anchor, "The fixture must resolve visible content")
+    XCTAssertNil(MenuAnchorView.anchor(for: try event(inside, type: .leftMouseDown)), "Ordinary clicks keep their handlers")
+    let outside = NSPoint(x: 120, y: 10)
+    XCTAssertTrue(anchor.visibleRect.contains(outside), "Exercise visibleRect extending beyond own bounds")
+    XCTAssertFalse(anchor.bounds.contains(outside))
+    XCTAssertNil(MenuAnchorView.anchor(for: try event(outside)), "Outside own bounds is not this anchor")
+    parent.setFrameSize(NSSize(width: 60, height: 40))
+    let clipped = NSPoint(x: 80, y: 10)
+    XCTAssertTrue(anchor.bounds.contains(clipped))
+    XCTAssertFalse(anchor.visibleRect.contains(clipped), "The fixture must partially clip the anchor")
+    XCTAssertTrue(MenuAnchorView.anchor(for: valid) === anchor, "The unclipped portion still resolves")
+    XCTAssertNil(MenuAnchorView.anchor(for: try event(clipped)), "Clipped content is unavailable")
+    parent.isHidden = true
+    XCTAssertNil(MenuAnchorView.anchor(for: valid), "A hidden ancestor excludes the anchor")
+    parent.isHidden = false
+    XCTAssertNil(MenuAnchorView.anchor(for: try event(inside, in: other)), "Another event window cannot resolve this anchor")
+    anchor.removeFromSuperview()
+    XCTAssertNil(anchor.window)
+    XCTAssertNil(MenuAnchorView.anchor(for: valid), "A detached anchor leaves the registry")
+    XCTAssertFalse(window.isVisible)
+    XCTAssertFalse(other.isVisible)
+  }
+
   @MainActor func testMenuActionsSelectTheDotFirstThenShowItsView() async throws {
     let store = try isolatedStore()
     store.instructions["jolyne"] = draft("mine")
@@ -131,6 +219,10 @@ final class DotMenuTests: XCTestCase {
 }
 
 private struct NotIsolated: Error {}
+
+@MainActor private func menuAnchors(in view: NSView) -> [MenuAnchorView] {
+  (view as? MenuAnchorView).map { [$0] } ?? view.subviews.flatMap { menuAnchors(in: $0) }
+}
 
 /// A store with two dots shown, whose daemon client reads `api.json` from an empty temporary
 /// directory, so loading memory or instructions never reaches a real daemon.
