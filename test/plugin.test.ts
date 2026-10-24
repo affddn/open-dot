@@ -22,6 +22,8 @@ import {
   reminders,
   requests,
   responsibilities,
+  responsibilityRuns,
+  runWorkers,
   supervisions,
   workers,
   type Route,
@@ -221,6 +223,85 @@ test("workers and reminders capture the invoking assistant's route, never a newe
   ).toEqual([a, null]);
   expect(loaded.turns).toEqual([]);
   await loaded.cleanup?.();
+  db.$client.close();
+});
+
+/** One turn after an idle: its inputs, then the assistant message whose tool call runs. */
+const turn = (...inputs: [string, string][]): HistoryItem[] => [
+  historyItem("idle_before", "idle"),
+  ...inputs.map(([id, type]) => historyItem(id, type)),
+  historyItem("msg_invocation", "assistant"),
+];
+
+test("a worker joins a scheduled run only when the invoking turn's one input is that run's wake", async () => {
+  const db = openDatabase(databasePath());
+  db.insert(responsibilities)
+    .values({
+      dot: "jojo",
+      goal: "Inbox",
+      nextAction: "Triage",
+      status: "active",
+      createdAt: 0,
+      updatedAt: 0,
+    })
+    .run();
+  const run = (messageID: string, sessionID: string) =>
+    db
+      .insert(responsibilityRuns)
+      .values({
+        dot: "jojo",
+        responsibility: 1,
+        dueAt: 0,
+        claimedAt: 0,
+        snapshot: {
+          goal: "Inbox",
+          nextAction: "Triage",
+          schedule: { kind: "interval", everyMinutes: 10 },
+          version: 1,
+        },
+        sessionID,
+        messageID,
+      })
+      .returning()
+      .get();
+  const own = run("msg_run", dot.sessionID);
+  run("msg_run_old", "ses_earlier");
+  for (const id of ["msg_run", "msg_run_old"])
+    db.insert(outbox)
+      .values({ sessionID: dot.sessionID, messageID: id, text: id, state: "sent", createdAt: 0 })
+      .run();
+  for (const history of [
+    turn(["msg_run", "user"]),
+    // The owner's message folded into the run's turn: the worker may be for either.
+    turn(["msg_run", "user"], ["msg_owner", "user"]),
+    turn(["msg_run", "user"], ["syn_1", "synthetic"]),
+    turn(["msg_owner", "user"]),
+    // A run saved for an earlier session of the dot isn't this conversation's.
+    turn(["msg_run_old", "user"]),
+    // Input already in context after the invoking message, before the turn's idle: the owner's
+    // message, another run's wake, or a compaction, all part of the same turn.
+    [...turn(["msg_run", "user"]), historyItem("msg_owner_later", "user")],
+    [...turn(["msg_run", "user"]), historyItem("msg_run_other", "user")],
+    [...turn(["msg_run", "user"]), historyItem("compact", "compaction")],
+    // The idle before the turn is out of sight, so an earlier input may be too. The reminder and
+    // worker route rules still accept this turn; only the run link is refused.
+    [historyItem("msg_run", "user"), historyItem("msg_invocation", "assistant")],
+    // Input after the turn's own idle is a later turn's.
+    [
+      ...turn(["msg_run", "user"]),
+      historyItem("idle_after", "idle"),
+      historyItem("msg_owner_next", "user"),
+    ],
+  ]) {
+    const loaded = await load(dot.directory, history);
+    await loaded.call("dot_delegate", { task: "Sort the inbox." });
+    await loaded.cleanup?.();
+  }
+  expect(db.select().from(workers).all()).toHaveLength(10);
+  expect(db.select().from(runWorkers).all()).toEqual([
+    { worker: 1, run: own.id, assistantMessage: "msg_invocation" },
+    { worker: 10, run: own.id, assistantMessage: "msg_invocation" },
+  ]);
   db.$client.close();
 });
 

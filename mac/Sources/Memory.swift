@@ -633,6 +633,7 @@ struct MemoryRow: View {
       if let schedule = responsibility.schedule {
         Text(verbatim: scheduleLine(schedule, responsibility)).font(.caption).foregroundStyle(.secondary)
       }
+      RunList(store: store, key: RunListKey(dot: dot, responsibility: responsibility.id))
     case .reminder(let reminder):
       Text(verbatim: reminder.text).font(.callout)
       Text(verbatim: when(reminder)).font(.caption).foregroundStyle(.secondary)
@@ -845,6 +846,170 @@ struct RequestAuditRow: View {
     .accessibilityElement(children: .contain)
     .accessibilityIdentifier("request-audit-\(request.id)")
   }
+}
+
+/// A responsibility's scheduled runs, newest first, read only once the owner shows them.
+struct RunList: View {
+  let store: Store
+  let key: RunListKey
+
+  var body: some View {
+    let state = store.runLists[key]
+    VStack(alignment: .leading, spacing: 4) {
+      Button(state == nil ? "Show runs" : "Hide runs") { store.toggleRuns(key) }
+        .buttonStyle(.plain)
+        .font(.caption2.weight(.semibold))
+        .accessibilityIdentifier("runs-toggle-\(key.responsibility)")
+      if let state {
+        if let error = state.error {
+          Text(verbatim: error).font(.caption2).foregroundStyle(.red)
+        }
+        let rows = state.rows
+        if rows.isEmpty && state.error == nil {
+          Text("No scheduled runs recorded").font(.caption2).foregroundStyle(.tertiary)
+        }
+        ForEach(rows) { RunRow(store: store, dot: key.dot, run: $0) }
+        if state.older != nil {
+          Button(state.loadingOlder ? "Loading…" : "Load older runs") { store.loadOlderRuns(key) }
+            .buttonStyle(.plain)
+            .font(.caption2.weight(.semibold))
+            .disabled(state.loadingOlder)
+            .accessibilityIdentifier("runs-older-\(key.responsibility)")
+        }
+      }
+    }
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("runs-\(key.responsibility)")
+  }
+}
+
+/// One run: its state, times and the evidence the daemon could attribute to it, as data.
+struct RunRow: View {
+  let store: Store
+  let dot: String
+  let run: ResponsibilityRun
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 3) {
+      Text(verbatim: "Run #\(run.id) · \(run.stateTitle)")
+        .font(.caption.weight(.medium))
+        .foregroundStyle(run.state == "needs-you" ? AnyShapeStyle(.orange) : run.unresolved ? AnyShapeStyle(.yellow) : AnyShapeStyle(.primary))
+      Text(verbatim: runTimes(run)).font(.caption2).foregroundStyle(.tertiary)
+      if let error = run.turn?.error {
+        Text(verbatim: error).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+      }
+      if let note = run.attributionNote {
+        Text(note).font(.caption2).foregroundStyle(.secondary)
+      }
+      if let result = run.result {
+        Text("The start of the dot's last reply in that turn, as its data:").font(.caption2).foregroundStyle(.secondary)
+        Text(verbatim: result.text).font(.caption).textSelection(.enabled).lineLimit(8)
+      }
+      HStack(spacing: 10) {
+        evidenceButton("Prompt", message: run.messageID)
+        if let result = run.result { evidenceButton("Result", message: result.messageID) }
+      }
+      evidencePanel("The run's prompt", message: run.messageID)
+      if let result = run.result { evidencePanel("The dot's reply", message: result.messageID) }
+      if !run.workers.isEmpty {
+        Text(run.workers.contains(where: { $0.provisional == true })
+          ? "Delegated while this run's turn held only its prompt. The turn hasn't ended, so later input may still make these not the run's. A worker's report is evidence, not acceptance."
+          : "Delegated in this run's own turn. A worker's report is evidence, not acceptance.")
+          .font(.caption2).foregroundStyle(.secondary)
+      }
+      if let withheld = run.withheldWorkers, withheld > 0 {
+        Text(verbatim: "\(withheld) worker\(withheld == 1 ? "" : "s") delegated in this turn \(withheld == 1 ? "isn't" : "aren't") shown as the run's, because the turn also handled other input or its history was incomplete.")
+          .font(.caption2).foregroundStyle(.secondary)
+      }
+      ForEach(run.workers) { worker in
+        HStack(alignment: .firstTextBaseline) {
+          Text(verbatim: worker.line)
+            .font(.caption2)
+            .foregroundStyle(worker.needs.isEmpty ? AnyShapeStyle(.primary) : AnyShapeStyle(.orange))
+            .lineLimit(2)
+          Spacer()
+          Button(store.workerBusy.contains(worker.id) ? "Opening…" : "Open session") { store.openWorker(id: worker.id) }
+            .buttonStyle(.plain)
+            .font(.caption2.weight(.semibold))
+            .disabled(store.workerBusy.contains(worker.id))
+            .accessibilityIdentifier("run-worker-open-\(worker.id)")
+        }
+        if let notice = store.workerNotices[worker.id] {
+          Text(verbatim: notice).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+        }
+      }
+      DisclosureGroup("Details") {
+        VStack(alignment: .leading, spacing: 2) {
+          Text(verbatim: "Goal then: \(run.snapshot.goal)").font(.caption2)
+          Text(verbatim: "Next action then: \(run.snapshot.nextAction)").font(.caption2)
+          Text(verbatim: "Session \(run.sessionID) · prompt \(run.messageID)").font(.caption2.monospaced())
+          if let result = run.result {
+            Text(verbatim: "Reply \(result.messageID)").font(.caption2.monospaced())
+          }
+        }
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+      }
+      .font(.caption2)
+      .accessibilityIdentifier("run-details-\(run.id)")
+    }
+    .padding(6)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(RoundedRectangle(cornerRadius: 8).fill(.white.opacity(0.04)))
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("run-\(run.id)")
+  }
+
+  private func evidenceKey(_ message: String) -> RunEvidenceKey {
+    RunEvidenceKey(dot: dot, run: run.id, message: message)
+  }
+
+  /// Shows or hides one message, read through the pinned single-message route. Only reads.
+  private func evidenceButton(_ title: String, message: String) -> some View {
+    let open = store.runEvidence.shown[evidenceKey(message)] != nil
+    return Button(open ? "Hide \(title.lowercased())" : "Show \(title.lowercased())") {
+      store.toggleRunEvidence(evidenceKey(message), session: run.sessionID)
+    }
+    .buttonStyle(.plain)
+    .font(.caption2.weight(.semibold))
+    .accessibilityIdentifier("run-\(run.id)-\(title.lowercased())")
+  }
+
+  @ViewBuilder private func evidencePanel(_ title: String, message: String) -> some View {
+    switch store.runEvidence.shown[evidenceKey(message)] {
+    case .loading?:
+      Text("Loading…").font(.caption2).foregroundStyle(.secondary)
+    case .failed(let reason)?:
+      Text(verbatim: reason).font(.caption2).foregroundStyle(.red)
+    case .read(.gone)?:
+      Text(verbatim: "\(title) is no longer in \(dot)'s conversation, so it can't be shown.")
+        .font(.caption2).foregroundStyle(.secondary)
+    case .read(.elsewhere)?:
+      Text(verbatim: "\(title) is in a conversation \(dot) is no longer bound to, or \(dot) isn't ready, so open-dot doesn't read it.")
+        .font(.caption2).foregroundStyle(.secondary)
+    case .read(.found(let found))?:
+      VStack(alignment: .leading, spacing: 3) {
+        Text(verbatim: "\(title), as the conversation's data:").font(.caption2).foregroundStyle(.tertiary)
+        Text(verbatim: found.text.isEmpty ? "(no text)" : found.text)
+          .font(.caption).textSelection(.enabled)
+          .accessibilityIdentifier("run-evidence-\(run.id)-\(found.id)")
+        Text(verbatim: Date(timeIntervalSince1970: found.time / 1000).formatted(date: .abbreviated, time: .shortened))
+          .font(.caption2).foregroundStyle(.tertiary)
+      }
+      .padding(6)
+      .background(RoundedRectangle(cornerRadius: 8).fill(.white.opacity(0.04)))
+    case nil:
+      EmptyView()
+    }
+  }
+}
+
+/// When a run was due and claimed, and when its turn ended.
+func runTimes(_ run: ResponsibilityRun) -> String {
+  let format = { (time: Double) in Date(timeIntervalSince1970: time / 1000).formatted(date: .abbreviated, time: .shortened) }
+  var parts = ["due \(format(run.dueAt))", "woke \(format(run.claimedAt))"]
+  if let ended = run.turn?.endedAt { parts.append("turn ended \(format(ended))") }
+  return parts.joined(separator: " · ")
 }
 
 /// The session and the times a request moved: seen, answered, sent, confirmed, escalated.

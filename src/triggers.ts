@@ -532,7 +532,8 @@ export function fireTriggers(
   }
 }
 
-const deliveryOf = (row: typeof outbox.$inferSelect | undefined) =>
+/** Where a wake stands in the outbox: queued, sending (started, outcome unresolved), admitted or cancelled. */
+export const deliveryOf = (row: typeof outbox.$inferSelect | undefined) =>
   !row
     ? "unknown"
     : row.state === "cancelled"

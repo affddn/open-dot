@@ -167,38 +167,235 @@ struct RequestAuditPage: Decodable, Equatable {
   var next: Int? = nil
 }
 
-/// The audit pages the notch has read for one dot. A read applies only to rows no later read
-/// already set, so a slow refresh can't bring back an older state, and older pages stay loaded.
-struct RequestAuditState: Equatable {
-  private var byID: [Int: RequestAudit] = [:]
+/// Pages the notch has read, newest first by ID. Each value is one opening of the list, and each
+/// read carries that opening, so a read begun before the list was hidden and shown again changes
+/// nothing. Within an opening, a read applies only to rows no later read already set, moves the
+/// error only if no later read settled first, and moves the older-page cursor only by reaching
+/// further than the rows loaded so far, or as far as a later read did not, so a slow answer can't
+/// bring back an older state, and older pages stay loaded.
+struct NewestFirstPages<Row: Identifiable & Equatable>: Equatable where Row.ID == Int {
+  struct Read: Equatable {
+    fileprivate let opening: UUID
+    fileprivate let number: Int
+  }
+
+  private let opening = UUID()
+  private var byID: [Int: Row] = [:]
   private var readOf: [Int: Int] = [:]
   private var reads = 0
+  private var cursorRead = 0
+  private var settledRead = 0
   /// Where the next older page starts, from the page that reached the oldest loaded row.
   private(set) var older: Int? = nil
   var loadingOlder = false
+  /// Why the latest settled read failed, if it did.
+  private(set) var error: String? = nil
 
   /// Newest first.
-  var rows: [RequestAudit] { byID.values.sorted { $0.id > $1.id } }
+  var rows: [Row] { byID.values.sorted { $0.id > $1.id } }
 
-  mutating func startRead() -> Int {
+  mutating func startRead() -> Read {
     reads += 1
-    return reads
+    return Read(opening: opening, number: reads)
   }
 
-  mutating func apply(_ read: Int, _ page: RequestAuditPage, older isOlder: Bool) {
+  /// True when the read belongs to this opening.
+  func isCurrent(_ read: Read) -> Bool { read.opening == opening }
+
+  mutating func apply(_ read: Read, rows page: [Row], next: Int?, older isOlder: Bool) {
+    guard isCurrent(read) else { return }
+    if isOlder { loadingOlder = false }
     let oldest = byID.keys.min()
-    for row in page.requests where (readOf[row.id] ?? 0) < read {
+    for row in page where (readOf[row.id] ?? 0) < read.number {
       byID[row.id] = row
-      readOf[row.id] = read
+      readOf[row.id] = read.number
     }
     // The page that reaches past every row loaded so far says where the next older one starts.
-    if let last = page.requests.last?.id, oldest == nil || last <= oldest! {
-      older = page.next
-    } else if isOlder && page.requests.isEmpty {
+    // One that only reaches the oldest loaded row moves it only if no later read already did.
+    if let last = page.last?.id, oldest == nil || last < oldest! || (last == oldest! && read.number > cursorRead) {
+      older = next
+      cursorRead = max(cursorRead, read.number)
+    } else if isOlder && page.isEmpty {
       older = nil
-    } else if oldest == nil {
-      older = page.next
+    } else if oldest == nil && page.isEmpty && read.number > cursorRead {
+      older = next
+      cursorRead = read.number
     }
+    if read.number > settledRead {
+      settledRead = read.number
+      error = nil
+    }
+  }
+
+  /// A read that failed. Only the latest settled read of this opening shows its error.
+  mutating func fail(_ read: Read, _ message: String, older isOlder: Bool) {
+    guard isCurrent(read) else { return }
+    if isOlder { loadingOlder = false }
+    if read.number > settledRead {
+      settledRead = read.number
+      error = message
+    }
+  }
+}
+
+/// The audit pages the notch has read for one dot.
+typealias RequestAuditState = NewestFirstPages<RequestAudit>
+
+extension NewestFirstPages where Row == RequestAudit {
+  mutating func apply(_ read: Read, _ page: RequestAuditPage, older isOlder: Bool) {
+    apply(read, rows: page.requests, next: page.next, older: isOlder)
+  }
+}
+
+/// One scheduled run of a responsibility: what the daemon saved when it claimed the run, and what
+/// it last saw of the run's turn in OpenCode's public history.
+struct ResponsibilityRun: Decodable, Equatable, Identifiable {
+  /// The responsibility as it was at the claim.
+  struct Snapshot: Decodable, Equatable {
+    let goal: String
+    let nextAction: String
+  }
+
+  struct Turn: Decodable, Equatable {
+    var outcome: String? = nil
+    var error: String? = nil
+    var endedAt: Double? = nil
+  }
+
+  /// The dot's last reply in the run's own turn. Only a turn that held nothing else has one.
+  struct Result: Decodable, Equatable {
+    let messageID: String
+    let text: String
+  }
+
+  /// A worker the run's own turn delegated.
+  struct Worker: Decodable, Equatable, Identifiable {
+    let id: Int
+    let state: String
+    var outcome: String? = nil
+    let task: String
+    let sessionID: String
+    var finishedAt: Double? = nil
+    let needs: [String]
+    /// Linked while the run's turn hadn't ended, so later input may still make it not the run's.
+    var provisional: Bool? = nil
+
+    var line: String {
+      let status = !needs.isEmpty ? "needs you: \(needs.joined(separator: ", "))"
+        : state == "done" ? "finished (\(outcome ?? "unknown"))"
+        : state
+      return "Worker #\(id): \(task) · \(status)"
+    }
+  }
+
+  let id: Int
+  let responsibility: Int
+  let dueAt: Double
+  let claimedAt: Double
+  let snapshot: Snapshot
+  let sessionID: String
+  let messageID: String
+  /// queued, admitted, running, needs-you, finished-turn, failed or unknown.
+  let state: String
+  var delivery: String? = nil
+  var turn: Turn? = nil
+  /// exclusive, shared or unknown once the turn ended.
+  var attribution: String? = nil
+  var result: Result? = nil
+  let workers: [Worker]
+  /// Workers linked to the run whose turn ended shared or unknown, so not shown as its own.
+  var withheldWorkers: Int? = nil
+
+  /// The state in the owner's words. A finished turn never says the goal was met.
+  var stateTitle: String {
+    switch state {
+    case "queued": return delivery == "sending" ? "sending, not confirmed" : "queued"
+    case "admitted": return "admitted, not started"
+    case "running": return "running"
+    case "needs-you": return "needs you"
+    case "finished-turn": return "turn finished, goal not checked"
+    case "failed": return turn?.outcome == "interrupted" ? "interrupted" : "failed"
+    case "unknown": return "outcome unknown"
+    default: return state
+    }
+  }
+
+  /// Still waiting on something, or never to be known: shown as unresolved.
+  var unresolved: Bool { !["finished-turn", "failed"].contains(state) }
+
+  /// Why no result is shown for a turn that ended.
+  var attributionNote: String? {
+    switch attribution {
+    case "shared"?: return "Its turn also handled other messages, so no reply is attributed to this run."
+    case "unknown"?: return "History didn't show what else its turn handled, so no reply is attributed to this run."
+    default: return nil
+    }
+  }
+}
+
+/// One page of a responsibility's runs. `next`, when there may be more, is where the next older page starts.
+struct RunPage: Decodable, Equatable {
+  let runs: [ResponsibilityRun]
+  var next: Int? = nil
+}
+
+/// The run pages the notch has read for one responsibility.
+typealias RunListState = NewestFirstPages<ResponsibilityRun>
+
+extension NewestFirstPages where Row == ResponsibilityRun {
+  mutating func apply(_ read: Read, _ page: RunPage, older isOlder: Bool) {
+    apply(read, rows: page.runs, next: page.next, older: isOlder)
+  }
+}
+
+struct RunListKey: Hashable {
+  let dot: String
+  let responsibility: Int
+}
+
+/// One message of a run's evidence: its prompt, or its result once attributed.
+struct RunEvidenceKey: Hashable {
+  let dot: String
+  let run: Int
+  let message: String
+}
+
+/// What the pinned single-message read found for a piece of a run's evidence.
+enum RunEvidenceRead: Equatable {
+  case found(Message)
+  /// The dot's conversation no longer has that message.
+  case gone
+  /// The run was in another conversation of the dot, or the dot isn't ready, so it isn't read.
+  case elsewhere
+}
+
+enum RunEvidenceShown: Equatable {
+  case loading
+  case read(RunEvidenceRead)
+  case failed(String)
+}
+
+/// The run evidence the owner opened. Each opening has its own generation, so an answer for one
+/// the owner closed or opened again changes nothing.
+struct RunEvidenceState: Equatable {
+  private(set) var shown: [RunEvidenceKey: RunEvidenceShown] = [:]
+  private var generations: [RunEvidenceKey: Int] = [:]
+
+  /// Opens the key, or closes it when open. Returns the generation to read under, or nil once closed.
+  mutating func toggle(_ key: RunEvidenceKey) -> Int? {
+    let generation = (generations[key] ?? 0) + 1
+    generations[key] = generation
+    if shown[key] != nil {
+      shown[key] = nil
+      return nil
+    }
+    shown[key] = .loading
+    return generation
+  }
+
+  mutating func finish(_ key: RunEvidenceKey, _ generation: Int, _ result: RunEvidenceShown) {
+    guard generations[key] == generation, shown[key] != nil else { return }
+    shown[key] = result
   }
 }
 
@@ -731,6 +928,29 @@ enum APIError: Error {
   func requests(_ dot: String, before: Int? = nil) async throws -> RequestAuditPage {
     let query = before.map { "?before=\($0)" } ?? ""
     return try decode(RequestAuditPage.self, await send("GET", "/dots/\(escape(dot))/requests\(query)"))
+  }
+
+  /// A page of a responsibility's scheduled runs, newest first, older than `before` if given. The daemon only reads.
+  func runs(_ key: RunListKey, before: Int? = nil) async throws -> RunPage {
+    let query = before.map { "?before=\($0)" } ?? ""
+    return try decode(RunPage.self, await send("GET", "/dots/\(escape(key.dot))/memory/responsibilities/\(key.responsibility)/runs\(query)"))
+  }
+
+  /// Reads one message of a run's evidence through the pinned single-message route, which answers
+  /// only while the dot is bound to `session`, before and after its read. It only reads, starts no
+  /// turn, and is never retried on its own.
+  func runEvidence(_ key: RunEvidenceKey, session: String) async throws -> RunEvidenceRead {
+    let path = "/dots/\(escape(key.dot))/messages/\(escape(key.message))?sessionID=\(escape(session))"
+    let (status, data) = try await exchange("GET", path)
+    switch status {
+    case 200: return .found(try decode(Message.self, data))
+    case 404: return .gone
+    case 409: return .elsewhere
+    default:
+      struct Failure: Decodable { let error: String }
+      let text = (try? JSONDecoder().decode(Failure.self, from: data))?.error
+      throw APIError.server(text ?? HTTPURLResponse.localizedString(forStatusCode: status))
+    }
   }
 
   /// Stops a worker the owner confirmed. Never retried on its own.

@@ -6,6 +6,7 @@ import {
   type Entry,
   OpenCode,
   OpenCodeError,
+  type PromptTurn,
   type SessionInput,
   type TextEvent,
   type Written,
@@ -138,6 +139,25 @@ export function fakeOpenCode() {
               return turn && { end: `idle_${messageID}`, ...turn };
             }),
       ),
+    // An ended turn as turnAfter has it; else the inbox, then the history of admitted prompts.
+    promptTurn: ({ sessionID, messageID }) =>
+      Effect.suspend((): Effect.Effect<PromptTurn, OpenCodeError> => {
+        if (state.readFailure || state.lookupFailure) return broken("history unavailable");
+        const sessionTurn = state.turns.get(sessionID);
+        const turn =
+          state.messageTurns.get(messageID) ??
+          (sessionTurn && state.messages.has(messageID)
+            ? { end: `idle_${messageID}`, ...sessionTurn }
+            : undefined);
+        if (turn) return Effect.succeed({ kind: "ended" as const, turn });
+        if (state.inbox.some((item) => item.id === messageID))
+          return Effect.succeed({ kind: "queued" as const });
+        return Effect.succeed(
+          state.messages.has(messageID)
+            ? { kind: "running" as const }
+            : { kind: "absent" as const },
+        );
+      }),
     turnSoFar: ({ sessionID, messageID }) =>
       Effect.suspend(() =>
         state.readFailure

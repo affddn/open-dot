@@ -298,6 +298,10 @@ struct MessageWindow: Equatable {
   var requestNotices: [Int: String] = [:]
   /// Each dot's worker requests and answers, read with its memory. Nil from older daemons.
   var requestAudits: [String: RequestAuditState] = [:]
+  /// The scheduled runs of each responsibility the owner opened, read again with its dot's memory.
+  var runLists: [RunListKey: RunListState] = [:]
+  /// The prompts and results of runs the owner opened, read through the pinned message route.
+  var runEvidence = RunEvidenceState()
   var reacting: Set<MessageKey> = []
   var reactionErrors: [MessageKey: String] = [:]
   /// The owner's latest non-classic emoji, newest first, as the daemon last reported them.
@@ -1094,16 +1098,18 @@ struct MessageWindow: Equatable {
 
   /// Opens the worker's session in a new terminal window. If none opens, the daemon copies the
   /// command and the notice says so. Never retried on its own.
-  func openWorker(_ worker: Dot.Worker) {
-    guard workerBusy.insert(worker.id).inserted else { return }
-    workerNotices[worker.id] = nil
+  func openWorker(_ worker: Dot.Worker) { openWorker(id: worker.id) }
+
+  func openWorker(id: Int) {
+    guard workerBusy.insert(id).inserted else { return }
+    workerNotices[id] = nil
     Task {
       do {
-        workerNotices[worker.id] = try await api.openWorker(worker.id).notice
+        workerNotices[id] = try await api.openWorker(id).notice
       } catch {
-        workerNotices[worker.id] = Self.describeMemory(error, "Not opened", unknown: "A window may have opened anyway.")
+        workerNotices[id] = Self.describeMemory(error, "Not opened", unknown: "A window may have opened anyway.")
       }
-      workerBusy.remove(worker.id)
+      workerBusy.remove(id)
     }
   }
 
@@ -1284,6 +1290,61 @@ struct MessageWindow: Equatable {
     }
   }
 
+  /// Shows or hides a responsibility's runs. Showing reads the newest page; nothing starts a turn.
+  /// Each showing is a new opening, so answers to reads begun before a hide change nothing.
+  func toggleRuns(_ key: RunListKey) {
+    guard runLists[key] == nil else {
+      runLists[key] = nil
+      return
+    }
+    runLists[key] = RunListState()
+    Task { await refreshRuns(key) }
+  }
+
+  /// Reads the newest page of runs again, keeping older pages already loaded.
+  private func refreshRuns(_ key: RunListKey) async {
+    guard var state = runLists[key] else { return }
+    let read = state.startRead()
+    runLists[key] = state
+    do {
+      let page = try await api.runs(key)
+      runLists[key]?.apply(read, page, older: false)
+    } catch {
+      runLists[key]?.fail(read, "Runs not refreshed. \(Self.describe(error))", older: false)
+    }
+  }
+
+  /// Reads the next older page of runs, once at a time.
+  func loadOlderRuns(_ key: RunListKey) {
+    guard var state = runLists[key], let before = state.older, !state.loadingOlder else { return }
+    state.loadingOlder = true
+    let read = state.startRead()
+    runLists[key] = state
+    Task {
+      do {
+        let page = try await api.runs(key, before: before)
+        runLists[key]?.apply(read, page, older: true)
+      } catch {
+        runLists[key]?.fail(read, "Older runs not loaded. \(Self.describe(error))", older: true)
+      }
+    }
+  }
+
+  /// Shows or hides one message of a run's evidence, read once through the pinned single-message
+  /// route for the run's own session. It only reads and is never retried on its own.
+  func toggleRunEvidence(_ key: RunEvidenceKey, session: String) {
+    guard let generation = runEvidence.toggle(key) else { return }
+    Task {
+      let shown: RunEvidenceShown
+      do {
+        shown = .read(try await api.runEvidence(key, session: session))
+      } catch {
+        shown = .failed("Not shown. \(Self.describe(error)) No automatic retry.")
+      }
+      runEvidence.finish(key, generation, shown)
+    }
+  }
+
   private func refreshMemory(_ name: String) async {
     let read = memories[name, default: MemoryState()].startRead()
     do {
@@ -1292,6 +1353,7 @@ struct MessageWindow: Equatable {
       // The dot's own notes, added or forgotten, show in the search too.
       if memories[name, default: MemoryState()].apply(read, memory), before != memory.notes { rerunSearch(name) }
       await refreshAudit(name)
+      for key in runLists.keys where key.dot == name { await refreshRuns(key) }
     } catch {
       guard memories[name]?.isCurrent(read) == true else { return }
       memories[name]?.readError = Self.describe(error)

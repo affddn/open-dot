@@ -47,6 +47,7 @@ import {
 } from "./reactions";
 import { quoted, quoteText, replyPrompt } from "./replies";
 import { answerSummary, needsYou, requestView } from "./requests";
+import { listRuns } from "./runs";
 import { approveBinding, endBinding, openSupervisions, supervisionView } from "./supervise";
 import {
   createTrigger,
@@ -70,6 +71,7 @@ import {
   type QuoteSnapshot,
   outbox,
   requests,
+  responsibilities,
   type Worker,
   type WorkerRequest,
   workers,
@@ -1114,6 +1116,31 @@ const triggerRoute = async (
   return error(404, "Not found");
 };
 
+/**
+ * `GET …/memory/responsibilities/<id>/runs[?before=<run>]`: a page of the responsibility's
+ * scheduled runs, newest first. It only reads open-dot's database: no OpenCode, no turn.
+ */
+const runsRoute = (db: Db, dot: string, request: Request, rawID: string) => {
+  const missing = error(404, "There's no such responsibility for this dot.");
+  if (!positive.test(rawID) || !Number.isSafeInteger(Number(rawID))) return missing;
+  const id = Number(rawID);
+  const owned = db
+    .select({ id: responsibilities.id })
+    .from(responsibilities)
+    .where(and(eq(responsibilities.id, id), eq(responsibilities.dot, dot)))
+    .get();
+  if (!owned) return missing;
+  const query = new URL(request.url).searchParams;
+  const rawBefore = query.get("before");
+  if (
+    [...query.keys()].some((key) => key !== "before") ||
+    query.getAll("before").length > 1 ||
+    (rawBefore !== null && (!positive.test(rawBefore) || !Number.isSafeInteger(Number(rawBefore))))
+  )
+    return error(400, "before must be a run ID.");
+  return Response.json(listRuns(db, dot, id, rawBefore === null ? undefined : Number(rawBefore)));
+};
+
 /** `GET …/memory/search?q=<words>[&limit=<1–50>]`: the dot's notes that contain every word. */
 const search = (db: Db, dot: string, request: Request) => {
   const query = new URL(request.url).searchParams;
@@ -1223,6 +1250,10 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
   const { method } = request;
   if (kind === "supervisions") return supervisionRoute(db, dot.name, method, rawID, extra);
   if (kind === "triggers") return triggerRoute(db, dot, request, rawID, extra);
+  if (kind === "responsibilities" && extra[0] === "runs")
+    return extra.length === 1 && method === "GET"
+      ? runsRoute(db, dot.name, request, rawID ?? "")
+      : error(404, "Not found");
   if (extra.length) return error(404, "Not found");
   if (kind === undefined)
     return method === "GET"

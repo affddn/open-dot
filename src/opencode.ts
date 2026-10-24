@@ -82,21 +82,50 @@ const destructive = [
   "opencode service *",
 ].map((resource) => ({ action: "shell", resource, effect: "ask" as const }));
 
-/** The text of the last assistant message that wrote any. */
-const lastText = (items: ReadonlyArray<SessionMessage.Info>) =>
+/** The last assistant message that wrote any text, with that text. */
+const lastWritten = (items: ReadonlyArray<SessionMessage.Info>) =>
   items
     .flatMap((item) =>
       item.type === "assistant"
         ? [
-            item.content
-              .flatMap((part) => (part.type === "text" ? [part.text] : []))
-              .join("\n")
-              .trim(),
+            {
+              id: item.id,
+              text: item.content
+                .flatMap((part) => (part.type === "text" ? [part.text] : []))
+                .join("\n")
+                .trim(),
+            },
           ]
         : [],
     )
-    .filter((written) => written !== "")
+    .filter((written) => written.text !== "")
     .at(-1);
+
+/** History items that bring a turn new input, as opposed to the assistant's own work or notices. */
+const inputTypes: ReadonlySet<string> = new Set(["user", "synthetic", "shell"]);
+
+/** The most history pages one walk reads, 200 items each, before it fails instead of looping. */
+const historyPageLimit = 5_000;
+
+/** A prompt's ended turn, from the history items after the prompt and the idle that ended it. */
+const ended = (
+  items: readonly SessionMessage.Info[],
+  idle: Extract<SessionMessage.Info, { type: "idle" }>,
+  inputs: readonly string[],
+  complete: boolean,
+): Turn => {
+  const reply = lastWritten(items);
+  return {
+    outcome: idle.outcome,
+    text: reply?.text,
+    end: idle.id,
+    endedAt: DateTime.toEpochMillis(idle.time.created),
+    error: idle.error?.message,
+    inputs,
+    complete,
+    reply,
+  };
+};
 
 const failed = (message: string) => (cause: unknown) => new OpenCodeError({ message, cause });
 
@@ -160,7 +189,34 @@ export interface Turn {
   readonly text: string | undefined;
   /** The idle that ended the turn. OpenCode folds a message sent mid-turn into that turn, so several messages can share one. */
   readonly end: string;
+  /** When the idle was written. */
+  readonly endedAt?: number;
+  readonly error?: string | undefined;
+  /**
+   * Every input the history showed in the turn, in order, the prompt among them: user, synthetic
+   * and shell messages since the idle before it. Absent when history didn't say, which is never
+   * proof of one prompt.
+   */
+  readonly inputs?: readonly string[];
+  /**
+   * True only when the idle before the prompt was in the history and nothing in the turn was
+   * compacted, so `inputs` is every input the turn had. Without it, a lone prompt in `inputs`
+   * proves nothing: an earlier input may be out of sight.
+   */
+  readonly complete?: boolean;
+  /** The turn's last assistant message that wrote any text. */
+  readonly reply?: { readonly id: string; readonly text: string } | undefined;
 }
+
+/**
+ * Where a prompt is in its session: in the inbox, which OpenCode admitted but hasn't delivered;
+ * in a turn still running; in a turn that ended; or in neither the inbox nor the history.
+ */
+export type PromptTurn =
+  | { readonly kind: "queued" }
+  | { readonly kind: "running" }
+  | { readonly kind: "ended"; readonly turn: Turn }
+  | { readonly kind: "absent" };
 
 /** A turn that ended in a supervised session, with the last text its assistant wrote. */
 export interface TurnEnd {
@@ -339,6 +395,11 @@ export class OpenCode extends Context.Service<
     /** The first turn that ended after the message, or undefined while none has. */
     readonly turnAfter: (ref: MessageRef) => Effect.Effect<Turn | undefined, OpenCodeError>;
     /**
+     * Where the prompt is now. The inbox is read before the history, and an admitted prompt only
+     * moves from the inbox into the history, so "absent" means OpenCode has it in neither.
+     */
+    readonly promptTurn: (ref: MessageRef) => Effect.Effect<PromptTurn, OpenCodeError>;
+    /**
      * The assistant messages of the turn after the message so far, while it runs, each with its text
      * parts. Undefined once it has ended, or while the message isn't in the history.
      */
@@ -465,27 +526,56 @@ export class OpenCode extends Context.Service<
       /**
        * The history items after the prompt, up to the idle that ends its turn, if one has. The full
        * history in processing order: session.context would start at the latest compaction, which
-       * can hide the prompt or its idle. Undefined while the prompt isn't in the history.
+       * can hide the prompt or its idle. Undefined while the prompt isn't in the history. Pages
+       * follow OpenCode's `next` cursor while it gives one, whatever a page's length, and end when
+       * it gives none or a page is empty; a cursor given twice, or a history past the page limit,
+       * fails rather than looping or reading as absent.
        */
       const afterPrompt = ({ sessionID, messageID }: MessageRef) =>
         Effect.gen(function* () {
           const limit = 200;
           const items: SessionMessage.Info[] = [];
+          // The turn's inputs so far: since the last idle before the prompt, then after it.
+          let inputs: string[] = [];
+          // Whether the idle before the prompt was seen, and anything since it was compacted.
+          let bounded = false;
+          let compacted = false;
           let prompted = false;
           let cursor: string | undefined;
-          for (;;) {
+          const cursors = new Set<string>();
+          for (let pages = 0; ; pages++) {
+            if (pages === historyPageLimit)
+              return yield* new OpenCodeError({
+                message: `The history of ${sessionID} is longer than open-dot reads`,
+              });
             const page = yield* client.message.list(
               cursor
                 ? { sessionID: Session.ID.make(sessionID), cursor, limit }
                 : { sessionID: Session.ID.make(sessionID), order: "asc", limit },
             );
             for (const item of page.data) {
-              if (!prompted) prompted = item.id === messageID;
-              else if (item.type === "idle") return { items, idle: item };
-              else items.push(item);
+              if (prompted && item.type === "idle")
+                return { items, idle: item, inputs, complete: bounded && !compacted };
+              if (item.type === "idle") {
+                inputs = [];
+                bounded = true;
+                compacted = false;
+              } else if (inputTypes.has(item.type)) inputs.push(item.id);
+              else if (item.type === "compaction") compacted = true;
+              if (prompted) items.push(item);
+              else prompted = item.id === messageID;
             }
-            if (page.data.length < limit) return prompted ? { items, idle: undefined } : undefined;
-            cursor = page.cursor.next;
+            const next = page.cursor.next;
+            if (!next || page.data.length === 0)
+              return prompted
+                ? { items, idle: undefined, inputs, complete: bounded && !compacted }
+                : undefined;
+            if (cursors.has(next))
+              return yield* new OpenCodeError({
+                message: `OpenCode returned the same history page of ${sessionID} twice`,
+              });
+            cursors.add(next);
+            cursor = next;
           }
         });
 
@@ -548,8 +638,28 @@ export class OpenCode extends Context.Service<
           afterPrompt(ref).pipe(
             Effect.map((found) =>
               found?.idle
-                ? { outcome: found.idle.outcome, text: lastText(found.items), end: found.idle.id }
+                ? ended(found.items, found.idle, found.inputs, found.complete)
                 : undefined,
+            ),
+            Effect.mapError(failed(`Could not read session ${ref.sessionID}`)),
+          ),
+        promptTurn: (ref) =>
+          client.session.inbox.list({ sessionID: Session.ID.make(ref.sessionID) }).pipe(
+            Effect.flatMap((inbox) =>
+              inbox.some((item) => item.id === ref.messageID)
+                ? Effect.succeed<PromptTurn>({ kind: "queued" })
+                : afterPrompt(ref).pipe(
+                    Effect.map((found): PromptTurn =>
+                      !found
+                        ? { kind: "absent" }
+                        : found.idle
+                          ? {
+                              kind: "ended",
+                              turn: ended(found.items, found.idle, found.inputs, found.complete),
+                            }
+                          : { kind: "running" },
+                    ),
+                  ),
             ),
             Effect.mapError(failed(`Could not read session ${ref.sessionID}`)),
           ),

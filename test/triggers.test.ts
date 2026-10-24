@@ -15,6 +15,7 @@ import {
   feedTriggers,
   outbox,
   responsibilities,
+  responsibilityRuns,
   triggerOccurrences,
 } from "../src/schema";
 import { fireTriggers, pauseTrigger, wakeEvents, wakesPerHour } from "../src/triggers";
@@ -182,6 +183,8 @@ test("an enabled trigger wakes its dot once per distinct activity, across repeat
   await tick();
   expect(fake.state.prompted).toEqual(wakes().map((row) => row.messageID));
   expect(new Set(fake.state.texts.map((sent) => sent.sessionID))).toEqual(new Set(["ses_jojo"]));
+  // A feed trigger's wake is not a scheduled run of its responsibility.
+  expect(db.select().from(responsibilityRuns).all()).toEqual([]);
 });
 
 test("only the exact repository, its reasons and GitHub match", async () => {

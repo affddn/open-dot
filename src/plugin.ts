@@ -40,7 +40,9 @@ import {
   type RequestAnswer,
   requests,
   responsibilities,
+  responsibilityRuns,
   routeKey,
+  runWorkers,
   type Supervision,
   supervisions,
   type WorkerRequest,
@@ -56,6 +58,9 @@ import {
   sentByDot,
   sessionIDPattern,
 } from "./supervise";
+
+/** Context items that bring a turn new input: the owner's or open-dot's prompts, plugins' and shell input. */
+const inputTypes: ReadonlySet<string> = new Set(["user", "synthetic", "shell"]);
 
 const text = (description: string) => Schema.String.annotate({ description });
 const id = (description: string) => Schema.Int.annotate({ description });
@@ -278,7 +283,14 @@ export default Plugin.define({
         ? current
         : undefined;
     };
-    const origin = async (call: { sessionID: string; messageID: string }) => {
+    /**
+     * The invoking assistant message's turn, from public context: its reply route, as before, and
+     * the scheduled run it belongs to, judged more strictly and apart from the route. A run needs
+     * the idle before the turn in sight, nothing compacted in the whole turn as context shows it,
+     * including anything already after the invoking message, and that run's wake as its one input.
+     * The daemon still withholds the link if the turn later turns out shared or unknown.
+     */
+    const invoking = async (call: { sessionID: string; messageID: string }) => {
       if (!bound(call.sessionID)) throw new Error("The dot's conversation changed.");
       const history = await context.session.context({ sessionID: call.sessionID });
       if (!bound(call.sessionID)) throw new Error("The dot's conversation changed.");
@@ -306,8 +318,32 @@ export default Plugin.define({
       const route = routes[0] ?? null;
       if (route && (route.dot !== name || route.sessionID !== call.sessionID))
         throw new Error("The saved origin belongs to another conversation.");
-      return route;
+      const after = history.slice(at + 1);
+      const ending = after.findIndex((item) => item.type === "idle");
+      const whole = [...turn, ...(ending < 0 ? after : after.slice(0, ending))];
+      const inputs = whole.filter((item) => inputTypes.has(item.type));
+      const [only] = inputs;
+      const run =
+        boundary >= 0 &&
+        !whole.some((item) => item.type === "compaction") &&
+        inputs.length === 1 &&
+        only?.type === "user"
+          ? db
+              .select({ id: responsibilityRuns.id })
+              .from(responsibilityRuns)
+              .where(
+                and(
+                  eq(responsibilityRuns.messageID, only.id),
+                  eq(responsibilityRuns.dot, name),
+                  eq(responsibilityRuns.sessionID, call.sessionID),
+                ),
+              )
+              .get()
+          : undefined;
+      return { route, run: run?.id };
     };
+    const origin = async (call: { sessionID: string; messageID: string }) =>
+      (await invoking(call)).route;
 
     /**
      * The source of a note dot_note saves. Only the dot's exact ready session may save one, before
@@ -529,7 +565,7 @@ ${dataJSON(
         }),
         options: { codemode: false },
         execute: async (input, call) => {
-          const route = await origin(call);
+          const { route, run } = await invoking(call);
           if (!bound(call.sessionID)) throw new Error("The dot's conversation changed.");
           const directory = workingDirectory(name, input.directory);
           const source = input.directory === undefined ? undefined : repository(directory);
@@ -548,6 +584,10 @@ ${dataJSON(
               })
               .returning()
               .get();
+            if (run !== undefined)
+              tx.insert(runWorkers)
+                .values({ worker: inserted.id, run, assistantMessage: call.messageID })
+                .run();
             if (!source) return inserted;
             const planned = {
               directory: join(worktreeDirectory(name, inserted.id), relative(source, directory)),

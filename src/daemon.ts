@@ -18,6 +18,7 @@ import {
   outbox,
   reminders,
   responsibilities,
+  responsibilityRuns,
   routeKey,
   type Supervision,
   supervisions,
@@ -45,6 +46,7 @@ import {
   type SupervisionEvent,
   supervisionNotice,
 } from "./supervise";
+import { hasOpenRuns, observeRuns } from "./runs";
 import { queueReport } from "./slack-agents";
 import { fireTriggers, wakeAllowed } from "./triggers";
 
@@ -144,8 +146,8 @@ export function claimDue(db: Db, now: number) {
  * Wakes each ready dot about its active scheduled responsibilities that are due, and arms any
  * without a next run, such as one a plugin from before migration 0021 set active again. Each claim
  * needs the version it read, and moves the next run past `now` in the same transaction that
- * queues the wake, so runs missed during downtime wake the dot once and a restart sends nothing
- * twice. Arming queues nothing.
+ * queues the wake and saves the run's record, so runs missed during downtime wake the dot once and
+ * a restart sends nothing twice. Arming queues nothing and records no run.
  */
 export function claimSchedules(db: Db, now: number) {
   const due = db
@@ -187,7 +189,7 @@ export function claimSchedules(db: Db, now: number) {
         .returning({ id: responsibilities.id })
         .get();
       if (!claimed || item.nextRunAt === null) return;
-      enqueue(
+      const wake = enqueue(
         tx,
         sessionID,
         `Scheduled run of responsibility #${item.id} (${describeSchedule(schedule)}), due ${new Date(item.nextRunAt).toString()}.
@@ -196,6 +198,23 @@ Next action: ${item.nextAction}
 
 Act on it now if you can, then keep its next action current with dot_update.`,
       );
+      // The run's record, with the wake's saved ID, commits or rolls back with the claim.
+      tx.insert(responsibilityRuns)
+        .values({
+          dot: item.dot,
+          responsibility: item.id,
+          dueAt: item.nextRunAt,
+          claimedAt: now,
+          snapshot: {
+            goal: item.goal,
+            nextAction: item.nextAction,
+            schedule,
+            version: item.version,
+          },
+          sessionID,
+          messageID: wake.messageID,
+        })
+        .run();
     });
   }
 }
@@ -363,7 +382,7 @@ const followUp = (sessionID: string) =>
 
 /**
  * True when a message is waiting to be sent, a worker is unfinished or a session is supervised.
- * Worker requests have their own loops, in `daemonLoops`.
+ * Worker requests and scheduled runs have their own loops, in `daemonLoops`.
  */
 export const hasWork = (db: Db) =>
   db.select({ id: outbox.id }).from(outbox).where(eq(outbox.state, "pending")).get() !==
@@ -1238,9 +1257,10 @@ const report = (error: { readonly message: string }) =>
 /**
  * The daemon's repeating work, each loop on its own fiber so one that waits can't stall another.
  * Reminders, schedules and worker requests' local settling are database-only and run without
- * OpenCode. The worker, supervision and delivery pass, the answer pass and the Threads pass each
- * connect on their own, and the answer pass only when an answer is queued. Only the answer loop
- * sends answers, one at a time, so none is sent twice.
+ * OpenCode. The worker, supervision and delivery pass, the answer pass, the Threads pass and the
+ * scheduled run pass each connect on their own, the answer pass only when an answer is queued and
+ * the run pass only while a run is open. Only the answer loop sends answers, one at a time, so
+ * none is sent twice.
  */
 export const daemonLoops = (db: Db, layer: Layer.Layer<OpenCode, OpenCodeError>) => {
   const work = Effect.suspend(() => {
@@ -1261,12 +1281,22 @@ export const daemonLoops = (db: Db, layer: Layer.Layer<OpenCode, OpenCodeError>)
     Effect.provide(layer),
     Effect.catch(() => Effect.void),
   );
+  // Only reads, and only while an admitted run's turn hasn't been seen to end or go missing.
+  const runs = Effect.suspend(() =>
+    hasOpenRuns(db)
+      ? observeRuns(db).pipe(
+          Effect.provide(layer),
+          Effect.catch(() => Effect.void),
+        )
+      : Effect.void,
+  );
   return Effect.all(
     [
       Effect.repeat(work, Schedule.spaced("1 second")),
       Effect.repeat(settling, Schedule.spaced("1 second")),
       Effect.repeat(answers, Schedule.spaced("1 second")),
       Effect.repeat(threads, Schedule.spaced("5 seconds")),
+      Effect.repeat(runs, Schedule.spaced("5 seconds")),
     ],
     { concurrency: "unbounded", discard: true },
   );

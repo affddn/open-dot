@@ -35,8 +35,8 @@ const repoMigrations = join(import.meta.dir, "..", "drizzle");
 
 // 0024 and 0025 append columns to these, so earlier migrations' tests compare only their first columns.
 const polished = ["slack_apps", "slack_events", "notes"];
-// 0026 adds these tables, so earlier migrations' tests leave them out.
-const later = ["feed_triggers", "trigger_occurrences"];
+// 0026 and 0027 add these tables, so earlier migrations' tests leave them out.
+const later = ["feed_triggers", "trigger_occurrences", "responsibility_runs", "run_workers"];
 
 type LedgerRow = { seq: number; id: unknown; hash: string; created_at: number };
 
@@ -1409,6 +1409,71 @@ test("0026 adds only the feed trigger tables, keeps every 0025 table, row and tr
     db.$client.close();
     db = openDatabase(path);
     expectLedger(db.$client, ledger, "0026");
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0027 adds only the run tables, keeps every 0026 table, row and trigger, and backfills no run", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-runs-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0027");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  // A scheduled responsibility that already woke its dot before runs were recorded.
+  old.run(
+    `insert into responsibilities (dot,goal,next_action,status,created_at,updated_at,schedule,next_run_at) values ('jojo','Inbox','Triage','active',1,1,'{"kind":"interval","everyMinutes":10}',600001)`,
+  );
+  old.run(
+    "insert into outbox (session_id,message_id,text,state,created_at) values ('ses_jojo','msg_oldwake','Scheduled run of responsibility #1','sent',1)",
+  );
+  old.run(
+    "insert into workers (dot,task,directory,session_id,state,created_at) values ('jojo','Old','/work','ses_w','done',1)",
+  );
+  const tables = tableNames(old);
+  const columns = new Map(
+    tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
+  );
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+  const before = rows(old);
+  const ledger = ledgerOf(old);
+  const triggers = triggerSQL(old);
+  old.close();
+  let db = openDatabase(path);
+  try {
+    expect(tableNames(db.$client)).toEqual(
+      [...tables, "responsibility_runs", "run_workers"].toSorted(),
+    );
+    for (const name of tables)
+      expect(db.$client.query(`pragma table_info("${name}")`).all()).toEqual(
+        columns.get(name) ?? [],
+      );
+    expect(rows(db.$client)).toEqual(before);
+    expect(triggerSQL(db.$client)).toEqual(triggers);
+    expectLedger(db.$client, ledger, "0027");
+    // Nothing is invented from the old wake or the next run.
+    expect(db.$client.query("select * from responsibility_runs").all()).toEqual([]);
+    expect(db.$client.query("select * from run_workers").all()).toEqual([]);
+    const run = (messageID: string) =>
+      db.$client.run(
+        `insert into responsibility_runs (dot,responsibility,due_at,claimed_at,snapshot,session_id,message_id) values ('jojo',1,600001,600002,'{}','ses_jojo','${messageID}')`,
+      );
+    run("msg_new");
+    // One run per wake.
+    expect(() => run("msg_new")).toThrow();
+    db.$client.close();
+    db = openDatabase(path);
+    expectLedger(db.$client, ledger, "0027");
   } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });

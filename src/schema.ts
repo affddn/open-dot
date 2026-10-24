@@ -319,6 +319,62 @@ export const responsibilities = sqliteTable("responsibilities", {
 
 export type Responsibility = typeof responsibilities.$inferSelect;
 
+/** A responsibility as it was when the daemon claimed one of its scheduled runs. */
+export interface RunSnapshot {
+  readonly goal: string;
+  readonly nextAction: string;
+  readonly schedule: Schedule;
+  // The version the claim read; the claim itself advanced it by one.
+  readonly version: number;
+}
+
+/**
+ * Each scheduled run the daemon claimed, saved in the same transaction as the claim and its wake,
+ * so there is never a wake without its run or a run without its wake. Feed trigger wakes aren't
+ * runs, and nothing is ever made up from `next_run_at`. The rest is what the daemon last saw in
+ * OpenCode's public history for the wake's message: "queued" in the session's inbox, "running" in
+ * a turn with no idle yet, "ended" with the turn's outcome, or "missing", admitted yet in neither
+ * the inbox nor the history, so its outcome stays unknown. Null means not observed yet.
+ */
+export const responsibilityRuns = sqliteTable(
+  "responsibility_runs",
+  {
+    id: integer().primaryKey({ autoIncrement: true }),
+    dot: text()
+      .notNull()
+      .references(() => dots.name),
+    responsibility: integer()
+      .notNull()
+      .references(() => responsibilities.id),
+    // The run's own due time, which a catch-up after downtime keeps.
+    dueAt: integer("due_at").notNull(),
+    // When the daemon claimed it and queued its wake.
+    claimedAt: integer("claimed_at").notNull(),
+    snapshot: text({ mode: "json" }).$type<RunSnapshot>().notNull(),
+    // The dot's session the wake went to, and the wake's outbox message ID.
+    sessionID: text("session_id").notNull(),
+    messageID: text("message_id").notNull().unique(),
+    turn: text({ enum: ["queued", "running", "ended", "missing"] }),
+    // When the daemon first saw `turn` and `waiting` as they are now.
+    observedAt: integer("observed_at"),
+    // The session waited on a permission or question while the turn ran.
+    waiting: integer({ mode: "boolean" }).notNull().default(false),
+    outcome: text({ enum: ["succeeded", "failed", "interrupted"] }),
+    error: text(),
+    // The idle that ended the turn, and when.
+    turnEnd: text("turn_end"),
+    endedAt: integer("ended_at"),
+    // Whether the turn held only this wake ("exclusive"), other input too ("shared"), or history
+    // didn't say ("unknown"). Only an exclusive turn's reply is kept as the run's result.
+    attribution: text({ enum: ["exclusive", "shared", "unknown"] }),
+    resultID: text("result_id"),
+    resultText: text("result_text"),
+  },
+  (table) => [index("responsibility_runs_page").on(table.dot, table.responsibility, table.id)],
+);
+
+export type ResponsibilityRun = typeof responsibilityRuns.$inferSelect;
+
 /** Work a dot handed to a separate OpenCode session. */
 export const workers = sqliteTable("workers", {
   id: integer().primaryKey({ autoIncrement: true }),
@@ -347,6 +403,22 @@ export const workers = sqliteTable("workers", {
 });
 
 export type Worker = typeof workers.$inferSelect;
+
+/**
+ * A worker that a scheduled run's own turn delegated: the plugin saves one only when public
+ * `session.context` shows the invoking assistant message's turn had exactly one input, the run's
+ * wake. A worker from any other turn, a shared one or one an older plugin made has no row.
+ */
+export const runWorkers = sqliteTable("run_workers", {
+  worker: integer()
+    .primaryKey()
+    .references(() => workers.id),
+  run: integer()
+    .notNull()
+    .references(() => responsibilityRuns.id),
+  // The assistant message whose dot_delegate made the worker.
+  assistantMessage: text("assistant_message").notNull(),
+});
 
 /** What a worker's permission request or question showed when open-dot first read it. */
 export type RequestDetail =

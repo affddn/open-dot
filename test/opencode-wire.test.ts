@@ -82,7 +82,7 @@ test("installed public client streams only text events over fake HTTP only", asy
 test("installed public client reads a running turn's text so far over fake HTTP only", async () => {
   const result = await fixture("test/fixtures/turn-wire.ts", "turn-wire");
   expect(result).toMatchObject({ code: 0, stderr: "" });
-  expect(result.checks).toHaveLength(3);
+  expect(result.checks).toHaveLength(10);
 }, 20_000);
 
 test("installed public client pages messages with opaque cursors over fake HTTP only", async () => {
