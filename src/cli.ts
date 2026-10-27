@@ -20,6 +20,7 @@ import { collect, github, linear } from "./feed";
 import { apiPath, databasePath } from "./home";
 import { instructionsPath } from "./instructions";
 import { OpenCode } from "./opencode";
+import { reviewScopedPolicy } from "./policy-review";
 import { slackApps, type Supervision, supervisions } from "./schema";
 import { sharedNotices, slackChat, slackClient, slackFeed } from "./slack";
 import { slackAgents } from "./slack-agents";
@@ -56,6 +57,7 @@ const usage = `Usage:
   open-dot instructions <name>       Print the path of a dot's AGENTS.md, to edit it in an editor
   open-dot daemon                    Deliver reminders and run workers until stopped
   open-dot doctor [--json]           Check setup and runtime health, read only; starts nothing
+  open-dot policy review <file.json> Review a scoped preview proposal offline; grants nothing
   open-dot backup                    Back up the database without migrating it
   open-dot restore <file>            Restore a backup while the daemon is stopped
   open-dot slack config              Save your Slack app configuration tokens, typed without echo
@@ -76,6 +78,20 @@ const usage = `Usage:
   open-dot watch revoke <id>         End a supervision or decline a request`;
 
 const [command, ...args] = process.argv.slice(2);
+if (command === "policy") {
+  try {
+    if (args.length !== 2 || args[0] !== "review" || !args[1])
+      throw new Error("Usage: open-dot policy review <file.json> (offline; grants nothing)");
+    const file = Bun.file(args[1]);
+    if (file.size > 64 * 1024) throw new Error("Proposal exceeds 64 KiB.");
+    const review = reviewScopedPolicy(await file.json(), Date.now());
+    await Bun.write(Bun.stdout, `${JSON.stringify(review, null, 2)}\n`);
+    process.exit(review.status === "candidate" ? 0 : 1);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : "Proposal review failed.");
+    process.exit(1);
+  }
+}
 // Before anything opens the database, which would migrate it: doctor only reads.
 if (command === "doctor") {
   const json = args.length === 1 && args[0] === "--json";
