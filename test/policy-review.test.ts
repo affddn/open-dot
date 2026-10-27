@@ -130,12 +130,22 @@ test("confirmation text and revision use the exact normalized policy, including 
   expect(scopedPolicyRevision({ ...parsed, expiresAt: null })).not.toBe(review.revision);
 });
 
-test("this proposal feature leaves all existing live approval guards binding", () => {
+test("the local fork removes only the merge, ready and deploy blanket guard", () => {
   for (const command of [
     "gh pr ready 123",
     "gh pr merge 123",
     "git merge feature",
     "wrangler deploy",
+  ])
+    expect(
+      prohibited({ kind: "permission", action: "shell", resources: [command] }, "/work/1"),
+    ).toBeUndefined();
+  for (const command of [
+    "git push --force origin main",
+    "git reset --hard",
+    "npm publish",
+    "gh pr edit 123 --add-reviewer bob",
+    "kubectl delete deployment app",
   ])
     expect(
       prohibited({ kind: "permission", action: "shell", resources: [command] }, "/work/1"),

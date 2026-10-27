@@ -284,6 +284,21 @@ test("an answer in flight holds the session's gate, so a stop waits for it and n
   expect(db.select().from(workers).get()).toMatchObject({ state: "done", outcome: "stopped" });
 });
 
+test("owner-task merge, ready and deploy requests use normal once approval and fresh checks", async () => {
+  const commands = ["gh pr merge 12", "gh pr ready 12", "git merge feature", "wrangler deploy"];
+  for (const [index, command] of commands.entries()) {
+    const id = index + 1;
+    const session = running(id);
+    fake.state.waiting.set(session, [permission(`shell: ${command}`, `per_${id}`)]);
+    await tick();
+    expect(toDot().at(-1)).not.toContain("open-dot won't approve it");
+    expect(queue({ decision: "once" }, id)).toMatchObject({ state: "queued" });
+    await tick();
+    expect(request(id)).toMatchObject({ state: "answered", actorSession: "ses_jojo" });
+  }
+  expect(fake.state.answers).toHaveLength(commands.length);
+});
+
 test("open-dot won't approve what it recognizes as off limits, but the dot may reject it", async () => {
   const off = [
     "shell: git push --force origin main",
@@ -291,8 +306,6 @@ test("open-dot won't approve what it recognizes as off limits, but the dot may r
     "shell: rm -rf ~/Documents",
     "shell: rm -rf /Users/me/other",
     "edit: /Users/me/.config/opencode/opencode.json",
-    "shell: gh pr merge 12",
-    "shell: gh pr ready 12",
     "shell: npm publish",
     "shell: gh pr edit 3 --add-reviewer bob",
     "slack_send_message: hello",
@@ -696,7 +709,7 @@ test("deletions are approved only inside the worktree open-dot made for the work
   // Without a worktree of its own, nothing that deletes is approved, even a relative path.
   expect(shell("rm -rf build", null)).toContain("no worktree of its own");
   expect(shell("bun test", null)).toBeUndefined();
-  expect(shell("git merge main", root)).toBe("merges branches");
+  expect(shell("git merge main", root)).toBeUndefined();
   expect(shell("git branch -D other", root)).toBeString();
 
   // A worker with its own worktree may delete inside it; one in a scratch directory may not.

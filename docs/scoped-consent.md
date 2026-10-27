@@ -1,5 +1,16 @@
 # Scoped preview consent proposal
 
+## Local fork follow-up
+
+After this prototype, the owner explicitly confirmed removing the blanket merge/deploy/ready restriction and switching the daemon to the local fork.
+The fork's `requestPolicy` now permits those operations only within an explicitly authorized owner task, and the corresponding categorical regex guards are removed.
+This is a global guard change, not enforcement of the scoped proposal below. Production and main receive no blanket consent.
+Other guards, including infrastructure changes, reviewer requests, destructive operations, config edits, publications, and external posts, remain.
+The historical description below refers to the original installed base `c3e8009`.
+The offline proposal command still grants nothing. Existing OpenCode locations may retain the old plugin until separately refreshed by the owner.
+
+## Offline prototype
+
 This patch adds an **offline proposal reviewer**, not an authorization service.
 `open-dot policy review <file.json>` validates a proposal and an execution fixture before opening any database.
 It never approves requests, writes grants, changes instructions, starts services, or executes the proposed operation.
