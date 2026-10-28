@@ -1,5 +1,5 @@
 import { beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Plugin } from "@opencode/plugin";
@@ -667,6 +667,30 @@ test("a delegated task waits as an unfinished worker in the dot's memory", async
   expect(memory).toContain("Summarize the README.");
   expect(memory).toContain(`${join(home(), "worktrees/jojo/2/src")} on branch dot/jojo-2`);
   await loaded.cleanup?.();
+});
+
+test("a worker's extra paths must be existing absolute directories clear of OpenCode's config", async () => {
+  const db = openDatabase(databasePath());
+  const loaded = await load(dot.directory);
+  try {
+    const config = join(home(), ".config/opencode/skills");
+    mkdirSync(config, { recursive: true });
+    for (const bad of ["relative", join(home(), "missing"), config])
+      expect(await fails(loaded.call("dot_delegate", { task: "x", paths: [bad] }))).toBe(true);
+    const reference = join(home(), "reference");
+    mkdirSync(reference);
+    await loaded.call("dot_delegate", { task: "Read it.", paths: [reference, reference] });
+    expect(
+      db
+        .select()
+        .from(workers)
+        .all()
+        .map((worker) => worker.paths),
+    ).toEqual([[realpathSync(reference)]]);
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
 });
 
 test("a dot adds only its own workers' outputs to its Library, from its own conversation", async () => {

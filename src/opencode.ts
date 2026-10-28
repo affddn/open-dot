@@ -154,6 +154,8 @@ export interface SessionInput {
   readonly title: string;
   /** Absent, the session uses OpenCode's default model. */
   readonly model?: Model.Ref | undefined;
+  /** Canonical directories outside its own the session may use without an external_directory ask. */
+  readonly directories?: readonly string[];
 }
 
 export interface MessageRef {
@@ -787,14 +789,21 @@ export class OpenCode extends Context.Service<
             Effect.catchTag("SessionNotFoundError", () => Effect.succeed(false)),
             Effect.mapError(failed(`Could not look up session ${sessionID}`)),
           ),
-        createSession: ({ id, directory, title, model }) =>
+        createSession: ({ id, directory, title, model, directories = [] }) =>
           client.session
             .create({
               id: Session.ID.make(id),
               title,
               model,
               location: { directory: AbsolutePath.make(directory) },
-              permissions: destructive,
+              permissions: [
+                ...directories.map((allowed) => ({
+                  action: "external_directory",
+                  resource: `${allowed}/*`,
+                  effect: "allow" as const,
+                })),
+                ...destructive,
+              ],
             })
             .pipe(Effect.asVoid, Effect.mapError(failed(`Could not create session ${id}`))),
         // Check the inbox first: an admitted message moves from the inbox into the history, never back.

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Model } from "@opencode/client/effect";
@@ -321,8 +321,10 @@ test("a worker in a git repo gets its own worktree, and one that can't get a who
   // Worker 3's worktree is still locked, as git leaves it when killed mid-checkout.
   git(repo, "worktree", "add", "-q", "-b", "dot/jojo-3", worktreeDirectory("jojo", 3), "HEAD");
   git(repo, "worktree", "lock", worktreeDirectory("jojo", 3));
+  const reference = join(temp, "reference");
+  mkdirSync(reference);
   db.insert(workers)
-    .values([worker(1), worker(2), worker(3)])
+    .values([{ ...worker(1), paths: [reference] }, worker(2), worker(3)])
     .run();
 
   await tick(1);
@@ -331,6 +333,14 @@ test("a worker in a git repo gets its own worktree, and one that can't get a who
   const root = worktreeDirectory("jojo", 1);
   expect(git(root, "branch", "--show-current")).toBe("dot/jojo-1");
   expect(fake.state.created.map((session) => session.directory)).toEqual([join(root, "src")]);
+  // It may use its output directory, OpenCode's temporary directory, its repository and the
+  // directories its dot named without asking.
+  expect(fake.state.created[0]?.directories).toEqual([
+    outputDirectory("jojo", 1),
+    join(realpathSync(tmpdir()), "opencode"),
+    realpathSync(repo),
+    realpathSync(reference),
+  ]);
   expect(fake.state.texts.find((sent) => sent.sessionID === "ses_w1")?.text).toContain(
     "branch dot/jojo-1",
   );

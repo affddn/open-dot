@@ -43,6 +43,7 @@ import { isReactionEmoji, messageKind, messageSources, saveReaction } from "./re
 import {
   answerSummary,
   closedBecause,
+  containsConfig,
   escalate,
   needsYou,
   queueAnswer,
@@ -203,6 +204,21 @@ function workingDirectory(dot: string, requested: string | undefined) {
     throw new Error(`${requested} is not an existing absolute directory.`);
   }
   return realpathSync(requested);
+}
+
+/** Extra directories a worker may use, each existing, absolute and clear of OpenCode's configuration. */
+function extraPaths(requested: readonly string[] | undefined) {
+  const found = (requested ?? []).map((path) => {
+    if (!isAbsolute(path) || !statSync(path, { throwIfNoEntry: false })?.isDirectory())
+      throw new Error(`${path} is not an existing absolute directory.`);
+    const canonical = realpathSync(path);
+    if (containsConfig(canonical) || /\/\.config\/opencode(\/|$)/.test(canonical))
+      throw new Error(
+        `${path} holds or is inside OpenCode's configuration, so a worker can't have it.`,
+      );
+    return canonical;
+  });
+  return found.length === 0 ? null : [...new Set(found)];
 }
 
 /** The top of the git repository that contains a directory, if there is one. */
@@ -807,6 +823,12 @@ ${dataJSON(part)}
               "Absolute path of an existing directory to work in, such as a repository. Omit for a scratch directory",
             ),
           ),
+          paths: Schema.optionalKey(
+            Schema.Array(Schema.String).annotate({
+              description:
+                "Absolute paths of other existing directories the worker may read and use without asking, such as reference repositories the task names. Its own directory, the repository it works on, its output directory and the temporary directory are always allowed",
+            }),
+          ),
         }),
         options: { codemode: false },
         execute: async (input, call) => {
@@ -814,6 +836,7 @@ ${dataJSON(part)}
           if (!bound(call.sessionID)) throw new Error("The dot's conversation changed.");
           const directory = workingDirectory(name, input.directory);
           const source = input.directory === undefined ? undefined : repository(directory);
+          const paths = extraPaths(input.paths);
           // One transaction, so the daemon never sees the worker before its worktree is planned.
           const row = db.transaction((tx) => {
             const inserted = tx
@@ -823,6 +846,7 @@ ${dataJSON(part)}
                 route,
                 task: input.task,
                 directory,
+                paths,
                 sessionID: Session.ID.create(),
                 state: "creating",
                 createdAt: Date.now(),

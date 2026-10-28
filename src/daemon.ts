@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionMessage } from "@opencode/client/effect";
 import { and, asc, eq, gt, inArray, isNull, lte, ne, or, isNotNull } from "drizzle-orm";
@@ -590,6 +591,29 @@ function prepareWorktree(worker: Worker) {
   }
 }
 
+const canonical = (path: string) => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+};
+
+/**
+ * Where a worker may go outside its own directory without asking: its output directory, OpenCode's
+ * temporary directory, the repository its worktree came from and the paths its dot named.
+ */
+export const workerDirectories = (worker: Worker) => [
+  ...new Set(
+    [
+      outputDirectory(worker.dot, worker.id),
+      join(canonical(tmpdir()), "opencode"),
+      ...(worker.source ? [worker.source] : []),
+      ...(worker.paths ?? []),
+    ].map(canonical),
+  ),
+];
+
 /**
  * Creates the worker's worktree and saved session if they are absent, then queues its task.
  * A worktree git can't create ends the worker, with one report to its dot.
@@ -622,6 +646,7 @@ const start = (db: Db, worker: Worker, dotSessionID: string) =>
         directory: worker.directory,
         title: `${worker.dot} worker #${worker.id}: ${headline(worker.task)}`,
         model: yield* opencode.sessionModel(dotSessionID),
+        directories: workerDirectories(worker),
       });
     }
     db.transaction((tx) => {
