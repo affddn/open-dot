@@ -63,6 +63,45 @@ const historyItem = (id: string, type: string): HistoryItem => ({
   time: { created: 0 },
 });
 
+/** A request message without the cache breakpoint the context hook puts before its tail. */
+const withoutCache = (message: FakeMessage | undefined) =>
+  message && {
+    ...message,
+    content: message.content.map(
+      ({ cache: _, ...part }: { cache?: unknown; text?: string }) => part,
+    ),
+  };
+
+/** A session's instruction entries, as OpenCode 2.2's plugin API keeps them, with each put. */
+function fakeEntries() {
+  const values = new Map<string, unknown>();
+  const puts: string[] = [];
+  let failing = false;
+  const fail = () => {
+    if (failing) throw new Error("instruction entries unavailable");
+  };
+  return {
+    values,
+    puts,
+    fail: (on: boolean) => {
+      failing = on;
+    },
+    api: {
+      list: async () => (fail(), [...values].map(([key, value]) => ({ key, value }))),
+      put: async ({ key, value }: { key: string; value: unknown }) => {
+        fail();
+        puts.push(key);
+        values.set(key, value);
+      },
+      remove: async ({ key }: { key: string }) => {
+        fail();
+        values.delete(key);
+      },
+    },
+  };
+}
+type FakeEntries = ReturnType<typeof fakeEntries>;
+
 const fails = (promise: Promise<unknown>) =>
   promise.then(
     () => false,
@@ -86,6 +125,7 @@ async function load(
     { id: "msg_invocation", type: "assistant", text: "", time: { created: 1 } },
   ],
   onRead = () => {},
+  entries?: FakeEntries,
 ) {
   const tools = new Map<string, FakeTool>();
   let hook: ContextHook | undefined;
@@ -120,6 +160,7 @@ async function load(
         if (name === "compaction") compactionHook = callback;
         else hook = callback;
       },
+      ...(entries ? { instructions: { entry: entries.api } } : {}),
     },
     // A dot never answers a permission request or question; any call here fails the test.
     permission: {
@@ -430,6 +471,64 @@ test("a saved note appears in the dot's own context and nowhere else", async () 
   expect(await loaded.injected(dot.sessionID)).toContain("Prefers short answers.");
   expect(await loaded.injected("ses_someone_else")).toBe("");
   await loaded.cleanup?.();
+});
+
+test("memory goes into instruction entries, one per section, put only when it changes", async () => {
+  const entries = fakeEntries();
+  const loaded = await load(dot.directory, undefined, undefined, entries);
+  try {
+    // The first request puts every section, and shows them once in the tail, since OpenCode
+    // read the entries before the hook ran.
+    const first = await loaded.injected(dot.sessionID);
+    expect(entries.puts).toEqual([
+      "open-dot.notes",
+      "open-dot.responsibilities",
+      "open-dot.workers",
+      "open-dot.reminders",
+      "open-dot.dots",
+      "open-dot.supervised",
+      "open-dot.requests",
+    ]);
+    expect(first).toContain('<context key="open-dot.notes">');
+    expect(first).toContain("Current time:");
+
+    // Nothing changed: nothing is put, and the tail is only the time.
+    const quiet = await loaded.injected(dot.sessionID);
+    expect(entries.puts).toHaveLength(7);
+    expect(quiet).not.toContain("## Notes");
+    expect(quiet).toContain("Current time:");
+
+    // A new note changes one section only.
+    await loaded.call("dot_note", { text: "Prefers short answers." });
+    const noted = await loaded.injected(dot.sessionID);
+    expect(entries.puts.slice(7)).toEqual(["open-dot.notes"]);
+    expect(entries.values.get("open-dot.notes")).toContain("Prefers short answers.");
+    expect(noted).toContain("Prefers short answers.");
+    expect(noted).not.toContain("## Responsibilities");
+  } finally {
+    await loaded.cleanup?.();
+  }
+});
+
+test("memory falls back to the reminder when instruction entries fail, and recovers", async () => {
+  const entries = fakeEntries();
+  const loaded = await load(dot.directory, undefined, undefined, entries);
+  try {
+    entries.fail(true);
+    const fallback = await loaded.injected(dot.sessionID);
+    expect(fallback).toContain("# open-dot memory, as of now");
+    expect(fallback).toContain("## Responsibilities");
+    expect(fallback).not.toContain("<context key=");
+
+    // Once they work again, what the session holds is read back before anything is put.
+    entries.fail(false);
+    entries.values.set("open-dot.dots", "stale");
+    await loaded.injected(dot.sessionID);
+    expect(entries.puts).toContain("open-dot.dots");
+    expect(entries.values.get("open-dot.dots")).toContain("## Other dots");
+  } finally {
+    await loaded.cleanup?.();
+  }
 });
 
 test("a reminder needs a future time with a UTC offset", async () => {
@@ -1491,7 +1590,9 @@ test("issue42 phase 2: one owner message gets one block, reused; visible and wea
     // History is never rewritten: one message is added just before the prompt, nothing else.
     expect(original).toEqual(snapshot);
     expect(first).toHaveLength(4);
-    expect([first[0], first[1], first[3]]).toEqual(snapshot);
+    expect([first[0], withoutCache(first[1]), first[3]]).toEqual(snapshot);
+    // The message before the tail holds the cache breakpoint, so the history stays cached.
+    expect(first[1]?.content[0]).toHaveProperty("cache", { type: "ephemeral" });
     const tail = first[2]?.content.map((part) => part.text).join("") ?? "";
     expect(recalledData(tail)?.map((hit) => hit.message)).toEqual(["msg_budget"]);
 
@@ -1629,7 +1730,9 @@ test("issue42 phase 3: the checkpoint leads every request until the next compact
       trigger: "msg_compact",
       native: false,
     });
-    expect((await loaded.request(dot.sessionID, [earlier, prompt]))[0]).toBe(earlier);
+    expect(withoutCache((await loaded.request(dot.sessionID, [earlier, prompt]))[0])).toEqual(
+      earlier,
+    );
     saveArchiveSettings(db, "jojo", { ledger: true, frozenHead: true }, 1);
     // A later intent sets it; the same one settling again never would.
     settleHead(db, {
@@ -1655,7 +1758,9 @@ test("issue42 phase 3: the checkpoint leads every request until the next compact
     expect(compacting[0]?.content[0]?.text).toBe(head);
     // A native compaction keeps phases 1 and 2 only.
     history[0] = compactionItem("msg_compact", true);
-    expect((await loaded.request(dot.sessionID, [earlier, prompt]))[0]).toBe(earlier);
+    expect(withoutCache((await loaded.request(dot.sessionID, [earlier, prompt]))[0])).toEqual(
+      earlier,
+    );
     expect((await loaded.compacting(dot.sessionID, [earlier, prompt]))[0]).toBe(earlier);
   } finally {
     await loaded.cleanup?.();
@@ -2002,13 +2107,13 @@ test("issue42 cache: the checkpoint keeps its exact bytes across requests, tool 
     const compacting = await loaded.compacting(dot.sessionID, [earlier, prompt]);
     expect(compacting).toEqual([parent[0] ?? earlier, earlier, prompt]);
     expect(compacting[0]).not.toBe(earlier);
-    expect(parent.slice(0, 2)).toEqual(compacting.slice(0, 2));
+    expect(parent.slice(0, 2).map(withoutCache)).toEqual(compacting.slice(0, 2));
     // The owner forgets a row: the checkpoint goes away once, never shows it again, until the
     // next compaction sets a new one.
     Date.now = clock;
     expect(forgetObservation(db, "jojo", first.id, 1)).toEqual({ deleted: true });
     const without = await loaded.request(dot.sessionID, [earlier, prompt]);
-    expect(without[0]).toBe(earlier);
+    expect(withoutCache(without[0])).toEqual(earlier);
     expect(JSON.stringify(without)).not.toContain("The Lisbon budget is now 45k.");
     expect((await loaded.compacting(dot.sessionID, [earlier, prompt]))[0]).toBe(earlier);
     history[0] = compactionItem("msg_compact_2");
