@@ -383,6 +383,47 @@ const followUp = (sessionID: string) =>
   });
 
 /**
+ * Steers a queued message into its session's running turn, or cancels it, inside the session's
+ * gate. "done" when it changed, "delivered" when OpenCode already put it into the history,
+ * "confirming" while an admission's outcome is still unknown, and "gone" when it's finished,
+ * cancelled or missing. A message never started only changes how the daemon will send it.
+ */
+export const changeQueued = (db: Db, id: number, change: "steer" | "cancel") =>
+  Effect.suspend(() => {
+    const first = db.select().from(outbox).where(eq(outbox.id, id)).get();
+    if (!first) return Effect.succeed("gone" as const);
+    return gated(first.sessionID)(
+      Effect.gen(function* () {
+        const row = db.select().from(outbox).where(eq(outbox.id, id)).get();
+        if (!row || row.state === "cancelled" || row.turnEnd !== null) return "gone" as const;
+        if (row.state === "pending" && row.startedAt === null) {
+          db.update(outbox)
+            .set(change === "cancel" ? { state: "cancelled" } : { delivery: "auto" })
+            .where(eq(outbox.id, id))
+            .run();
+          return "done" as const;
+        }
+        if (row.state !== "sent") return "confirming" as const;
+        const opencode = yield* OpenCode;
+        const ref = { sessionID: row.sessionID, messageID: row.messageID };
+        const queued = (yield* opencode.inbox(row.sessionID)).find(
+          (item) => item.id === row.messageID,
+        );
+        if (!queued) return "delivered" as const;
+        if (change === "steer") {
+          if (queued.delivery !== "steer") yield* opencode.steerQueued(ref);
+          db.update(outbox).set({ delivery: "steer" }).where(eq(outbox.id, id)).run();
+          return "done" as const;
+        }
+        yield* opencode.cancelQueued(ref);
+        if (yield* opencode.messageExists(ref)) return "delivered" as const;
+        db.update(outbox).set({ state: "cancelled" }).where(eq(outbox.id, id)).run();
+        return "done" as const;
+      }),
+    );
+  });
+
+/**
  * True when a message is waiting to be sent, a worker is unfinished or a session is supervised.
  * Worker requests and scheduled runs have their own loops, in `daemonLoops`.
  */

@@ -261,6 +261,9 @@ struct MessageWindow: Equatable {
   var pending: [String: [Pending]] = [:]
   /// Per dot, where each accepted send stands until it's in the conversation: sending, confirming or sent.
   var sendStatus: [String: [String: String]] = [:]
+  /// Per dot, how each accepted send joins the turn, and the sends with a Send now or Cancel in flight.
+  var sendDelivery: [String: [String: String]] = [:]
+  var changingPending: Set<String> = []
   var drafts: [String: String] = [:]
   var draftImages: [String: [DraftImage]] = [:]
   var imageErrors: [String: String] = [:]
@@ -1055,6 +1058,46 @@ struct MessageWindow: Equatable {
     }
   }
 
+  /// What the owner can still do with a send before the dot has it: Send now while it waits behind
+  /// the turn, Cancel until OpenCode hands it over. Neither while its admission is being confirmed.
+  nonisolated static func pendingActions(status: String?, delivery: String?) -> (sendNow: Bool, cancel: Bool) {
+    switch status {
+    case "sending": (true, true)
+    case "sent": (delivery == "queue", true)
+    default: (false, false)
+    }
+  }
+
+  func pendingActions(_ dot: String, _ item: Pending) -> (sendNow: Bool, cancel: Bool) {
+    guard let id = item.messageID, item.error == nil, !changingPending.contains(id) else { return (false, false) }
+    return Self.pendingActions(status: sendStatus[dot]?[id], delivery: sendDelivery[dot]?[id])
+  }
+
+  /// Steers a waiting send into the dot's running turn, or cancels it, once. A refusal, such as one
+  /// the dot already has, shows above the message box; the next poll shows where it stands.
+  func changePending(_ dot: String, _ item: Pending, steer: Bool) {
+    guard let id = item.messageID, changingPending.insert(id).inserted else { return }
+    chatActionErrors[dot] = nil
+    Task {
+      defer { changingPending.remove(id) }
+      do {
+        try await api.changePending(dot, id: id, steer: steer)
+        if steer {
+          sendDelivery[dot]?[id] = "steer"
+        } else {
+          pending[dot]?.removeAll { $0.messageID == id }
+        }
+      } catch {
+        let verb = steer ? "sent now" : "cancelled"
+        if case .lost = error as? APIError {
+          report("Outcome unknown: no response. It may be \(verb) after the next refresh. No automatic retry.", dot: dot, key: nil)
+        } else {
+          report("Not \(verb). \(Self.describe(error)) No automatic retry.", dot: dot, key: nil)
+        }
+      }
+    }
+  }
+
   private func fail(_ key: MessageKey, _ text: String) { report(text, dot: key.dot, key: key) }
 
   /// Shows a failure under its message while that message is shown, otherwise above the dot's
@@ -1779,6 +1822,7 @@ struct MessageWindow: Equatable {
     window.mergeLatest(result)
     if window != conversations[name] { conversations[name] = window }
     if sendStatus[name] != statuses { sendStatus[name] = statuses }
+    if sendDelivery[name] != result.deliveries { sendDelivery[name] = result.deliveries }
     // Recent emoji are the owner's across dots, so a reaction to any dot's message makes this read stale.
     if let recent, recentEpoch == recentWrites, reacting.isEmpty, recent != recentEmojis { recentEmojis = recent }
     pruneThumbnails(name)

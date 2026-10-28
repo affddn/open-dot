@@ -57,7 +57,7 @@ const post = async (body: unknown) => {
 const conversation = async () =>
   (await (await call("/dots/jojo/messages")).json()) as {
     messages: { id: string; kind: string; text: string; quote?: unknown }[];
-    pending: { id: string; status: string }[];
+    pending: { id: string; status: string; delivery: string | null }[];
   };
 
 const row = (messageID: string) =>
@@ -102,10 +102,14 @@ test("idle owner messages queue, busy ones steer mid-tool with files and quote, 
   fake.state.onPrompt = (id) => saved.push(row(id));
   const first = await post({ text: "Look into the build." });
   expect(row(first)).toMatchObject({ delivery: "auto", startedAt: null, state: "pending" });
-  expect((await conversation()).pending).toEqual([{ id: first, status: "sending" }]);
+  expect((await conversation()).pending).toEqual([
+    { id: first, status: "sending", delivery: "auto" },
+  ]);
   await tick();
   expect(fake.state.deliveries.get(first)).toBe("queue");
-  expect((await conversation()).pending).toEqual([{ id: first, status: "sent" }]);
+  expect((await conversation()).pending).toEqual([
+    { id: first, status: "sent", delivery: "queue" },
+  ]);
 
   // The turn started with the first message and is now running a tool.
   deliverInto(first, "Look into the build.");
@@ -129,7 +133,7 @@ test("idle owner messages queue, busy ones steer mid-tool with files and quote, 
 
   // Admitted but still waiting for the tool to finish: sent, not delivered.
   let shown = await conversation();
-  expect(shown.pending).toEqual([{ id: second, status: "sent" }]);
+  expect(shown.pending).toEqual([{ id: second, status: "sent", delivery: "steer" }]);
   expect(shown.messages.map((message) => message.id)).toEqual([first, "msg_dot"]);
   deliverInto(second, row(second)?.text ?? "");
   shown = await conversation();
@@ -152,7 +156,9 @@ test("notices and Slack never steer, a waiting notice holds the owner's message 
   // The Slack follow-up joins its own thread's turn queued; the owner's message waits for that turn.
   expect(fake.state.prompted).toEqual(["slack_a", "slack_a2"]);
   expect(fake.state.deliveries.get("slack_a2")).toBe("queue");
-  expect((await conversation()).pending).toEqual([{ id: native, status: "sending" }]);
+  expect((await conversation()).pending).toEqual([
+    { id: native, status: "sending", delivery: "auto" },
+  ]);
 
   for (const id of ["slack_a", "slack_a2"])
     fake.state.messageTurns.set(id, { end: "idle_A", outcome: "succeeded", text: undefined });
@@ -253,7 +259,11 @@ test("a lost steer survives reopening and a failed lookup, and is never sent twi
     await tick();
     expect(fake.state.prompted).toEqual([first, lost]);
     expect(row(lost)).toMatchObject({ state: "pending", delivery: "steer" });
-    expect((await conversation()).pending).toContainEqual({ id: lost, status: "confirming" });
+    expect((await conversation()).pending).toContainEqual({
+      id: lost,
+      status: "confirming",
+      delivery: "steer",
+    });
 
     db.$client.close();
     db = openDatabase(path);
@@ -400,7 +410,10 @@ test("over the public client, the saved mode reaches OpenCode, and only the hist
           headers: { authorization: "Bearer secret" },
         }),
       )
-    ).json()) as { messages: { id: string }[]; pending: { id: string; status: string }[] };
+    ).json()) as {
+      messages: { id: string }[];
+      pending: { id: string; status: string; delivery: string | null }[];
+    };
   try {
     // A turn started in the TUI is running before the owner sends anything from the notch.
     busy = true;
@@ -432,7 +445,7 @@ test("over the public client, the saved mode reaches OpenCode, and only the hist
     });
     let view = await shown();
     expect(view.messages.map((message) => message.id)).toEqual([opening, first]);
-    expect(view.pending).toEqual([{ id: second, status: "sent" }]);
+    expect(view.pending).toEqual([{ id: second, status: "sent", delivery: "steer" }]);
 
     // A worker report waits queued for the turn to end, and keeps the next owner message behind it.
     const report = SessionMessage.ID.create();
@@ -460,7 +473,7 @@ test("over the public client, the saved mode reaches OpenCode, and only the hist
     handOver(second);
     view = await shown();
     expect(view.messages.map((message) => message.id)).toEqual([opening, first, second]);
-    expect(view.pending).toEqual([{ id: third, status: "sent" }]);
+    expect(view.pending).toEqual([{ id: third, status: "sent", delivery: "queue" }]);
 
     // A lost answer is confirmed by ID after reopening and a failed lookup, never posted again.
     handOver(report);
@@ -469,7 +482,9 @@ test("over the public client, the saved mode reaches OpenCode, and only the hist
     const fourth = await post({ text: "Lost answer." });
     await poll();
     expect(row(fourth)).toMatchObject({ state: "pending", delivery: "steer" });
-    expect((await shown()).pending).toEqual([{ id: fourth, status: "confirming" }]);
+    expect((await shown()).pending).toEqual([
+      { id: fourth, status: "confirming", delivery: "steer" },
+    ]);
     db.$client.close();
     db = openDatabase(path);
     lost = false;
@@ -488,4 +503,65 @@ test("over the public client, the saved mode reaches OpenCode, and only the hist
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+const changePending = (id: string, method: "PATCH" | "DELETE", body?: unknown) =>
+  api(
+    db,
+    "secret",
+    fake.layer,
+  )(
+    new Request(`http://127.0.0.1/dots/jojo/pending/${id}`, {
+      method,
+      headers: { authorization: "Bearer secret" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    }),
+  );
+
+test("the owner sends a queued message now or cancels it, only while it waits outside the history", async () => {
+  // A busy turn with a worker report queued keeps the owner's messages queued behind it.
+  fake.state.active.add("ses_jojo");
+  fake.state.inbox.push({ sessionID: "ses_jojo", id: "msg_report", delivery: "queue" });
+  const first = await post({ text: "Then this." });
+  const second = await post({ text: "And this." });
+  await tick();
+  expect(fake.state.deliveries.get(first)).toBe("queue");
+  expect(fake.state.deliveries.get(second)).toBe("queue");
+
+  expect((await changePending(first, "PATCH", { delivery: "queue" })).status).toBe(400);
+  const sent = await changePending(first, "PATCH", { delivery: "steer" });
+  expect(sent.status).toBe(200);
+  expect(await sent.json()).toEqual({ pending: { id: first, status: "sent", delivery: "steer" } });
+  expect(fake.state.inbox.find((item) => item.id === first)?.delivery).toBe("steer");
+  expect(row(first)?.delivery).toBe("steer");
+
+  expect((await changePending(second, "DELETE")).status).toBe(200);
+  expect(fake.state.inbox.some((item) => item.id === second)).toBe(false);
+  expect(row(second)?.state).toBe("cancelled");
+  expect((await conversation()).pending).toEqual([
+    { id: first, status: "sent", delivery: "steer" },
+  ]);
+  expect((await changePending(second, "DELETE")).status).toBe(404);
+
+  // Once OpenCode hands it to the turn, it's the dot's: neither steer nor cancel changes it.
+  deliverInto(first, "Then this.");
+  expect((await changePending(first, "DELETE")).status).toBe(409);
+  expect((await changePending(first, "PATCH", { delivery: "steer" })).status).toBe(409);
+  expect(row(first)?.state).toBe("sent");
+
+  // Never started: cancelling means it's never sent.
+  const third = await post({ text: "Never mind." });
+  expect((await changePending(third, "DELETE")).status).toBe(200);
+  await tick();
+  expect(fake.state.prompted).not.toContain(third);
+  expect((await changePending("msg_nope", "DELETE")).status).toBe(404);
+});
+
+test("a message whose admission is unconfirmed can't change until it's confirmed", async () => {
+  fake.state.prompt = "lost";
+  const lost = await post({ text: "Lost answer." });
+  await tick();
+  expect(row(lost)).toMatchObject({ state: "pending" });
+  expect((await changePending(lost, "DELETE")).status).toBe(409);
+  expect((await changePending(lost, "PATCH", { delivery: "steer" })).status).toBe(409);
 });

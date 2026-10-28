@@ -13,7 +13,7 @@ import {
   observationTextLimit,
 } from "./ledger";
 import { observerStatus } from "./observer";
-import { stopWorker } from "./daemon";
+import { changeQueued, stopWorker } from "./daemon";
 import type { Db } from "./db";
 import type { HealthReport } from "./doctor";
 import { findDot, listDots } from "./dots";
@@ -948,18 +948,75 @@ const conversationMessage = (db: Db, dot: Dot, id: string, request: Request) =>
 const pendingSends = (db: Db, dot: Dot, entries: readonly Entry[]) => {
   const delivered = new Set(entries.map((item) => item.id));
   return db
-    .select({ messageID: outbox.messageID, state: outbox.state, startedAt: outbox.startedAt })
+    .select({
+      messageID: outbox.messageID,
+      state: outbox.state,
+      startedAt: outbox.startedAt,
+      delivery: outbox.delivery,
+    })
     .from(outbox)
     .where(
-      and(eq(outbox.sessionID, dot.sessionID), isNotNull(outbox.delivery), isNull(outbox.turnEnd)),
+      and(
+        eq(outbox.sessionID, dot.sessionID),
+        eq(outbox.fromOwner, true),
+        isNotNull(outbox.delivery),
+        isNull(outbox.turnEnd),
+        ne(outbox.state, "cancelled"),
+      ),
     )
     .all()
     .filter((row) => !delivered.has(row.messageID))
     .map((row) => ({
       id: row.messageID,
       status: row.state === "sent" ? "sent" : row.startedAt === null ? "sending" : "confirming",
+      delivery: row.delivery,
     }));
 };
+
+/**
+ * Steers one of the owner's queued notch messages into the dot's running turn, or cancels it.
+ * The ID is the message's own; only a message still waiting outside the history can change.
+ */
+const changePending = (db: Db, dot: Dot, id: string, request: Request) =>
+  Effect.gen(function* () {
+    let change: "steer" | "cancel" = "cancel";
+    if (request.method === "PATCH") {
+      const body = yield* Effect.tryPromise(() => messageBody(request, 1024)).pipe(
+        Effect.orElseSucceed(() => undefined),
+      );
+      if (body instanceof Response) return body;
+      if (
+        typeof body !== "object" ||
+        body === null ||
+        Array.isArray(body) ||
+        Object.keys(body).length !== 1 ||
+        !("delivery" in body) ||
+        body.delivery !== "steer"
+      )
+        return error(400, 'Send {delivery: "steer"}.');
+      change = "steer";
+    }
+    const row = db
+      .select({ id: outbox.id })
+      .from(outbox)
+      .where(
+        and(
+          eq(outbox.messageID, id),
+          eq(outbox.sessionID, dot.sessionID),
+          eq(outbox.fromOwner, true),
+        ),
+      )
+      .get();
+    if (!row) return error(404, "There's no such queued message.");
+    const outcome = yield* changeQueued(db, row.id, change);
+    if (outcome === "gone") return error(404, "There's no such queued message.");
+    if (outcome === "delivered") return error(409, "The dot already has this message.");
+    if (outcome === "confirming")
+      return error(409, "open-dot is still confirming this message. Try again in a moment.");
+    return Response.json({
+      pending: pendingSends(db, dot, []).find((item) => item.id === id) ?? null,
+    });
+  });
 
 const react = (db: Db, dot: Dot, id: string, request: Request) =>
   Effect.gen(function* () {
@@ -1820,6 +1877,13 @@ const route = (
       : Effect.succeed(error(404, "Not found"));
   if (rest === "messages" && id !== undefined && extra.length === 1 && request.method === "GET")
     return conversationMessage(db, dot, id, request);
+  if (
+    rest === "pending" &&
+    id !== undefined &&
+    extra.length === 1 &&
+    (request.method === "PATCH" || request.method === "DELETE")
+  )
+    return changePending(db, dot, id, request);
   if (
     rest === "messages" &&
     part === "reaction" &&

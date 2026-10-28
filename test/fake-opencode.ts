@@ -130,6 +130,21 @@ export function fakeOpenCode() {
           ? broken("inbox unavailable")
           : Effect.succeed(state.inbox.filter((item) => item.sessionID === sessionID)),
       ),
+    steerQueued: ({ messageID }) =>
+      Effect.suspend(() => {
+        if (state.lookupFailure) return broken("inbox unavailable");
+        for (const item of state.inbox) if (item.id === messageID) item.delivery = "steer";
+        return Effect.void;
+      }),
+    cancelQueued: ({ messageID }) =>
+      Effect.suspend(() => {
+        if (state.lookupFailure) return broken("inbox unavailable");
+        if (state.inbox.some((item) => item.id === messageID)) {
+          state.inbox = state.inbox.filter((item) => item.id !== messageID);
+          state.messages.delete(messageID);
+        }
+        return Effect.void;
+      }),
     prompt: ({ sessionID, messageID, text, files, delivery }) => {
       if (state.prompt === "fail") return broken("connection refused");
       state.onPrompt(messageID);

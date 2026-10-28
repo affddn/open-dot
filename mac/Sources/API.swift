@@ -419,7 +419,7 @@ struct WorkerOpened: Decodable, Equatable {
 }
 
 struct MessagePage: Decodable {
-  struct Status: Decodable { let id: String; let status: String }
+  struct Status: Decodable { let id: String; let status: String; var delivery: String? = nil }
   var messages: [Message]
   let sessionID: String?
   let next: String?
@@ -429,6 +429,10 @@ struct MessagePage: Decodable {
   var refreshError: String? = nil
   var statuses: [String: String] {
     Dictionary((pending ?? []).map { ($0.id, $0.status) }) { first, _ in first }
+  }
+  /// How each pending send joins the dot's turn: "auto" until the daemon decides, then "queue" or "steer".
+  var deliveries: [String: String] {
+    Dictionary((pending ?? []).compactMap { item in item.delivery.map { (item.id, $0) } }) { first, _ in first }
   }
 }
 
@@ -997,6 +1001,17 @@ enum APIError: Error {
     let data = try await send("PUT", "/dots/\(escape(key.dot))/messages/\(escape(key.message))/hidden", body: body)
     guard let saved = try? decode(Body.self, data) else { throw APIError.lost }
     return saved.hidden
+  }
+
+  /// Steers a queued send into the dot's running turn, or cancels it. Never retried on its own.
+  func changePending(_ dot: String, id: String, steer: Bool) async throws {
+    let path = "/dots/\(escape(dot))/pending/\(escape(id))"
+    if steer {
+      let body = try JSONSerialization.data(withJSONObject: ["delivery": "steer"])
+      _ = try await send("PATCH", path, body: body)
+    } else {
+      _ = try await send("DELETE", path)
+    }
   }
 
   /// Queues the text, as a reply to a feed item when `feed` is its ID. Never retried on its own.

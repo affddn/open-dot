@@ -1282,6 +1282,19 @@ struct PendingRow: View {
             Text("\(error) · click to dismiss").font(.caption2).foregroundStyle(.red)
           } else {
             Text(status).font(.caption2).foregroundStyle(.tertiary)
+            let actions = store.pendingActions(dot, item)
+            if actions.sendNow {
+              Button("Send now") { store.changePending(dot, item, steer: true) }
+                .buttonStyle(.link).font(.caption2)
+                .help("Join the dot's running turn at its next step instead of waiting for it to end")
+                .accessibilityIdentifier("pending-send-now")
+            }
+            if actions.cancel {
+              Button("Cancel") { store.changePending(dot, item, steer: false) }
+                .buttonStyle(.link).font(.caption2)
+                .help("Withdraw this message before the dot gets it")
+                .accessibilityIdentifier("pending-cancel")
+            }
           }
           MessageActionsButton(id: anchorID)
         }
@@ -1826,6 +1839,18 @@ private func tapbackImage(_ emoji: String, selected: Bool) -> NSImage {
     // A refusal shows above the message box, since a pending bubble has no error line of its own.
     store.present([text], dot: dot, key: nil, from: anchor)
   })
+  let actions = store.pendingActions(dot, item)
+  if actions.sendNow || actions.cancel { menu.addItem(.separator()) }
+  if actions.sendNow {
+    menu.addItem(action("Send Now", symbol: "arrow.up.forward", id: "message-menu-send-now") {
+      store.changePending(dot, item, steer: true)
+    })
+  }
+  if actions.cancel {
+    menu.addItem(action("Cancel Message", symbol: "xmark", id: "message-menu-cancel") {
+      store.changePending(dot, item, steer: false)
+    })
+  }
   menu.addItem(.separator())
   menu.addItem(note("Tapbacks, Reply and Delete wait until it's delivered."))
   if !item.images.isEmpty { menu.addItem(note("Its images copy and share once delivered.")) }

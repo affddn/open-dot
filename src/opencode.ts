@@ -542,6 +542,10 @@ export class OpenCode extends Context.Service<
     readonly messageExists: (ref: MessageRef) => Effect.Effect<boolean, OpenCodeError>;
     /** Input OpenCode has admitted but not yet delivered into the history, oldest first. */
     readonly inbox: (sessionID: string) => Effect.Effect<readonly Pending[], OpenCodeError>;
+    /** Moves a queued inbox input to join the running turn at its next step. */
+    readonly steerQueued: (ref: MessageRef) => Effect.Effect<void, OpenCodeError>;
+    /** Withdraws an inbox input. OpenCode does nothing when it's no longer in the inbox. */
+    readonly cancelQueued: (ref: MessageRef) => Effect.Effect<void, OpenCodeError>;
     /**
      * Admits the text as a user message with the caller's ID. "queue" waits for the running turn to
      * end; "steer" joins it at its next step, after the current step's tool calls finish.
@@ -805,6 +809,27 @@ export class OpenCode extends Context.Service<
             Effect.map((inbox) => inbox.map(({ id, delivery }) => ({ id, delivery }))),
             Effect.mapError(failed(`Could not read the inbox of ${sessionID}`)),
           ),
+        steerQueued: (ref) =>
+          client.session.inbox
+            .update({
+              sessionID: Session.ID.make(ref.sessionID),
+              inboxID: SessionMessage.ID.make(ref.messageID),
+              delivery: "steer",
+            })
+            .pipe(
+              Effect.asVoid,
+              Effect.mapError(failed(`Could not steer message ${ref.messageID}`)),
+            ),
+        cancelQueued: (ref) =>
+          client.session.inbox
+            .cancel({
+              sessionID: Session.ID.make(ref.sessionID),
+              inboxID: SessionMessage.ID.make(ref.messageID),
+            })
+            .pipe(
+              Effect.asVoid,
+              Effect.mapError(failed(`Could not cancel message ${ref.messageID}`)),
+            ),
         prompt: ({ sessionID, messageID, text, files, delivery }) =>
           client.session
             .prompt({
