@@ -82,7 +82,9 @@ import {
   endBinding,
   openSupervisions,
   saveBinding,
+  instructionLimit,
   promoteSend,
+  saveInstruction,
   sentByDot,
   sessionIDPattern,
 } from "./supervise";
@@ -220,7 +222,7 @@ const when = (reminder: { dueAt: number; everyMinutes: number | null }) =>
 
 const supervisionLine = (binding: Supervision) =>
   binding.state === "active"
-    ? `- #${binding.id} active since ${new Date(binding.activatedAt ?? binding.createdAt).toString()}, ${describeMode(binding.mode)}: session ${binding.sessionID} in ${dataJSON(binding.directory)}; busy alert after ${binding.busyMinutes} minutes`
+    ? `- #${binding.id} active since ${new Date(binding.activatedAt ?? binding.createdAt).toString()}, ${describeMode(binding.mode)}: session ${binding.sessionID} in ${dataJSON(binding.directory)}; busy alert after ${binding.busyMinutes} minutes${binding.instruction === null ? "" : `; your standing instruction (dot_instruct) ${binding.instructed === binding.instruction ? "is in place" : "is being put in place"}: ${dataJSON(binding.instruction)}`}`
     : `- #${binding.id} requested, ${describeMode(binding.mode)}: session ${binding.sessionID} in ${dataJSON(binding.directory)}; nothing is watched until your owner approves it in the notch's Memory view or with \`open-dot watch approve ${binding.id}\``;
 
 const requestLine = (row: WorkerRequest, now: number) =>
@@ -320,7 +322,7 @@ ${list(others.map((other) => `- ${other.name}${other.purpose ? `: ${other.purpos
     },
     {
       key: "open-dot.supervised",
-      text: `## Supervised sessions (only your owner makes one active; dot_watch asks them, dot_unwatch lets one go, dot_send writes into a watch-and-send one)
+      text: `## Supervised sessions (only your owner makes one active; dot_watch asks them, dot_unwatch lets one go, dot_send writes into a watch-and-send one, dot_instruct keeps a standing instruction there)
 ${list(supervised.map(supervisionLine))}`,
     },
     {
@@ -1263,6 +1265,38 @@ ${dataJSON(part)}
           if (typeof queued === "string") throw new Error(queued);
           return {
             content: `Your message ${messageID} to session ${queued.sessionID} is queued${input.steer ? " to join its running turn" : ""}. It isn't delivered yet, and it is dropped if your owner ends binding #${queued.id} first.`,
+          };
+        },
+      });
+      editor.add({
+        name: "dot_instruct",
+        description: `Keep a standing instruction in a session your owner lets you watch and send to, such as how to report or what to avoid. OpenCode gives it to that session's model on every step, even after compaction, without adding a message or starting a turn. It is labelled as yours, not your owner's. One per binding: setting it again replaces it, remove takes it out, and it goes when the binding ends. At most ${instructionLimit} characters.`,
+        input: Schema.Struct({
+          id: id("The watch-and-send binding number from your memory"),
+          text: Schema.optionalKey(
+            text("The instruction. That session can't see this conversation"),
+          ),
+          remove: Schema.optionalKey(
+            Schema.Boolean.annotate({ description: "Remove your instruction instead" }),
+          ),
+        }),
+        options: { codemode: false },
+        execute: async (input, call) => {
+          if (!bound(call.sessionID))
+            throw new Error(`Only ${name}'s own conversation can instruct a supervised session.`);
+          const removing = input.remove === true;
+          if (removing === (input.text !== undefined))
+            throw new Error("Pass either text or remove: true.");
+          const instruction = input.text?.trim() ?? null;
+          if (instruction !== null && !instruction) throw new Error("Write the instruction.");
+          if (instruction !== null && instruction.length > instructionLimit)
+            throw new Error(`Keep it to ${instructionLimit} characters.`);
+          const refused = saveInstruction(db, name, input.id, instruction);
+          if (refused !== undefined) throw new Error(refused);
+          return {
+            content: removing
+              ? `Your instruction for binding #${input.id} will be removed from the session shortly.`
+              : `Your instruction for binding #${input.id} is saved. open-dot puts it into the session shortly; it isn't there yet.`,
           };
         },
       });

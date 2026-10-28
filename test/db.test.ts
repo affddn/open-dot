@@ -33,8 +33,11 @@ import {
 
 const repoMigrations = join(import.meta.dir, "..", "drizzle");
 
-// 0024, 0025 and 0029 append columns to these, so earlier migrations' tests compare only their first columns.
-const polished = ["slack_apps", "slack_events", "notes"];
+// 0024, 0025, 0029 and 0033 append columns to these, so earlier migrations' tests compare only their first columns.
+const polished = ["slack_apps", "slack_events", "notes", "supervisions"];
+
+// What 0033 appends to supervisions.
+const instructionColumns = ["instruction", "instructed"];
 
 // What 0029 appends to slack_apps.
 const iconColumns = [
@@ -46,10 +49,13 @@ const iconColumns = [
   "icon_retry_at",
 ];
 
-// A table's columns are the ones it had, but 0029 appends icon columns to slack_apps.
+// A table's columns are the ones it had, but 0029 appends icon columns to slack_apps and 0033
+// instruction columns to supervisions.
 function sameColumns(sqlite: Database, name: string, before: unknown[]) {
   const after = sqlite.query(`pragma table_info("${name}")`).all();
-  expect(name === "slack_apps" ? after.slice(0, before.length) : after).toEqual(before);
+  expect(
+    name === "slack_apps" || name === "supervisions" ? after.slice(0, before.length) : after,
+  ).toEqual(before);
 }
 // 0030 adds the archive, its settings and cursors, and the full-text index with its shadow tables.
 const archiveTables = [
@@ -1293,7 +1299,9 @@ test("0024 appends nullable Slack polish columns, keeps every 0023 row, and leav
             : // 0025 then adds where a note was saved from.
               name === "notes"
               ? ["source_session", "source_message"]
-              : [],
+              : name === "supervisions"
+                ? instructionColumns
+                : [],
       );
     }
     expect(tables.map((name) => [name, rows(db.$client, name)])).toEqual(before);
@@ -1373,7 +1381,9 @@ test("0025 appends nullable note sources, keeps every 0024 row and trigger, and 
           : // 0029 then appends nullable icon columns to slack_apps.
             name === "slack_apps"
             ? iconColumns.map((column) => ({ name: column, notnull: 0, dflt_value: null, pk: 0 }))
-            : [],
+            : name === "supervisions"
+              ? instructionColumns.map((column) => ({ name: column, notnull: 0, pk: 0 }))
+              : [],
       );
     }
     expect(tables.map((name) => [name, rows(db.$client, name)])).toEqual(before);
@@ -1813,7 +1823,13 @@ test("0031 appends only auto_recall, off, to memory_settings and keeps every 003
       const after = db.$client.query(`pragma table_info("${name}")`).all();
       const was = columns.get(name) ?? [];
       expect(after.slice(0, was.length)).toEqual(was);
-      expect(after.length - was.length).toBe(name === "memory_settings" ? laterSettings.length : 0);
+      expect(after.length - was.length).toBe(
+        name === "memory_settings"
+          ? laterSettings.length
+          : name === "supervisions"
+            ? instructionColumns.length
+            : 0,
+      );
     }
     expect(rows(db.$client)).toEqual(before);
     expect(db.$client.query("select auto_recall from memory_settings").all()).toEqual([

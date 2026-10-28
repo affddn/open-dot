@@ -232,6 +232,13 @@
       "when": 1792835643038,
       "tag": "0032_ledger",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1793183718240,
+      "tag": "0033_instruction",
+      "breakpoints": true
     }
   ]
 }

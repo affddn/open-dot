@@ -107,6 +107,8 @@ export function fakeOpenCode() {
     onScratch: () => {},
     create: "ok" as "ok" | "fail",
     prompt: "ok" as "ok" | "fail" | "lost",
+    instruct: "ok" as "ok" | "fail" | "lost",
+    instructions: new Map<string, Map<string, string>>(),
   };
   const layer = Layer.succeed(OpenCode, {
     sessionExists: (sessionID) => Effect.sync(() => state.sessions.has(sessionID)),
@@ -144,6 +146,15 @@ export function fakeOpenCode() {
           state.messages.delete(messageID);
         }
         return Effect.void;
+      }),
+    instruct: (sessionID, key, value) =>
+      Effect.suspend(() => {
+        if (state.instruct === "fail") return broken("instructions unavailable");
+        const entries = state.instructions.get(sessionID) ?? new Map<string, string>();
+        if (value === undefined) entries.delete(key);
+        else entries.set(key, value);
+        state.instructions.set(sessionID, entries);
+        return state.instruct === "lost" ? broken("connection reset") : Effect.void;
       }),
     prompt: ({ sessionID, messageID, text, files, delivery }) => {
       if (state.prompt === "fail") return broken("connection refused");

@@ -547,6 +547,15 @@ export class OpenCode extends Context.Service<
     /** Withdraws an inbox input. OpenCode does nothing when it's no longer in the inbox. */
     readonly cancelQueued: (ref: MessageRef) => Effect.Effect<void, OpenCodeError>;
     /**
+     * Puts the session's instruction entry under the key, or removes it when the value is undefined.
+     * Both are idempotent, so a lost outcome is settled by doing the same again.
+     */
+    readonly instruct: (
+      sessionID: string,
+      key: string,
+      value: string | undefined,
+    ) => Effect.Effect<void, OpenCodeError>;
+    /**
      * Admits the text as a user message with the caller's ID. "queue" waits for the running turn to
      * end; "steer" joins it at its next step, after the current step's tool calls finish.
      */
@@ -830,6 +839,21 @@ export class OpenCode extends Context.Service<
               Effect.asVoid,
               Effect.mapError(failed(`Could not cancel message ${ref.messageID}`)),
             ),
+        instruct: (sessionID, key, value) =>
+          (value === undefined
+            ? client.session.instructions.entry.remove({
+                sessionID: Session.ID.make(sessionID),
+                key,
+              })
+            : client.session.instructions.entry.put({
+                sessionID: Session.ID.make(sessionID),
+                key,
+                value,
+              })
+          ).pipe(
+            Effect.asVoid,
+            Effect.mapError(failed(`Could not change instruction ${key} of ${sessionID}`)),
+          ),
         prompt: ({ sessionID, messageID, text, files, delivery }) =>
           client.session
             .prompt({

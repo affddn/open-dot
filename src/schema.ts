@@ -198,6 +198,11 @@ export const supervisions = sqliteTable(
     // When the daemon first saw the current busy spell, and whether it reported it.
     busySince: integer("busy_since"),
     busyReported: integer("busy_reported", { mode: "boolean" }).notNull().default(false),
+    // A send binding's standing instruction for the session, as the dot set it with dot_instruct,
+    // and the one OpenCode last confirmed holding under the dot's entry key. Null is none. The daemon
+    // puts or removes the entry until they agree, and removes it once the binding ends.
+    instruction: text(),
+    instructed: text(),
   },
   (table) => [
     uniqueIndex("supervisions_open")

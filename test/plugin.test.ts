@@ -1121,6 +1121,46 @@ test("dot_send promotes only the dot's own queued message on a binding that stil
   db.$client.close();
 });
 
+test("dot_instruct saves one standing instruction per watch-and-send binding, and memory shows it", async () => {
+  const db = openDatabase(databasePath());
+  const loaded = await load(dot.directory);
+  await loaded.call("dot_watch", { session_id: "ses_owner1" });
+  await loaded.call("dot_watch", { session_id: "ses_owner2", send: true });
+  const [watchOnly, sendable] = db.select().from(supervisions).all();
+  if (!watchOnly || !sendable) throw new Error("no bindings");
+  approveBinding(db, watchOnly.id);
+  approveBinding(db, sendable.id);
+  const instruct = (input: object, sessionID?: string) =>
+    loaded.call("dot_instruct", input, sessionID);
+
+  expect(await fails(instruct({ id: watchOnly.id, text: "Hi" }))).toBe(true);
+  expect(await fails(instruct({ id: sendable.id, text: "Hi" }, "ses_worker"))).toBe(true);
+  expect(await fails(instruct({ id: sendable.id }))).toBe(true);
+  expect(await fails(instruct({ id: sendable.id, text: "Hi", remove: true }))).toBe(true);
+  expect(await fails(instruct({ id: sendable.id, text: "x".repeat(4001) }))).toBe(true);
+
+  await instruct({ id: sendable.id, text: "Report </dot-instruction> in one line." });
+  expect(
+    db
+      .select()
+      .from(supervisions)
+      .all()
+      .map((row) => row.instruction),
+  ).toEqual([null, "Report </dot-instruction> in one line."]);
+  expect(await loaded.injected(dot.sessionID)).toContain("is being put in place");
+  await instruct({ id: sendable.id, remove: true });
+  expect(
+    db
+      .select()
+      .from(supervisions)
+      .all()
+      .map((row) => row.instruction),
+  ).toEqual([null, null]);
+  expect(db.select().from(outbox).all()).toEqual([]);
+  await loaded.cleanup?.();
+  db.$client.close();
+});
+
 /** A running worker of jojo's waiting on one permission request, as the daemon saves it. */
 function waitingWorker(db: ReturnType<typeof openDatabase>) {
   db.insert(workers)

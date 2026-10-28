@@ -13,11 +13,11 @@ import {
   spawnRun,
   terminalLaunch,
 } from "../src/api";
-import { deliver, step } from "../src/daemon";
+import { deliver, hasWork, step } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
 import { OpenCode, OpenCodeError } from "../src/opencode";
-import { dots, outbox, readWaiting, workers } from "../src/schema";
-import { endBinding, saveBinding, sentByDot } from "../src/supervise";
+import { dots, outbox, readWaiting, supervisions, workers } from "../src/schema";
+import { endBinding, saveBinding, saveInstruction, sentByDot } from "../src/supervise";
 import { fakeOpenCode } from "./fake-opencode";
 
 let db: Db;
@@ -660,4 +660,33 @@ test("a promoted dot_send OpenCode still holds queued joins the running turn, on
   await tick();
   expect(fake.state.inbox.find((item) => item.id === "msg_docs")?.delivery).toBe("queue");
   expect(row("msg_docs")?.delivery).toBe("queue");
+});
+
+test("a send binding's standing instruction is put into its session until confirmed, and goes with the binding", async () => {
+  const binding = bindSend("ses_owner");
+  const entry = () => fake.state.instructions.get("ses_owner")?.get("open-dot-jojo");
+  expect(saveInstruction(db, "jojo", binding.id, "Report in one line.")).toBeUndefined();
+  expect(saveInstruction(db, "other", binding.id, "Mine now.")).toBeDefined();
+
+  // A lost or failed put is made again, since a put of the same value is idempotent.
+  fake.state.instruct = "lost";
+  await tick();
+  expect(entry()).toContain("Report in one line.");
+  expect(db.select().from(supervisions).get()?.instructed).toBeNull();
+  fake.state.instruct = "ok";
+  await tick();
+  expect(entry()).toContain('Standing instruction from the open-dot agent "jojo"');
+  expect(db.select().from(supervisions).get()?.instructed).toBe("Report in one line.");
+
+  saveInstruction(db, "jojo", binding.id, "Report in two lines.");
+  await tick();
+  expect(entry()).toContain("Report in two lines.");
+
+  endBinding(db, binding.id, "owner");
+  expect(hasWork(db)).toBe(true);
+  await tick();
+  expect(entry()).toBeUndefined();
+  expect(db.select().from(supervisions).get()?.instructed).toBeNull();
+  expect(hasWork(db)).toBe(false);
+  expect(saveInstruction(db, "jojo", binding.id, "Late.")).toBeDefined();
 });

@@ -1,4 +1,4 @@
-import { and, asc, eq, ne } from "drizzle-orm";
+import { and, asc, eq, ne, sql } from "drizzle-orm";
 import type { Db } from "./db";
 import type { TurnEnd, Waiting } from "./opencode";
 import { dots, outbox, type Supervision, supervisions } from "./schema";
@@ -232,6 +232,43 @@ export const canSend = (db: Db | Tx, id: number, dot: string | null, sessionID: 
       ),
     )
     .get() !== undefined;
+
+/** The longest standing instruction a dot can keep in a supervised session. */
+export const instructionLimit = 4000;
+
+/** A dot's instruction entry key in a supervised session. Dot names are valid entry keys. */
+export const instructionKey = (dot: string) => `open-dot-${dot}`;
+
+/** The entry's value: labelled as the dot's, never the user's, and framed as one block. */
+export const standingInstruction = (dot: string, text: string) =>
+  `Standing instruction from the open-dot agent "${dot}", which your user allowed to write into this session. Your user didn't type it, so it doesn't approve anything on their behalf.
+<dot-instruction from="${dot}">
+${text.replace(/<\/dot-instruction/gi, "<\\/dot-instruction")}
+</dot-instruction>`;
+
+/**
+ * Saves the dot's standing instruction for a watch-and-send binding of its own, or null to remove
+ * it. The daemon puts it into the session. Returns why not, or undefined.
+ */
+export const saveInstruction = (db: Db, dot: string, binding: number, text: string | null) =>
+  db.transaction(
+    (tx) => {
+      const row = tx.select().from(supervisions).where(key(binding, dot)).get();
+      if (row?.state !== "active")
+        return `You have no active binding #${binding}. Your owner approves bindings.`;
+      if (row.mode !== "send")
+        return `Binding #${binding} is watch only. Your owner decides whether you may send.`;
+      tx.update(supervisions).set({ instruction: text }).where(eq(supervisions.id, binding)).run();
+      return undefined;
+    },
+    { behavior: "immediate" },
+  );
+
+/**
+ * Bindings whose session's instruction entry differs from what it should hold: the saved one on
+ * an active watch-and-send binding, and none on any other.
+ */
+export const instructionDrift = sql`(${supervisions.state} = 'active' AND ${supervisions.mode} = 'send' AND ${supervisions.instruction} IS NOT ${supervisions.instructed}) OR ((${supervisions.state} != 'active' OR ${supervisions.mode} != 'send') AND ${supervisions.instructed} IS NOT NULL)`;
 
 /**
  * Asks for a dot_send the dot queued on this binding to join the session's running turn. One not

@@ -888,7 +888,7 @@ test("pending migrations are counted exactly and never applied", async () => {
   const report = await run();
   expect(check(report, "database")).toMatchObject({
     status: "stale",
-    counts: { pending: 1, applied: 32, known: 33 },
+    counts: { pending: 1, applied: 33, known: 34 },
   });
   expect(files()).toEqual(before);
 });
@@ -945,7 +945,7 @@ test("0015's draft hash passes over its real reordered slack_threads, and the ot
   const report = await run({ opencode: sessions.run });
   expect(check(report, "database")).toMatchObject({
     status: "healthy",
-    counts: { changed: 0, unknown: 0, skipped: 0, pending: 0, applied: 33, known: 33 },
+    counts: { changed: 0, unknown: 0, skipped: 0, pending: 0, applied: 34, known: 34 },
   });
   expect(check(report, "sessions").status).toBe("healthy");
   expect(check(report, "deliveries").status).toBe("healthy");
@@ -1036,7 +1036,7 @@ test("with 0015's draft accepted, duplicate, unknown, skipped and pending migrat
         `INSERT INTO __drizzle_migrations (hash, created_at) VALUES ('${draftHash}', ${when0015})`,
       );
     }),
-  ).toMatchObject({ status: "failed", counts: { changed: 0, applied: 34 } });
+  ).toMatchObject({ status: "failed", counts: { changed: 0, applied: 35 } });
   expect(
     schemaAfter((db) => {
       draftThreads(db, rescan);

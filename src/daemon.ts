@@ -44,6 +44,9 @@ import {
 import {
   canSend,
   hasSupervisions,
+  instructionDrift,
+  instructionKey,
+  standingInstruction,
   sessionIDPattern,
   type SupervisionEvent,
   supervisionNotice,
@@ -432,7 +435,8 @@ export const hasWork = (db: Db) =>
     undefined ||
   db.select({ id: workers.id }).from(workers).where(ne(workers.state, "done")).get() !==
     undefined ||
-  hasSupervisions(db);
+  hasSupervisions(db) ||
+  db.select({ id: supervisions.id }).from(supervisions).where(instructionDrift).get() !== undefined;
 
 export const deliverAll = (db: Db) =>
   Effect.gen(function* () {
@@ -1294,6 +1298,47 @@ export const watchThreads = (db: Db) =>
   });
 
 /**
+ * Puts each send binding's standing instruction into its session as the dot's entry, and removes
+ * it from sessions whose binding ended or that no longer hold one. Both calls are idempotent, so a
+ * failed or lost one is simply made again next pass. Only a confirmed call is saved, and only when
+ * the dot didn't change the instruction meanwhile.
+ */
+export const instructAll = (db: Db) =>
+  Effect.gen(function* () {
+    const opencode = yield* OpenCode;
+    const rows = db.select().from(supervisions).where(instructionDrift).all();
+    for (const row of rows) {
+      const wanted = row.state === "active" && row.mode === "send" ? row.instruction : null;
+      const value = wanted === null ? undefined : standingInstruction(row.dot, wanted);
+      // OpenCode deleted the session, and its entries with it.
+      const done =
+        row.endReason === "deleted" ||
+        (yield* opencode.instruct(row.sessionID, instructionKey(row.dot), value).pipe(
+          Effect.as(true),
+          Effect.catch((error) =>
+            Effect.sync(() => {
+              console.error(`Instruction #${row.id}: ${error.message}`);
+              return false;
+            }),
+          ),
+        ));
+      if (!done) continue;
+      db.update(supervisions)
+        .set({ instructed: wanted })
+        .where(
+          and(
+            eq(supervisions.id, row.id),
+            eq(supervisions.state, row.state),
+            row.instruction === null
+              ? isNull(supervisions.instruction)
+              : eq(supervisions.instruction, row.instruction),
+          ),
+        )
+        .run();
+    }
+  });
+
+/**
  * One pass of the daemon's OpenCode work: advance workers and supervisions, then send what they
  * queued. Worker requests are settled and answered in their own loops, so nothing here, however
  * long it waits, holds them up.
@@ -1305,6 +1350,7 @@ export const step = (db: Db) =>
         Effect.catch((error) => Effect.sync(() => console.error(`Supervision: ${error.message}`))),
       ),
     ),
+    Effect.andThen(instructAll(db)),
     Effect.andThen(deliverAll(db)),
   );
 
