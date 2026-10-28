@@ -2,11 +2,12 @@ import { beforeEach, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Effect } from "effect";
 import { api, type Run } from "../src/api";
-import { answerAll, settleRequests, step, watchThreads } from "../src/daemon";
+import { homedir } from "node:os";
+import { answerAll, enqueue, settleRequests, step, watchThreads } from "../src/daemon";
 import { worktreeDirectory } from "../src/home";
 import { formWaiting, redactedQuestion } from "../src/opencode";
 import { type Db, openDatabase } from "../src/db";
-import { graceMs, prohibited, queueAnswer } from "../src/requests";
+import { graceMs, prohibited, queueAnswer, unseenLimitMs } from "../src/requests";
 import { dots, outbox, requests, type RequestAnswer, workers } from "../src/schema";
 import { saveBinding } from "../src/supervise";
 import { fakeOpenCode, type FakeWaiting } from "./fake-opencode";
@@ -330,6 +331,72 @@ test("open-dot won't approve what it recognizes as off limits, but the dot may r
   expect(fake.state.answers.map((sent) => sent.answer)).toEqual([{ decision: "reject" }]);
 });
 
+const elsewhere = (resource: string) =>
+  prohibited(
+    { kind: "permission", action: "external_directory", resources: [resource] },
+    "/work/1",
+  );
+
+test("open-dot leaves an ordinary external directory to the dot, but never the home or config directory", () => {
+  expect(elsewhere("/Users/me/deploy-tools/*")).toBeUndefined();
+  expect(elsewhere("/private/var/folders/x/T/opencode/*")).toBeUndefined();
+  for (const resource of ["/*", `${homedir()}/*`, `${homedir()}/.config/opencode/*`])
+    expect(elsewhere(resource)).toBeString();
+});
+
+test("a request notice steers ahead of queued input, and the grace starts once it's sent", async () => {
+  const session = running();
+  db.transaction((tx) => enqueue(tx, "ses_jojo", "Earlier message."));
+  fake.state.waiting.set(session, [permission()]);
+  const before = Date.now();
+  await tick();
+  const notice = request()?.noticeID;
+  expect(notice).toBeString();
+  expect(fake.state.prompted[0]).toBe(notice as string);
+  expect(fake.state.deliveries.get(notice as string)).toBe("steer");
+  expect(request()?.noticedAt).toBeGreaterThanOrEqual(before);
+  expect(toDot()).toEqual([expect.stringContaining("Answer it now"), "Earlier message."]);
+});
+
+test("a request notice waits out a Slack turn, and goes to the owner if it never reaches the dot", async () => {
+  const session = running();
+  const route = {
+    kind: "shared",
+    dot: "jojo",
+    sessionID: "ses_jojo",
+    owner: "U1",
+    team: "T1",
+    bot: "B1",
+    dm: true,
+    channel: "D1",
+    thread: "1.0",
+  } as const;
+  db.insert(outbox)
+    .values({
+      sessionID: "ses_jojo",
+      messageID: "msg_slack",
+      text: "From Slack.",
+      route,
+      state: "sent",
+      delivery: "queue",
+      startedAt: 0,
+      createdAt: 0,
+    })
+    .run();
+  fake.state.waiting.set(session, [permission()]);
+  await tick();
+  expect(toDot()).toEqual([]);
+  expect(request()).toMatchObject({ state: "open", noticedAt: null });
+  const created = request()?.createdAt ?? 0;
+  settleRequests(db, created + graceMs * 2);
+  expect(request()?.state).toBe("open");
+  settleRequests(db, created + unseenLimitMs);
+  expect(request()).toMatchObject({
+    state: "escalated",
+    reason: "Its notice didn't reach the dot within fifteen minutes.",
+  });
+});
+
 const needs = async () =>
   ((await (await call("/dots")).json()) as { workers: { needs: string[] }[] }[])[0]?.workers[0]
     ?.needs;
@@ -340,7 +407,7 @@ test("unanswered past the grace period, a request needs the owner once, and is n
   await tick();
   expect(await needs()).toEqual([]);
   db.update(requests)
-    .set({ createdAt: Date.now() - graceMs })
+    .set({ noticedAt: Date.now() - graceMs })
     .run();
   expect(await needs()).toEqual(["permission"]);
   await tick();

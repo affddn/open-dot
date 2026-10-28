@@ -151,7 +151,8 @@ export const outbox = sqliteTable("outbox", {
   ownerText: text("owner_text"),
   // How OpenCode gets the message. The owner's notch messages start as "auto", and the daemon saves
   // "steer" (into a running turn) or "queue" with startedAt, before its first call. Null is "queue":
-  // Slack and notices never steer. A dot_send asks for "auto" with steer, or with a later promote;
+  // Slack and other notices never steer; a worker request notice does, outside a Slack turn.
+  // A dot_send asks for "auto" with steer, or with a later promote;
   // a sent row is "auto" only when promoted, until the daemon moves it in OpenCode's inbox.
   delivery: text({ enum: ["auto", "queue", "steer"] }),
   startedAt: integer("started_at"),
@@ -601,6 +602,8 @@ export const workers = sqliteTable("workers", {
   // A worker in a git repo gets its own worktree of `source` on `branch`, created before its session.
   source: text(),
   branch: text(),
+  // Extra directories the dot let the worker use outside its own, as canonical absolute paths.
+  paths: text({ mode: "json" }).$type<readonly string[]>(),
   sessionID: text("session_id").notNull(),
   // "creating" means the session ID is saved but OpenCode has not confirmed the session yet.
   // "stopping" means the owner asked to stop it and its queued messages are held, but OpenCode
@@ -736,8 +739,12 @@ export const requests = sqliteTable(
     answer: text({ mode: "json" }).$type<RequestAnswer>(),
     // The dot session that chose the answer.
     actorSession: text("actor_session"),
-    // When open-dot first saw it waiting, which starts the owner's grace period.
+    // When open-dot first saw it waiting.
     createdAt: integer("created_at").notNull(),
+    // The dot's notice about it in the outbox, and when OpenCode admitted that notice into the
+    // dot's session, which starts the owner's grace period.
+    noticeID: text("notice_id"),
+    noticedAt: integer("noticed_at"),
     // Null while OpenCode last listed it as waiting.
     goneAt: integer("gone_at"),
     queuedAt: integer("queued_at"),

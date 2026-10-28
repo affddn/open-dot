@@ -35,6 +35,7 @@ import {
   deletionRoot,
   escalate,
   graceMs,
+  unseenLimitMs,
   invalidAnswer,
   malformedAnswer,
   ownershipProblem,
@@ -67,6 +68,7 @@ export const enqueue = (
   sessionID: string,
   text: string,
   messageID: string = SessionMessage.ID.create(),
+  delivery?: "steer",
 ) =>
   tx
     .insert(outbox)
@@ -74,6 +76,7 @@ export const enqueue = (
       sessionID,
       messageID,
       text,
+      delivery,
       state: "pending",
       createdAt: Date.now(),
     })
@@ -341,6 +344,11 @@ const admit = (db: Db, message: Message, permit?: Message) =>
       .set({ state: "sent" })
       .where(and(eq(outbox.id, message.id), eq(outbox.state, from)))
       .run();
+    // A request notice in the dot's session starts the dot's grace period.
+    db.update(requests)
+      .set({ noticedAt: Date.now() })
+      .where(and(eq(requests.noticeID, message.messageID), isNull(requests.noticedAt)))
+      .run();
   });
 
 /**
@@ -489,6 +497,14 @@ export const deliverAll = (db: Db) =>
             activeRoute = key;
           }
         }
+        // A request notice steers past queued input into an unrouted turn, never into a Slack one.
+        const unrouted = routeKey(null);
+        if (activeRoute === undefined || activeRoute === unrouted)
+          for (const row of messages)
+            if (row.state === "pending" && row.delivery === "steer" && row.route === null) {
+              yield* deliver(db, row);
+              activeRoute = unrouted;
+            }
         for (const row of messages) {
           const current = db.select().from(outbox).where(eq(outbox.id, row.id)).get();
           if (current?.state !== "pending" && current?.state !== "held") continue;
@@ -687,7 +703,10 @@ const noteRequests = (
           })
           .returning()
           .get();
-        if (told.has(requestKey(item))) continue;
+        if (told.has(requestKey(item))) {
+          tx.update(requests).set({ noticedAt: now }).where(eq(requests.id, row.id)).run();
+          continue;
+        }
         if (item.sensitive)
           escalate(
             tx,
@@ -701,7 +720,20 @@ const noteRequests = (
             },
             now,
           );
-        else enqueue(tx, dot.sessionID, requestNotice(row, deletionRoot(tx, row)));
+        else {
+          // Steered, so it reaches a busy dot at its next step and ahead of queued input.
+          const notice = enqueue(
+            tx,
+            dot.sessionID,
+            requestNotice(row, deletionRoot(tx, row)),
+            SessionMessage.ID.create(),
+            "steer",
+          );
+          tx.update(requests)
+            .set({ noticeID: notice.messageID })
+            .where(eq(requests.id, row.id))
+            .run();
+        }
       }
     },
     { behavior: "immediate" },
@@ -1152,7 +1184,9 @@ const settle = (db: Db, row: WorkerRequest, from: "open" | "queued", why: string
           reason: why,
           message:
             from === "open"
-              ? "The dot didn't answer it within two minutes."
+              ? row.noticedAt === null
+                ? "Its notice couldn't reach the dot within fifteen minutes."
+                : "The dot didn't answer it within two minutes."
               : `open-dot didn't send the dot's answer: ${why}`,
         },
         now,
@@ -1192,7 +1226,10 @@ export const settleRequests = (db: Db, now: number) => {
       and(
         eq(requests.state, "open"),
         isNull(requests.goneAt),
-        lte(requests.createdAt, now - graceMs),
+        or(
+          lte(requests.noticedAt, now - graceMs),
+          and(isNull(requests.noticedAt), lte(requests.createdAt, now - unseenLimitMs)),
+        ),
       ),
     )
     .all();
@@ -1207,7 +1244,15 @@ export const settleRequests = (db: Db, now: number) => {
         .get()?.state !== "running"
     )
       continue;
-    settle(db, row, "open", "Nobody answered it within two minutes.", now);
+    settle(
+      db,
+      row,
+      "open",
+      row.noticedAt === null
+        ? "Its notice didn't reach the dot within fifteen minutes."
+        : "Nobody answered it within two minutes.",
+      now,
+    );
   }
   for (const row of db
     .select()

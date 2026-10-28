@@ -33,8 +33,16 @@ import {
 
 const repoMigrations = join(import.meta.dir, "..", "drizzle");
 
-// 0024, 0025, 0029 and 0033 append columns to these, so earlier migrations' tests compare only their first columns.
-const polished = ["slack_apps", "slack_events", "notes", "supervisions"];
+// 0024, 0025, 0029, 0033 and 0034 append columns to these, so earlier migrations' tests compare only their first columns.
+const polished = ["slack_apps", "slack_events", "notes", "supervisions", "workers", "requests"];
+
+// The columns a table had, quoted for a select, since later migrations append some.
+const storedColumns = (columns: Map<string, unknown>, name: string) =>
+  (columns.get(name) as { name: string }[]).map((column) => `"${column.name}"`).join(",");
+
+// What 0034 appends to requests and workers.
+const noticeColumns = ["notice_id", "noticed_at"];
+const pathColumns = ["paths"];
 
 // What 0033 appends to supervisions.
 const instructionColumns = ["instruction", "instructed"];
@@ -49,12 +57,14 @@ const iconColumns = [
   "icon_retry_at",
 ];
 
-// A table's columns are the ones it had, but 0029 appends icon columns to slack_apps and 0033
-// instruction columns to supervisions.
+// A table's columns are the ones it had, but 0029 appends icon columns to slack_apps, 0033
+// instruction columns to supervisions and 0034 notice and path columns to requests and workers.
 function sameColumns(sqlite: Database, name: string, before: unknown[]) {
   const after = sqlite.query(`pragma table_info("${name}")`).all();
   expect(
-    name === "slack_apps" || name === "supervisions" ? after.slice(0, before.length) : after,
+    ["slack_apps", "supervisions", "workers", "requests"].includes(name)
+      ? after.slice(0, before.length)
+      : after,
   ).toEqual(before);
 }
 // 0030 adds the archive, its settings and cursors, and the full-text index with its shadow tables.
@@ -1197,7 +1207,10 @@ test("0023 adds only requests, one row per session, kind and request, and keeps 
     tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
   );
   const rows = (sqlite: Database) =>
-    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+    tables.map((name) => [
+      name,
+      sqlite.query(`select ${storedColumns(columns, name)} from "${name}"`).all(),
+    ]);
   const before = rows(old);
   const ledger = ledgerOf(old);
   const triggers = triggerSQL(old);
@@ -1301,7 +1314,11 @@ test("0024 appends nullable Slack polish columns, keeps every 0023 row, and leav
               ? ["source_session", "source_message"]
               : name === "supervisions"
                 ? instructionColumns
-                : [],
+                : name === "requests"
+                  ? noticeColumns
+                  : name === "workers"
+                    ? pathColumns
+                    : [],
       );
     }
     expect(tables.map((name) => [name, rows(db.$client, name)])).toEqual(before);
@@ -1383,7 +1400,14 @@ test("0025 appends nullable note sources, keeps every 0024 row and trigger, and 
             ? iconColumns.map((column) => ({ name: column, notnull: 0, dflt_value: null, pk: 0 }))
             : name === "supervisions"
               ? instructionColumns.map((column) => ({ name: column, notnull: 0, pk: 0 }))
-              : [],
+              : name === "requests" || name === "workers"
+                ? (name === "requests" ? noticeColumns : pathColumns).map((column) => ({
+                    name: column,
+                    notnull: 0,
+                    dflt_value: null,
+                    pk: 0,
+                  }))
+                : [],
       );
     }
     expect(tables.map((name) => [name, rows(db.$client, name)])).toEqual(before);
@@ -1511,7 +1535,10 @@ test("0027 adds only the run tables, keeps every 0026 table, row and trigger, an
     tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
   );
   const rows = (sqlite: Database) =>
-    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+    tables.map((name) => [
+      name,
+      sqlite.query(`select ${storedColumns(columns, name)} from "${name}"`).all(),
+    ]);
   const before = rows(old);
   const ledger = ledgerOf(old);
   const triggers = triggerSQL(old);
@@ -1574,7 +1601,10 @@ test("0028 adds only the artifacts table, keeps every 0027 table, row and trigge
     tables.map((name) => [name, old.query(`pragma table_info("${name}")`).all()]),
   );
   const rows = (sqlite: Database) =>
-    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+    tables.map((name) => [
+      name,
+      sqlite.query(`select ${storedColumns(columns, name)} from "${name}"`).all(),
+    ]);
   const before = rows(old);
   const ledger = ledgerOf(old);
   const triggers = triggerSQL(old);
@@ -1828,7 +1858,11 @@ test("0031 appends only auto_recall, off, to memory_settings and keeps every 003
           ? laterSettings.length
           : name === "supervisions"
             ? instructionColumns.length
-            : 0,
+            : name === "requests"
+              ? noticeColumns.length
+              : name === "workers"
+                ? pathColumns.length
+                : 0,
       );
     }
     expect(rows(db.$client)).toEqual(before);

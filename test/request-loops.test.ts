@@ -41,7 +41,7 @@ beforeEach(() => {
         createdAt: 0,
       })
       .run();
-  // Worker 1 has an answer queued; worker 2 a request nobody answered for over two minutes.
+  // Worker 1 has an answer queued; worker 2 a request nobody answered for over two minutes after its notice.
   const base = {
     dot: "jojo",
     source: "worker" as const,
@@ -71,6 +71,7 @@ beforeEach(() => {
         requestID: "per_2",
         state: "open",
         createdAt: Date.now() - graceMs - 1,
+        noticedAt: Date.now() - graceMs - 1,
       },
     ])
     .run();
