@@ -1,7 +1,7 @@
 import { and, asc, eq, ne } from "drizzle-orm";
 import type { Db } from "./db";
 import type { TurnEnd, Waiting } from "./opencode";
-import { dots, type Supervision, supervisions } from "./schema";
+import { dots, outbox, type Supervision, supervisions } from "./schema";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -232,6 +232,39 @@ export const canSend = (db: Db | Tx, id: number, dot: string | null, sessionID: 
       ),
     )
     .get() !== undefined;
+
+/**
+ * Asks for a dot_send the dot queued on this binding to join the session's running turn. One not
+ * yet admitted becomes "auto", steering only when it's sent into a busy session with no queued input
+ * ahead. One admitted but still queued becomes a sent "auto", which only a promotion makes: the daemon
+ * then moves it in OpenCode's inbox. Returns why not, or undefined.
+ */
+export const promoteSend = (db: Db, dot: string, binding: number, messageID: string) =>
+  db.transaction(
+    (tx) => {
+      const row = tx
+        .select()
+        .from(outbox)
+        .where(
+          and(
+            eq(outbox.messageID, messageID),
+            eq(outbox.fromDot, dot),
+            eq(outbox.supervision, binding),
+          ),
+        )
+        .get();
+      if (!row) return `You queued no message ${messageID} on binding #${binding}.`;
+      if (!canSend(tx, binding, dot, row.sessionID))
+        return `Binding #${binding} no longer lets you send. Your owner decides.`;
+      if (row.state === "cancelled")
+        return `Message ${messageID} was dropped, so it can't be sent.`;
+      if (row.turnEnd !== null || row.delivery === "steer")
+        return `Message ${messageID} already joined a turn or is set to.`;
+      tx.update(outbox).set({ delivery: "auto" }).where(eq(outbox.id, row.id)).run();
+      return undefined;
+    },
+    { behavior: "immediate" },
+  );
 
 export const hasSupervisions = (db: Db) =>
   db

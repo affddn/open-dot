@@ -1088,6 +1088,39 @@ test("dot_send queues a labelled message only on an active watch-and-send bindin
   db.$client.close();
 });
 
+test("dot_send promotes only the dot's own queued message on a binding that still allows sending", async () => {
+  const db = openDatabase(databasePath());
+  const loaded = await load(dot.directory);
+  await loaded.call("dot_watch", { session_id: "ses_owner2", send: true });
+  const binding = db.select().from(supervisions).get();
+  if (!binding) throw new Error("no binding");
+  approveBinding(db, binding.id);
+  const queued = await loaded.call("dot_send", { id: binding.id, text: "Then lint." });
+  const row = db.select().from(outbox).get();
+  if (!row) throw new Error("no row");
+  expect(JSON.stringify(queued)).toContain(row.messageID);
+
+  const promote = (messageID: string, extra = {}) =>
+    loaded.call("dot_send", { id: binding.id, promote: messageID, ...extra });
+  expect(await fails(promote(row.messageID, { text: "Also" }))).toBe(true);
+  expect(await fails(promote("msg_other"))).toBe(true);
+  expect(await fails(loaded.call("dot_send", { id: binding.id }))).toBe(true);
+
+  // Admitted as queued: the daemon moves a sent "auto" in OpenCode's inbox.
+  db.update(outbox).set({ state: "sent", startedAt: 1, delivery: "queue" }).run();
+  await promote(row.messageID);
+  expect(db.select().from(outbox).get()).toMatchObject({ state: "sent", delivery: "auto" });
+
+  db.update(outbox).set({ delivery: "steer" }).run();
+  expect(await fails(promote(row.messageID))).toBe(true);
+  db.update(outbox).set({ delivery: "queue" }).run();
+  endBinding(db, binding.id, "owner");
+  expect(await fails(promote(row.messageID))).toBe(true);
+  expect(db.select().from(outbox).get()?.delivery).toBe("queue");
+  await loaded.cleanup?.();
+  db.$client.close();
+});
+
 /** A running worker of jojo's waiting on one permission request, as the daemon saves it. */
 function waitingWorker(db: ReturnType<typeof openDatabase>) {
   db.insert(workers)

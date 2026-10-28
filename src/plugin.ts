@@ -82,6 +82,7 @@ import {
   endBinding,
   openSupervisions,
   saveBinding,
+  promoteSend,
   sentByDot,
   sessionIDPattern,
 } from "./supervise";
@@ -1188,22 +1189,42 @@ ${dataJSON(part)}
       });
       editor.add({
         name: "dot_send",
-        description: `Write a message into a session your owner lets you watch and send to. It is labelled as coming from you, not your owner, and never answers that session's permission requests or questions or interrupts it. It counts toward your ${messagesPerHour} messages an hour.`,
+        description: `Write a message into a session your owner lets you watch and send to. It is labelled as coming from you, not your owner, and never answers that session's permission requests or questions or interrupts it. It counts toward your ${messagesPerHour} messages an hour. To move a message you already queued into the running turn, pass its ID as promote and no text.`,
         input: Schema.Struct({
           id: id("The watch-and-send binding number from your memory"),
-          text: text("The message. That session can't see this conversation"),
+          text: Schema.optionalKey(
+            text("The message. That session can't see this conversation. Omit only with promote"),
+          ),
           steer: Schema.optionalKey(
             Schema.Boolean.annotate({
               description:
                 "Join the turn it is running at its next step, without interrupting it. Omit to queue the message until the turn ends",
             }),
           ),
+          promote: Schema.optionalKey(
+            text(
+              "The msg_ ID dot_send gave a message you queued on this binding, to have it join the running turn at its next step instead of waiting for the turn to end",
+            ),
+          ),
         }),
         options: { codemode: false },
         execute: async (input, call) => {
           if (!bound(call.sessionID))
             throw new Error(`Only ${name}'s own conversation can write into a supervised session.`);
+          if (input.promote !== undefined) {
+            if (input.text !== undefined || input.steer !== undefined)
+              throw new Error("Pass promote alone, without text or steer.");
+            const promoted = promoteSend(db, name, input.id, input.promote);
+            if (promoted !== undefined) throw new Error(promoted);
+            return {
+              content: `Message ${input.promote} will join the session's running turn at its next step, unless OpenCode already delivered it. It isn't confirmed yet.`,
+            };
+          }
+          if (input.text === undefined || !input.text.trim())
+            throw new Error("Write the message, or pass promote with a message ID.");
+          const message = input.text;
           const now = Date.now();
+          const messageID = SessionMessage.ID.create();
           const queued = db.transaction(
             (tx) => {
               const binding = tx
@@ -1225,8 +1246,8 @@ ${dataJSON(part)}
               tx.insert(outbox)
                 .values({
                   sessionID: binding.sessionID,
-                  messageID: SessionMessage.ID.create(),
-                  text: sentByDot(name, input.text),
+                  messageID,
+                  text: sentByDot(name, message),
                   state: "pending",
                   fromDot: name,
                   supervision: binding.id,
@@ -1241,7 +1262,7 @@ ${dataJSON(part)}
           );
           if (typeof queued === "string") throw new Error(queued);
           return {
-            content: `Your message to session ${queued.sessionID} is queued${input.steer ? " to join its running turn" : ""}. It isn't delivered yet, and it is dropped if your owner ends binding #${queued.id} first.`,
+            content: `Your message ${messageID} to session ${queued.sessionID} is queued${input.steer ? " to join its running turn" : ""}. It isn't delivered yet, and it is dropped if your owner ends binding #${queued.id} first.`,
           };
         },
       });

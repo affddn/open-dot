@@ -468,6 +468,18 @@ export const deliverAll = (db: Db) =>
               .where(eq(outbox.id, row.id))
               .run();
           else {
+            // A sent "auto" is a dot's promotion of a message OpenCode still holds queued.
+            if (row.state === "sent" && row.delivery === "auto") {
+              if (
+                row.supervision !== null &&
+                canSend(db, row.supervision, row.fromDot, row.sessionID)
+              )
+                yield* changeQueued(db, row.id, "steer");
+              db.update(outbox)
+                .set({ delivery: "queue" })
+                .where(and(eq(outbox.id, row.id), eq(outbox.delivery, "auto")))
+                .run();
+            }
             const key = routeKey(row.route);
             if (activeRoute !== undefined && activeRoute !== key) return;
             activeRoute = key;

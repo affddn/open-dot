@@ -151,7 +151,8 @@ export const outbox = sqliteTable("outbox", {
   ownerText: text("owner_text"),
   // How OpenCode gets the message. The owner's notch messages start as "auto", and the daemon saves
   // "steer" (into a running turn) or "queue" with startedAt, before its first call. Null is "queue":
-  // Slack, notices and other dots never steer.
+  // Slack and notices never steer. A dot_send asks for "auto" with steer, or with a later promote;
+  // a sent row is "auto" only when promoted, until the daemon moves it in OpenCode's inbox.
   delivery: text({ enum: ["auto", "queue", "steer"] }),
   startedAt: integer("started_at"),
   turnEnd: text("turn_end"),

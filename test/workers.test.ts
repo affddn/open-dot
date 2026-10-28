@@ -636,3 +636,28 @@ test("the real runner passes input, and reports a failed exit or a missing progr
   expect(await spawnRun(["/bin/sh", "-c", "exit 4"])).toBe("exit 4");
   expect(await spawnRun(["/nonexistent/osascript"])).toEqual(expect.any(String));
 });
+
+test("a promoted dot_send OpenCode still holds queued joins the running turn, once and only while allowed", async () => {
+  const binding = bindSend("ses_owner");
+  dotSend("ses_owner", binding.id, "lint");
+  fake.state.active.add("ses_owner");
+  fake.state.inbox.push({ sessionID: "ses_owner", id: "msg_report", delivery: "queue" });
+  await tick();
+  expect(fake.state.deliveries.get("msg_lint")).toBe("queue");
+  expect(row("msg_lint")).toMatchObject({ state: "sent", delivery: null });
+
+  // dot_send's promote: a sent "auto" is moved in the inbox, and stays steer.
+  db.update(outbox).set({ delivery: "auto" }).where(eq(outbox.messageID, "msg_lint")).run();
+  await tick();
+  expect(fake.state.inbox.find((item) => item.id === "msg_lint")?.delivery).toBe("steer");
+  expect(row("msg_lint")?.delivery).toBe("steer");
+
+  // Already delivered, or the binding ended: nothing moves, and it's not tried again.
+  dotSend("ses_owner", binding.id, "docs");
+  await tick();
+  db.update(outbox).set({ delivery: "auto" }).where(eq(outbox.messageID, "msg_docs")).run();
+  endBinding(db, binding.id, "owner");
+  await tick();
+  expect(fake.state.inbox.find((item) => item.id === "msg_docs")?.delivery).toBe("queue");
+  expect(row("msg_docs")?.delivery).toBe("queue");
+});
